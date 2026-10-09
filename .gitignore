@@ -1,0 +1,10 @@
+.ax/worktrees/
+.ax/retro/
+.ax/upstream/
+.ax/upgrade/
+.ax/ablate/
+study/**/*.pcap
+study/**/*.pcapng
+study/**/*.cap
+study/**/*.tmp
+/target/

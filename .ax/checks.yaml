@@ -1,0 +1,34 @@
+- id: ax-format
+  builtin: ax-format
+  inputs:
+    - .ax/decisions/*.md
+    - .ax/observations/*.md
+    - .ax/friction/*.md
+    - .ax/capabilities/*.md
+    - .ax/scaffolds/*.md
+    - .ax/evals/*.md
+  tier: fast
+  enforces: .ax/decisions/2026-10-09-adopt-ax-for-harness-management.md
+- id: ax-consistency
+  builtin: ax-consistency
+  inputs:
+    - .ax/checks.yaml
+    - .ax/scaffolds/*.md
+    - .ax/decisions/*.md
+    - .ax/observations/*.md
+    - .ax/friction/*.md
+  tier: fast
+  enforces: .ax/decisions/2026-10-09-adopt-ax-for-harness-management.md
+- id: ax-staleness
+  builtin: ax-staleness
+  inputs:
+    - .ax/ax.yaml
+    - .ax/intent.md
+    - .ax/capabilities/*.md
+    - .ax/scaffolds/*.md
+    - .ax/evals/*.md
+    - .ax/checks.yaml
+    - .ax/manifest.yaml
+    - .ax/decisions/*.md
+  tier: fast
+  enforces: .ax/decisions/2026-10-09-adopt-ax-for-harness-management.md

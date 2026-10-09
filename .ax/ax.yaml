@@ -1,0 +1,4 @@
+ax: 0.7.1
+targets: [cursor, claude-code]
+packs: []
+notes: record

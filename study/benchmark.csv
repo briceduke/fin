@@ -1,0 +1,23 @@
+﻿file,packets,query,median_seconds,packets_per_second,notes
+eth-ipv4-udp.pcap,1000000,stock,7.9700,125471.2,stdout discarded
+eth-ipv4-udp.pcap,1000000,only-lower,5.7895,172726.6,stdout discarded
+eth-ipv4-udp.pcap,1000000,disable-upper,6.2305,160501.3,stdout discarded
+eth-ipv4-udp.pcap,1000000,floor,7.9328,126058.4,stdout discarded
+eth-ipv4-udp.pcap,20000,ceiling,3.4168,5853.3,20000-packet prefix via editcap -r; stdout discarded
+eth-ipv4-udp.pcap,1000000,stock-with-stdout,6.2622,159689.2,stdout written to ip-src-lines.txt; stdout size 13472986 bytes (12.8 MiB)
+eth-qinq-ipv4-udp.pcap,1000000,stock,8.8286,113268.5,stdout discarded
+eth-qinq-ipv4-udp.pcap,1000000,only-lower,2.7516,363422.7,only-protocols eth,vlan,ip; sample 50 packets nonempty ip.src=0/50; ip.src empty; do not treat time as a win
+eth-qinq-ipv4-udp.pcap,1000000,only-lower-no-vlan,2.7099,369018.0,only-protocols eth,ip (vlan omitted); sample 50 packets nonempty ip.src=0/50; ip.src empty; do not treat time as a win
+eth-qinq-ipv4-udp.pcap,1000000,disable-upper,7.0574,141696.1,stdout discarded
+eth-qinq-ipv4-udp.pcap,1000000,floor,8.7398,114419.6,stdout discarded
+eth-qinq-ipv4-udp.pcap,20000,ceiling,3.9466,5067.7,20000-packet prefix via editcap -r; stdout discarded
+mixed.pcap,1000000,stock,5.6736,176253.9,stdout discarded; half the packets have no ip.src (ARP)
+mixed.pcap,1000000,only-lower,4.3207,231446.2,stdout discarded
+mixed.pcap,1000000,disable-upper,4.8607,205731.9,stdout discarded
+mixed.pcap,1000000,floor,6.6181,151101.3,stdout discarded
+mixed.pcap,20000,ceiling,2.7773,7201.1,20000-packet prefix via editcap -r; stdout discarded
+real/challenge01_ooo_stream.pcapng,1670,stock,0.1336,12496.1,real capture; 1670 packets (< 50000); too small to rank against synthetic million-packet files
+real/challenge01_ooo_stream.pcapng,1670,only-lower,0.1228,13600.0,real capture; 1670 packets (< 50000); too small to rank against synthetic million-packet files
+real/challenge01_ooo_stream.pcapng,1670,disable-upper,0.1243,13430.4,real capture; 1670 packets (< 50000); too small to rank against synthetic million-packet files
+real/challenge01_ooo_stream.pcapng,1670,floor,0.1349,12383.0,real capture; 1670 packets (< 50000); too small to rank against synthetic million-packet files
+real/challenge01_ooo_stream.pcapng,1670,ceiling,0.5876,2841.9,real capture; 1670 packets (< 50000); too small to rank; -V on full file (smaller than 20000-packet prefix)
