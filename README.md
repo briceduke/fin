@@ -2,7 +2,7 @@
 
 > TLS server names on a 368 MB capture: 0.226 seconds, against 7.87 seconds for tshark 4.6.9. Same 1,252 names. Preliminary, from a prototype that has since been removed.
 
-**Status:** design locked. No reader yet.
+**Status:** the sequential reader walks classic pcap and pcapng into frames. It does not read fields yet. Next is `ip.src`.
 
 fin is an open-source packet analyzer. tshark decodes every layer of every packet, then prints the field you asked for. fin turns the fields you ask for into one plan and reads only the bytes that plan needs. On the fields it supports, fin may print less than tshark 4.6.9 with default preferences. It never prints something different.
 
@@ -71,9 +71,9 @@ The output is pinned to tshark 4.6.9. When the target version moves, its port ta
 
 Each step is checked against the one before it.
 
-1. The checker and a corpus of test captures.
-2. The sequential reader.
-3. `ip.src`.
+1. The checker and a corpus of test captures. Done.
+2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type, timestamp, original length, and the captured bytes. Forty-two tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises.
+3. `ip.src`. Next.
 4. The chunk split, checked against the sequential reader.
 5. TLS server names.
 
@@ -98,6 +98,18 @@ The prototype did not reassemble split TLS handshakes. bigFlows.pcap is older tr
 Inside tshark, the `ip.src` query costs about the same as printing the packet number. Disabling UDP, TCP, DNS, HTTP, TLS, and data dissection in tshark saves only 22%. The cost is tshark's per-packet engine itself.
 
 Notes: `study/mechanism.md`, `study/benchmark.md`, `study/spike.md`.
+
+## Frame walk, 10 Oct 2026
+
+Same machine and method as the table above. The file is the million-packet Ethernet capture. tshark printed `frame.number`. fin walked frames and did not extract a field.
+
+| Walk | Time |
+| --- | ---: |
+| tshark 4.6.9 `-e frame.number` | 7.69 s |
+| fin process | 0.057 s |
+| fin in-memory walk | 0.019 s |
+
+The process time is 136× the tshark floor. The 0.038s between process start and the in-memory walk is the next cut.
 
 ## License
 
