@@ -1,0 +1,16 @@
+# cargo test only. The live tshark 4.6.9 check skips unless that binary is
+# installed. Install it in CI when the sequential reader exists.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
