@@ -23,6 +23,23 @@ const JOURNAL_KEY: &[u8] = b"__REALTIME_TIMESTAMP=";
 const LE_ORDER: [u8; 4] = [0x4d, 0x3c, 0x2b, 0x1a];
 const BE_ORDER: [u8; 4] = [0x1a, 0x2b, 0x3c, 0x4d];
 
+/// tshark 4.6.9 `register_pcapng_block_type_information`. `packet` is
+/// `!handler->internal`: those blocks are rows, and a fault on them is
+/// exit 14 even when no row was produced.
+const BLOCKS: &[(u32, bool)] = &[
+    (SHB_TYPE, false),
+    (IDB_TYPE, false),
+    (OPB_TYPE, true),
+    (SPB_TYPE, true),
+    (NRB_TYPE, false),
+    (ISB_TYPE, false),
+    (EPB_TYPE, true),
+    (JOURNAL_TYPE, true),
+    (DSB_TYPE, false),
+    (CB_COPY, true),
+    (CB_NO_COPY, true),
+];
+
 struct Interface {
     link_type: u32,
     snaplen: u32,
@@ -53,7 +70,7 @@ fn open_section(bytes: &[u8]) -> Result<(bool, usize), Fault> {
         Some(big_endian) => big_endian,
         None => return Err(Fault::NotACaptureFile),
     };
-    let total = block_total(bytes, 0, big_endian, SHB_MIN, Fault::NotACaptureFile)?;
+    let total = block_total(bytes, 0, big_endian, SHB_MIN, Fault::NotACaptureFile, true)?;
     shb_version(bytes, 0, big_endian)?;
     options::walk_shb(bytes, 24, total - 4, big_endian)?;
     Ok((big_endian, total))
@@ -104,10 +121,9 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
 }
 
 fn is_packet(block_type: u32) -> bool {
-    matches!(
-        block_type,
-        EPB_TYPE | SPB_TYPE | OPB_TYPE | JOURNAL_TYPE | CB_COPY | CB_NO_COPY
-    )
+    BLOCKS
+        .iter()
+        .any(|&(id, packet)| id == block_type && packet)
 }
 
 fn packet_type_at(bytes: &[u8], offset: usize, big_endian: bool) -> bool {
@@ -121,7 +137,7 @@ fn block_at(bytes: &[u8], offset: usize, big_endian: bool) -> Result<(u32, usize
     }
     let block_type = u32_at(bytes, offset, big_endian);
     if block_type != SHB_TYPE {
-        let total = block_total(bytes, offset, big_endian, BLOCK_MIN, Fault::CutShort)?;
+        let total = block_total(bytes, offset, big_endian, BLOCK_MIN, Fault::CutShort, false)?;
         return Ok((block_type, total, big_endian));
     }
     if rest < 12 {
@@ -131,7 +147,7 @@ fn block_at(bytes: &[u8], offset: usize, big_endian: bool) -> Result<(u32, usize
         Some(endian) => endian,
         None => return Err(Fault::CutShort),
     };
-    let total = block_total(bytes, offset, endian, SHB_MIN, Fault::CutShort)?;
+    let total = block_total(bytes, offset, endian, SHB_MIN, Fault::CutShort, true)?;
     Ok((block_type, total, endian))
 }
 
@@ -141,16 +157,18 @@ fn block_total(
     big_endian: bool,
     minimum: u32,
     short: Fault,
+    round_first: bool,
 ) -> Result<usize, Fault> {
     let rest = bytes.len() - offset;
     if rest < 8 {
         return Err(short);
     }
     let first = u32_at(bytes, offset + 4, big_endian);
-    if first < minimum {
+    let padded = roundup4_u32(first);
+    let stored = if round_first { padded } else { first };
+    if stored < minimum {
         return Err(short);
     }
-    let padded = roundup4_u32(first);
     if padded < first || padded > MAX_BLOCK_SIZE {
         return Err(Fault::BlockTooLarge { length: first });
     }
@@ -160,9 +178,9 @@ fn block_total(
     }
     let second = u32_at(bytes, offset + total - 4, big_endian);
     let rounded_second = roundup4_u32(second);
-    if rounded_second != first {
+    if rounded_second != stored {
         return Err(Fault::BlockLengths {
-            first,
+            first: stored,
             second: rounded_second,
         });
     }
@@ -178,6 +196,7 @@ fn consume<'a>(
     interfaces: &mut Vec<Interface>,
     frames: &mut Vec<Frame<'a>>,
 ) -> Result<(), Fault> {
+    // Same set as BLOCKS. Unknown types are skipped.
     match block_type {
         SHB_TYPE => {
             shb_version(bytes, offset, big_endian)?;

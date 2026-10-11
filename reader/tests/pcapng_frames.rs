@@ -54,6 +54,14 @@ fn section_header(endian: Endian) -> Vec<u8> {
     section_header_version(endian, 1, 0)
 }
 
+fn section_header_totals(endian: Endian, first: u32, second: u32) -> Vec<u8> {
+    let mut header = section_header(endian);
+    header[4..8].copy_from_slice(&pack_u32(first, endian));
+    let end = header.len();
+    header[end - 4..end].copy_from_slice(&pack_u32(second, endian));
+    header
+}
+
 fn section_header_version(endian: Endian, major: u16, minor: u16) -> Vec<u8> {
     let block_type = [0x0a, 0x0d, 0x0d, 0x0a];
     let total = pack_u32(28, endian);
@@ -1195,6 +1203,59 @@ fn a_trailer_three_below_the_first_length_is_accepted() {
 }
 
 #[test]
+fn a_trailer_that_rounds_up_to_the_first_length_is_accepted() {
+    let bytes = concat(&[&prefix(None), &epb_lengths(36, 33)]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_later_unaligned_epb_trailer_keeps_both_frames() {
+    let bytes = concat(&[&prefix(Some(1)), &epb_lengths(36, 35)]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 2);
+    assert_eq!(capture.frames[0].captured, &[1]);
+    assert_eq!(capture.frames[1].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn opening_shb_first_length_27_still_opens() {
+    let bytes = concat(&[
+        &section_header_totals(Endian::Little, 27, 27),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn opening_shb_trailer_27_still_opens() {
+    let bytes = concat(&[
+        &section_header_totals(Endian::Little, 28, 27),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
 fn a_trailer_that_does_not_round_to_the_first_length_fails() {
     let bytes = concat(&[&prefix(None), &epb_lengths(36, 32)]);
     let capture = read_capture(&bytes);
@@ -1318,6 +1379,20 @@ fn an_opening_journal_export_fault_exits_14() {
 }
 
 #[test]
+fn a_journal_export_without_packets_is_a_frame() {
+    let entry = b"__REALTIME_TIMESTAMP=0\n";
+    let journal = block(Endian::Little, 9, &[entry.as_slice(), &[0]].concat());
+    let bytes = concat(&[&section_header(Endian::Little), &journal]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, entry.as_slice());
+    assert_eq!(capture.frames[0].original_length, 23);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
 fn a_custom_block_between_packets_is_a_frame() {
     let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
     let bytes = concat(&[
@@ -1331,6 +1406,35 @@ fn a_custom_block_between_packets_is_a_frame() {
     assert_eq!(capture.frames.len(), 3);
     assert_eq!(capture.frames[1].captured, b"");
     assert_eq!(capture.frames[1].original_length, 0);
+    assert_eq!(capture.frames[2].captured, &[0x02]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_custom_block_without_packets_is_a_frame() {
+    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
+    let bytes = concat(&[&section_header(Endian::Little), &custom]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, b"");
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_nocopy_custom_block_between_packets_is_a_frame() {
+    let custom = block(Endian::Little, 0x4000_0BAD, &pack_u32(1, Endian::Little));
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &custom,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, b"");
     assert_eq!(capture.frames[2].captured, &[0x02]);
     assert_eq!(capture.exit_code(), 0);
 }
