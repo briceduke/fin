@@ -413,16 +413,41 @@ fn journal_time(entry: &[u8]) -> Option<Timestamp> {
     let start = entry
         .windows(JOURNAL_KEY.len())
         .position(|window| window == JOURNAL_KEY)?;
-    let mut digits = &entry[start + JOURNAL_KEY.len()..];
-    while let Some((&byte, rest)) = digits.split_first() {
+    let ticks = ws_strtou64(&entry[start + JOURNAL_KEY.len()..])?;
+    Some(Timestamp {
+        seconds: (ticks / 1_000_000) as i64,
+        fraction: (ticks % 1_000_000) as u32,
+        unit: TimeUnit::Microsecond,
+    })
+}
+
+/// tshark 4.6.9 `ws_strtou64` with `endptr` set (pcapng.c journal stamp).
+fn ws_strtou64(bytes: &[u8]) -> Option<u64> {
+    match bytes.first() {
+        Some(b'+' | b'-') | None => return None,
+        _ => {}
+    }
+    let mut rest = bytes;
+    while let Some((&byte, tail)) = rest.split_first() {
         if !byte.is_ascii_whitespace() {
             break;
         }
-        digits = rest;
+        rest = tail;
     }
+    let negative = match rest.split_first() {
+        Some((b'+', tail)) => {
+            rest = tail;
+            false
+        }
+        Some((b'-', tail)) => {
+            rest = tail;
+            true
+        }
+        _ => false,
+    };
     let mut ticks = 0u64;
     let mut seen = false;
-    for &byte in digits {
+    for &byte in rest {
         if !byte.is_ascii_digit() {
             break;
         }
@@ -432,10 +457,10 @@ fn journal_time(entry: &[u8]) -> Option<Timestamp> {
     if !seen {
         return None;
     }
-    Some(Timestamp {
-        seconds: (ticks / 1_000_000) as i64,
-        fraction: (ticks % 1_000_000) as u32,
-        unit: TimeUnit::Microsecond,
+    Some(if negative {
+        0u64.wrapping_sub(ticks)
+    } else {
+        ticks
     })
 }
 

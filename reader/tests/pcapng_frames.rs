@@ -1475,6 +1475,74 @@ fn a_journal_timestamp_with_a_leading_space_is_read() {
 }
 
 #[test]
+fn a_journal_timestamp_with_a_leading_plus_is_missing() {
+    let entry = b"__REALTIME_TIMESTAMP=+1\nxxxx";
+    let journal = block(Endian::Little, 9, entry);
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(capture.frames[1].timestamp, None);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_journal_timestamp_with_a_space_and_plus_is_read() {
+    let entry = b"__REALTIME_TIMESTAMP= +1\nxxxx";
+    let journal = block(Endian::Little, 9, &pad_four(entry));
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(
+        capture.frames[1].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 1,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_journal_timestamp_with_a_space_and_minus_wraps() {
+    let entry = b"__REALTIME_TIMESTAMP= -1\nxxxx";
+    let journal = block(Endian::Little, 9, &pad_four(entry));
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(
+        capture.frames[1].timestamp,
+        Some(Timestamp {
+            seconds: 18_446_744_073_709,
+            fraction: 551_615,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
 fn a_custom_block_between_packets_is_a_frame() {
     let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
     let bytes = concat(&[
