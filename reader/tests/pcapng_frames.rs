@@ -55,7 +55,14 @@ fn section_header(endian: Endian) -> Vec<u8> {
 }
 
 fn section_header_totals(endian: Endian, first: u32, second: u32) -> Vec<u8> {
+    section_header_padded(endian, first, second, 0)
+}
+
+fn section_header_padded(endian: Endian, first: u32, second: u32, pad: usize) -> Vec<u8> {
     let mut header = section_header(endian);
+    let trailer = header.split_off(header.len() - 4);
+    header.extend_from_slice(&vec![0u8; pad]);
+    header.extend_from_slice(&trailer);
     header[4..8].copy_from_slice(&pack_u32(first, endian));
     let end = header.len();
     header[end - 4..end].copy_from_slice(&pack_u32(second, endian));
@@ -1256,6 +1263,38 @@ fn opening_shb_trailer_27_still_opens() {
 }
 
 #[test]
+fn opening_shb_first_length_29_still_opens() {
+    let bytes = concat(&[
+        &section_header_padded(Endian::Little, 29, 32, 4),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_later_shb_first_length_27_still_opens() {
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &section_header_totals(Endian::Little, 27, 27),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 2);
+    assert_eq!(capture.frames[0].captured, &[1]);
+    assert_eq!(capture.frames[1].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
 fn a_trailer_that_does_not_round_to_the_first_length_fails() {
     let bytes = concat(&[&prefix(None), &epb_lengths(36, 32)]);
     let capture = read_capture(&bytes);
@@ -1389,6 +1428,49 @@ fn a_journal_export_without_packets_is_a_frame() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured, entry.as_slice());
     assert_eq!(capture.frames[0].original_length, 23);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn an_overflowing_journal_timestamp_is_missing() {
+    let entry = b"__REALTIME_TIMESTAMP=18446744073709551616\n";
+    let journal = block(Endian::Little, 9, entry);
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(capture.frames[1].timestamp, None);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_journal_timestamp_with_a_leading_space_is_read() {
+    let entry = b"__REALTIME_TIMESTAMP= 1\nxxxx";
+    let journal = block(Endian::Little, 9, entry);
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(
+        capture.frames[1].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 1,
+            unit: TimeUnit::Microsecond,
+        })
+    );
     assert_eq!(capture.exit_code(), 0);
 }
 

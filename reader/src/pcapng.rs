@@ -413,7 +413,13 @@ fn journal_time(entry: &[u8]) -> Option<Timestamp> {
     let start = entry
         .windows(JOURNAL_KEY.len())
         .position(|window| window == JOURNAL_KEY)?;
-    let digits = &entry[start + JOURNAL_KEY.len()..];
+    let mut digits = &entry[start + JOURNAL_KEY.len()..];
+    while let Some((&byte, rest)) = digits.split_first() {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        digits = rest;
+    }
     let mut ticks = 0u64;
     let mut seen = false;
     for &byte in digits {
@@ -421,9 +427,7 @@ fn journal_time(entry: &[u8]) -> Option<Timestamp> {
             break;
         }
         seen = true;
-        ticks = ticks
-            .saturating_mul(10)
-            .saturating_add(u64::from(byte - b'0'));
+        ticks = ticks.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
     }
     if !seen {
         return None;
