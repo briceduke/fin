@@ -119,7 +119,11 @@ fn systematic() -> Vec<Vec<u8>> {
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= -1\nxxxx"));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= +1\nxx"));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= -1\nxx"));
-    for space in [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c] {
+    for space in [b' ', b'\t', b'\n', 0x0b, b'\x0c', b'\r'] {
+        files.push(extra_after_packet(
+            9,
+            &journal_stamp(&[space, b'8', b'\n', b'x', b'x', b'x', b'x']),
+        ));
         files.push(extra_after_packet(
             9,
             &journal_stamp(&[space, b'+', b'1', b'\n']),
@@ -129,6 +133,7 @@ fn systematic() -> Vec<Vec<u8>> {
             &journal_stamp(&[space, b'-', b'1', b'\n']),
         ));
     }
+    files.push(extra_solo(9, &journal_stamp(b"\x0b8\nxxxx")));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=   +2\n"));
     files.push(extra_after_packet(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x0000_0BAD, &[]));

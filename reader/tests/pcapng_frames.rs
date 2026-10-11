@@ -1197,6 +1197,16 @@ fn journal_between_packets(after_eq: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (entry, bytes)
 }
 
+fn assert_journal_stamp(after_eq: &[u8], want: Option<Timestamp>) {
+    let (entry, bytes) = journal_between_packets(after_eq);
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.fault, None, "{after_eq:?}");
+    assert_eq!(capture.frames.len(), 3, "{after_eq:?}");
+    assert_eq!(capture.frames[1].captured, entry.as_slice(), "{after_eq:?}");
+    assert_eq!(capture.frames[1].timestamp, want, "{after_eq:?}");
+    assert_eq!(capture.exit_code(), 0, "{after_eq:?}");
+}
+
 fn epb_lengths(first: u32, second: u32) -> Vec<u8> {
     let body = concat(&[
         &pack_u32(0, Endian::Little),
@@ -1522,8 +1532,13 @@ fn a_journal_timestamp_with_a_leading_minus_is_missing() {
 }
 
 #[test]
-fn a_journal_timestamp_accepts_a_sign_after_each_isspace() {
-    const SPACES: [u8; 6] = [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c];
+fn a_journal_timestamp_skips_each_isspace() {
+    const SPACES: [u8; 6] = [b' ', b'\t', b'\n', 0x0b, b'\x0c', b'\r'];
+    let eight = Some(Timestamp {
+        seconds: 0,
+        fraction: 8,
+        unit: TimeUnit::Microsecond,
+    });
     let plus = Some(Timestamp {
         seconds: 0,
         fraction: 1,
@@ -1535,27 +1550,38 @@ fn a_journal_timestamp_accepts_a_sign_after_each_isspace() {
         unit: TimeUnit::Microsecond,
     });
     for &space in &SPACES {
-        for (sign, want) in [(b'+', plus), (b'-', wrap)] {
-            let after = [space, sign, b'1', b'\n'];
-            let (entry, bytes) = journal_between_packets(&after);
-            let capture = read_capture(&bytes);
-            assert_eq!(capture.fault, None, "{after:?}");
-            assert_eq!(capture.frames.len(), 3, "{after:?}");
-            assert_eq!(capture.frames[1].captured, entry.as_slice(), "{after:?}");
-            assert_eq!(capture.frames[1].timestamp, want, "{after:?}");
-            assert_eq!(capture.exit_code(), 0, "{after:?}");
-        }
+        let digit = [space, b'8', b'\n', b'x', b'x', b'x', b'x'];
+        assert_journal_stamp(&digit, eight);
+        assert_journal_stamp(&[space, b'+', b'1', b'\n'], plus);
+        assert_journal_stamp(&[space, b'-', b'1', b'\n'], wrap);
     }
-    let (entry, bytes) = journal_between_packets(b"   +2\n");
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(
-        capture.frames[1].timestamp,
+    assert_journal_stamp(
+        b"   +2\n",
         Some(Timestamp {
             seconds: 0,
             fraction: 2,
+            unit: TimeUnit::Microsecond,
+        }),
+    );
+}
+
+#[test]
+fn a_journal_timestamp_skips_a_vertical_tab_before_a_digit() {
+    let entry = b"__REALTIME_TIMESTAMP=\x0b8\nxxxx";
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &block(Endian::Little, 9, entry),
+    ]);
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, entry.as_slice());
+    assert_eq!(capture.frames[0].captured.len(), 28);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 8,
             unit: TimeUnit::Microsecond,
         })
     );

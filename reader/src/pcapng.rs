@@ -429,8 +429,7 @@ fn ws_strtou64(bytes: &[u8]) -> Option<u64> {
     }
     let mut rest = bytes;
     while let Some((&byte, tail)) = rest.split_first() {
-        // C isspace / g_ascii_isspace. Rust is_ascii_whitespace omits `\v`.
-        if !matches!(byte, b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r' | b' ') {
+        if !isspace(byte) {
             break;
         }
         rest = tail;
@@ -463,6 +462,12 @@ fn ws_strtou64(bytes: &[u8]) -> Option<u64> {
     } else {
         ticks
     })
+}
+
+/// GLib `g_parse_long_long` `ISSPACE` in `gstrfuncs.c`: space, tab, `\n`,
+/// `\v`, `\f`, `\r`. `g_ascii_isspace` and Rust `is_ascii_whitespace` omit `\v`.
+fn isspace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r')
 }
 
 fn enhanced<'a>(
