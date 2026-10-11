@@ -1619,6 +1619,34 @@ fn a_journal_timestamp_after_an_embedded_nul_is_missing() {
 }
 
 #[test]
+fn a_custom_block_does_not_inherit_a_journal_stamp_past_nul() {
+    let entry = b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx";
+    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
+    let bytes = concat(&[
+        &prefix(None),
+        &enhanced_packet(Endian::Little, 0, 1_500_000, 1, 1, &[0x01], &[]),
+        &block(Endian::Little, 9, &pad_four(entry)),
+        &custom,
+    ]);
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 1,
+            fraction: 500_000,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(capture.frames[1].timestamp, None);
+    assert_eq!(capture.frames[2].captured, b"");
+    assert_eq!(capture.frames[2].timestamp, None);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
 fn a_journal_timestamp_before_an_embedded_nul_is_read() {
     assert_journal_entry(
         b"__REALTIME_TIMESTAMP=8\nxxxx\x00FOO=bar",

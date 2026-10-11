@@ -410,8 +410,13 @@ fn journal(bytes: &[u8], offset: usize, total: usize) -> Result<Frame<'_>, Fault
 }
 
 fn journal_time(entry: &[u8]) -> Option<Timestamp> {
-    // tshark writes a NUL at the stripped length and uses strstr.
-    let c_str = entry.split(|&byte| byte == 0).next().unwrap_or(&[]);
+    // tshark writes a NUL at the stripped length, then strstr. Cut at
+    // the first embedded NUL or that length, whichever comes first.
+    let end = entry
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(entry.len());
+    let c_str = &entry[..end];
     let start = c_str
         .windows(JOURNAL_KEY.len())
         .position(|window| window == JOURNAL_KEY)?;

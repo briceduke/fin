@@ -145,6 +145,10 @@ fn systematic() -> Vec<Vec<u8>> {
     files.push(extra_solo(9, b"xx__REALTIME_TIMESTAMP="));
     files.push(extra_solo(9, b"__REALTIME_TIMESTAMP=0x10\nxxxx"));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=0"));
+    files.push(epb_journal_custom(
+        1_500_000,
+        b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx",
+    ));
     files.push(extra_after_packet(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x0000_0BAD, &[]));
     files.push(extra_only(0x0000_0BAD, &[]));
@@ -338,6 +342,15 @@ fn extra(prior_packet: bool, block_type: u32, body: &[u8]) -> Vec<u8> {
     }
     file.extend_from_slice(&block(block_type, body));
     file.extend_from_slice(&epb(0, 0, &[0x02], &[]));
+    file
+}
+
+fn epb_journal_custom(ticks: u64, entry: &[u8]) -> Vec<u8> {
+    let mut file = shb(1, 0);
+    file.extend_from_slice(&idb(&[]));
+    file.extend_from_slice(&epb(0, ticks, &[0x01], &[]));
+    file.extend_from_slice(&block(9, entry));
+    file.extend_from_slice(&block(0x0000_0BAD, &1u32.to_le_bytes()));
     file
 }
 
