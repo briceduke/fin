@@ -412,7 +412,7 @@ fn fin_rows(capture: &reader::Capture<'_>) -> String {
                 };
                 format!("{}.{:09}", stamp.seconds, nanos)
             }
-            None => "0.000000000".to_string(),
+            None => String::new(),
         };
         out.push_str(&format!(
             "{}\t{}\t{}\n",
