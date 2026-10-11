@@ -322,6 +322,53 @@ fn simple_packet_has_no_timestamp() {
 }
 
 #[test]
+fn simple_packet_snaplen_zero_keeps_the_original_length() {
+    let packet = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 0, &[]),
+        &simple_packet(Endian::Little, 8, &packet),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].timestamp, None);
+    assert_eq!(capture.frames[0].original_length, 8);
+    assert_eq!(capture.frames[0].link_type, 1);
+    assert_eq!(capture.frames[0].captured, &packet);
+    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+}
+
+#[test]
+fn simple_packet_snaplen_zero_above_the_maximum_is_not_a_frame() {
+    let spb = simple_packet(Endian::Little, 262145, &[]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 0, &[]),
+        &spb,
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::CapturedLengthTooBig {
+            length: 262145,
+            kind: CaptureKind::Pcapng,
+        }
+    );
+    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(
+        fault
+            .phrase()
+            .contains("larger than maximum supported length 262144"),
+        true
+    );
+}
+
+#[test]
 fn nanosecond_interface_resolution() {
     let resol = option(Endian::Little, 9, &[9]);
     let bytes = concat(&[

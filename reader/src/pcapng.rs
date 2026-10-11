@@ -231,13 +231,21 @@ fn simple<'a>(
         Packet {
             interface_id: 0,
             ticks: None,
-            captured_len: original_len.min(snaplen),
+            captured_len: captured_from_snaplen(original_len, snaplen),
             original_len,
             packet_at: offset + 12,
         },
         offset + total - 4,
         interfaces,
     )
+}
+
+fn captured_from_snaplen(original_len: u32, snaplen: u32) -> u32 {
+    if snaplen == 0 {
+        original_len
+    } else {
+        original_len.min(snaplen)
+    }
 }
 
 fn obsolete<'a>(
