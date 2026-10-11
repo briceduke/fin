@@ -104,7 +104,10 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
 }
 
 fn is_packet(block_type: u32) -> bool {
-    matches!(block_type, EPB_TYPE | SPB_TYPE | OPB_TYPE)
+    matches!(
+        block_type,
+        EPB_TYPE | SPB_TYPE | OPB_TYPE | JOURNAL_TYPE | CB_COPY | CB_NO_COPY
+    )
 }
 
 fn packet_type_at(bytes: &[u8], offset: usize, big_endian: bool) -> bool {

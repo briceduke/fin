@@ -186,7 +186,8 @@ impl<'a> Capture<'a> {
     /// Process status tshark 4.6.9 uses for this capture.
     ///
     /// [`Fault::UnsupportedLinkType`] is fin's own rejection. The status is 1.
-    /// Any other fault is 3 before a packet block is reached, and 14 after.
+    /// Any other fault is 3 before a packet-like block is reached, and 14 after.
+    /// Packet-like blocks are EPB, SPB, OPB, custom, and systemd journal export.
     pub fn exit_code(&self) -> i32 {
         match self.fault {
             None => 0,

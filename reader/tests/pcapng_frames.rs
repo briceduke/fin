@@ -1304,13 +1304,13 @@ fn an_empty_journal_export_stops_the_file() {
 }
 
 #[test]
-fn an_opening_journal_export_fault_exits_3() {
+fn an_opening_journal_export_fault_exits_14() {
     let bytes = concat(&[&prefix(None), &unknown_block(Endian::Little, 9)]);
     let capture = read_capture(&bytes);
     let fault = capture.fault.unwrap();
 
     assert_eq!(capture.frames.len(), 0);
-    assert_eq!(capture.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         fault.phrase(),
         "pcapng: block content length 0 of a systemd journal export is less than the minimum systemd journal export content size 23"
