@@ -108,6 +108,11 @@ fn systematic() -> Vec<Vec<u8>> {
     files.push(extra_only(9, &[]));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=0\n\x00"));
     files.push(extra_solo(9, b"__REALTIME_TIMESTAMP=0\n\x00"));
+    files.push(extra_after_packet(
+        9,
+        b"__REALTIME_TIMESTAMP=18446744073709551616\n",
+    ));
+    files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= 1\nxxxx"));
     files.push(extra_after_packet(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x0000_0BAD, &[]));
     files.push(extra_only(0x0000_0BAD, &[]));
@@ -136,6 +141,8 @@ fn systematic() -> Vec<Vec<u8>> {
     files.push(huge_later());
     files.push(opening_shb_totals(27, 27));
     files.push(opening_shb_totals(28, 27));
+    files.push(opening_shb_padded(29, 32, 4));
+    files.push(later_shb_totals(27, 27));
     for length in [0u16, 1, 2, 4, 8, 9, 16] {
         files.push(capture(false, &[raw_opt(9, length, &[9])], true));
         files.push(capture(
@@ -187,7 +194,12 @@ fn random_extra(rng: &mut Rng) -> Vec<u8> {
 
 fn random_extra_body(rng: &mut Rng, block_type: u32) -> Vec<u8> {
     match block_type {
-        9 if rng.bit() => b"__REALTIME_TIMESTAMP=0\n".to_vec(),
+        9 => match rng.bounded(4) {
+            0 => b"__REALTIME_TIMESTAMP=0\n".to_vec(),
+            1 => b"__REALTIME_TIMESTAMP=18446744073709551616\n".to_vec(),
+            2 => b"__REALTIME_TIMESTAMP= 1\nxxxx".to_vec(),
+            _ => vec![0; rng.bounded(8) as usize],
+        },
         0x0000_0BAD | 0x4000_0BAD if rng.bit() => 1u32.to_le_bytes().to_vec(),
         5 => {
             let mut body = vec![0u8; 12];
@@ -302,12 +314,35 @@ fn epb_trailer_file(prior_packet: bool, first: u32, second: u32) -> Vec<u8> {
 }
 
 fn opening_shb_totals(first: u32, second: u32) -> Vec<u8> {
-    let mut file = shb(1, 0);
-    file[4..8].copy_from_slice(&first.to_le_bytes());
-    file[24..28].copy_from_slice(&second.to_le_bytes());
+    opening_shb_padded(first, second, 0)
+}
+
+fn opening_shb_padded(first: u32, second: u32, pad: usize) -> Vec<u8> {
+    let mut file = shb_padded(first, second, pad);
     file.extend_from_slice(&idb(&[]));
     file.extend_from_slice(&epb(0, 0, &[0xaa], &[]));
     file
+}
+
+fn later_shb_totals(first: u32, second: u32) -> Vec<u8> {
+    let mut file = shb(1, 0);
+    file.extend_from_slice(&idb(&[]));
+    file.extend_from_slice(&epb(0, 0, &[0x01], &[]));
+    file.extend_from_slice(&shb_padded(first, second, 0));
+    file.extend_from_slice(&idb(&[]));
+    file.extend_from_slice(&epb(0, 0, &[0xaa], &[]));
+    file
+}
+
+fn shb_padded(first: u32, second: u32, pad: usize) -> Vec<u8> {
+    let mut header = shb(1, 0);
+    let trailer = header.split_off(header.len() - 4);
+    header.extend_from_slice(&vec![0u8; pad]);
+    header.extend_from_slice(&trailer);
+    header[4..8].copy_from_slice(&first.to_le_bytes());
+    let end = header.len();
+    header[end - 4..end].copy_from_slice(&second.to_le_bytes());
+    header
 }
 
 fn later_unaligned_trailer() -> Vec<u8> {
