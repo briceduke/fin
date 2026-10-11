@@ -12,12 +12,11 @@ env:
   TSHARK_VERSION: "4.6.9"
   TSHARK_SHA256: d062d416a1ab3a49975aafe3a671c882dde0562ccd71b078808ceb59d465fc0f
   TSHARK_URL: https://www.wireshark.org/download/src/all-versions/wireshark-4.6.9.tar.xz
+  TSHARK_PREFIX: /tmp/tshark-4.6.9
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      TSHARK_PREFIX: ${{ runner.temp }}/tshark-4.6.9
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
