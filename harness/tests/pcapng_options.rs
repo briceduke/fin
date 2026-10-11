@@ -3,6 +3,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,6 +22,10 @@ fn malformed_idb_options_match_tshark_469() {
         Ok(session) => session,
         Err(RunError::Version { found }) => {
             eprintln!("skip: tshark version is {found}");
+            return;
+        }
+        Err(RunError::Spawn { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            eprintln!("skip: tshark 4.6.9 is not installed");
             return;
         }
         Err(error) => panic!("{error}"),
@@ -339,7 +344,23 @@ fn tshark_path() -> Option<PathBuf> {
     if windows.is_file() {
         return Some(windows);
     }
-    Some(PathBuf::from("tshark"))
+    let local = PathBuf::from("/usr/local/bin/tshark");
+    if local.is_file() {
+        return Some(local);
+    }
+    on_path("tshark")
+}
+
+fn on_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).find_map(|dir| {
+        let unix = dir.join(name);
+        if unix.is_file() {
+            return Some(unix);
+        }
+        let windows = dir.join(format!("{name}.exe"));
+        windows.is_file().then_some(windows)
+    })
 }
 
 struct Rng(u64);
