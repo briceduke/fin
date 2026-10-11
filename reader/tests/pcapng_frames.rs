@@ -1207,6 +1207,19 @@ fn assert_journal_stamp(after_eq: &[u8], want: Option<Timestamp>) {
     assert_eq!(capture.exit_code(), 0, "{after_eq:?}");
 }
 
+fn assert_journal_entry(entry: &[u8], want: Option<Timestamp>) {
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &block(Endian::Little, 9, &pad_four(entry)),
+    ]);
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.fault, None, "{entry:?}");
+    assert_eq!(capture.frames.len(), 1, "{entry:?}");
+    assert_eq!(capture.frames[0].captured, entry, "{entry:?}");
+    assert_eq!(capture.frames[0].timestamp, want, "{entry:?}");
+    assert_eq!(capture.exit_code(), 0, "{entry:?}");
+}
+
 fn epb_lengths(first: u32, second: u32) -> Vec<u8> {
     let body = concat(&[
         &pack_u32(0, Endian::Little),
@@ -1586,6 +1599,82 @@ fn a_journal_timestamp_skips_a_vertical_tab_before_a_digit() {
         })
     );
     assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_journal_timestamp_after_an_embedded_nul_is_missing() {
+    let entry = b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx";
+    assert_journal_entry(entry, None);
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &block(Endian::Little, 9, &pad_four(entry)),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(capture.frames[1].timestamp, None);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_journal_timestamp_before_an_embedded_nul_is_read() {
+    assert_journal_entry(
+        b"__REALTIME_TIMESTAMP=8\nxxxx\x00FOO=bar",
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 8,
+            unit: TimeUnit::Microsecond,
+        }),
+    );
+}
+
+#[test]
+fn a_journal_timestamp_inside_another_field_is_read() {
+    assert_journal_entry(
+        b"x__REALTIME_TIMESTAMP=8\nxxxx",
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 8,
+            unit: TimeUnit::Microsecond,
+        }),
+    );
+}
+
+#[test]
+fn a_journal_timestamp_with_no_value_bytes_is_missing() {
+    assert_journal_entry(b"xx__REALTIME_TIMESTAMP=", None);
+}
+
+#[test]
+fn a_journal_timestamp_stops_on_trailing_garbage() {
+    assert_journal_entry(
+        b"__REALTIME_TIMESTAMP=0x10\nxxxx",
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        }),
+    );
+}
+
+#[test]
+fn a_journal_entry_stripped_below_the_minimum_stops_the_file() {
+    let entry = b"__REALTIME_TIMESTAMP=0";
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &block(Endian::Little, 9, &pad_four(entry)),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(fault, Fault::JournalEntry { length: 22 });
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: entry length 22 is too small (< 23)"
+    );
 }
 
 #[test]

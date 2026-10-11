@@ -410,10 +410,12 @@ fn journal(bytes: &[u8], offset: usize, total: usize) -> Result<Frame<'_>, Fault
 }
 
 fn journal_time(entry: &[u8]) -> Option<Timestamp> {
-    let start = entry
+    // tshark writes a NUL at the stripped length and uses strstr.
+    let c_str = entry.split(|&byte| byte == 0).next().unwrap_or(&[]);
+    let start = c_str
         .windows(JOURNAL_KEY.len())
         .position(|window| window == JOURNAL_KEY)?;
-    let ticks = ws_strtou64(&entry[start + JOURNAL_KEY.len()..])?;
+    let ticks = ws_strtou64(&c_str[start + JOURNAL_KEY.len()..])?;
     Some(Timestamp {
         seconds: (ticks / 1_000_000) as i64,
         fraction: (ticks % 1_000_000) as u32,

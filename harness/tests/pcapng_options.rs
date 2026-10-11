@@ -135,6 +135,16 @@ fn systematic() -> Vec<Vec<u8>> {
     }
     files.push(extra_solo(9, &journal_stamp(b"\x0b8\nxxxx")));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=   +2\n"));
+    files.push(extra_solo(9, b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx"));
+    files.push(extra_after_packet(
+        9,
+        b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx",
+    ));
+    files.push(extra_solo(9, b"__REALTIME_TIMESTAMP=8\nxxxx\x00FOO=bar"));
+    files.push(extra_solo(9, b"x__REALTIME_TIMESTAMP=8\nxxxx"));
+    files.push(extra_solo(9, b"xx__REALTIME_TIMESTAMP="));
+    files.push(extra_solo(9, b"__REALTIME_TIMESTAMP=0x10\nxxxx"));
+    files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=0"));
     files.push(extra_after_packet(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x0000_0BAD, &[]));
     files.push(extra_only(0x0000_0BAD, &[]));
@@ -216,7 +226,7 @@ fn random_extra(rng: &mut Rng) -> Vec<u8> {
 
 fn random_extra_body(rng: &mut Rng, block_type: u32) -> Vec<u8> {
     match block_type {
-        9 => match rng.bounded(9) {
+        9 => match rng.bounded(11) {
             0 => b"__REALTIME_TIMESTAMP=0\n".to_vec(),
             1 => b"__REALTIME_TIMESTAMP=18446744073709551616\n".to_vec(),
             2 => b"__REALTIME_TIMESTAMP= 1\nxxxx".to_vec(),
@@ -233,6 +243,8 @@ fn random_extra_body(rng: &mut Rng, block_type: u32) -> Vec<u8> {
                     b'\n',
                 ])
             }
+            8 => b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx".to_vec(),
+            9 => b"x__REALTIME_TIMESTAMP=8\nxxxx".to_vec(),
             _ => vec![0; rng.bounded(8) as usize],
         },
         0x0000_0BAD | 0x4000_0BAD if rng.bit() => 1u32.to_le_bytes().to_vec(),
