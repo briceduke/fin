@@ -1419,7 +1419,26 @@ fn a_custom_block_without_packets_is_a_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured, b"");
+    assert_eq!(capture.frames[0].timestamp, None);
     assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_custom_block_keeps_the_previous_packet_timestamp() {
+    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
+    let bytes = concat(&[&prefix(Some(1)), &custom]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 2);
+    assert_eq!(
+        capture.frames[1].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
 }
 
 #[test]

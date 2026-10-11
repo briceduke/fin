@@ -90,6 +90,7 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
     let mut frames = Vec::new();
     let mut interfaces = Vec::new();
     let mut after_packet = false;
+    let mut last_ts = None;
     while offset < bytes.len() {
         let (block_type, total, endian) = match block_at(bytes, offset, big_endian) {
             Ok(found) => found,
@@ -112,6 +113,7 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
             big_endian,
             &mut interfaces,
             &mut frames,
+            &mut last_ts,
         ) {
             return Capture::halt(frames, fault, after_packet);
         }
@@ -195,6 +197,7 @@ fn consume<'a>(
     big_endian: bool,
     interfaces: &mut Vec<Interface>,
     frames: &mut Vec<Frame<'a>>,
+    last_ts: &mut Option<Timestamp>,
 ) -> Result<(), Fault> {
     // Same set as BLOCKS. Unknown types are skipped.
     match block_type {
@@ -204,17 +207,41 @@ fn consume<'a>(
             interfaces.clear();
         }
         IDB_TYPE => interfaces.push(interface(bytes, offset, total, big_endian)?),
-        EPB_TYPE => frames.push(enhanced(bytes, offset, total, big_endian, interfaces)?),
-        SPB_TYPE => frames.push(simple(bytes, offset, total, big_endian, interfaces)?),
-        OPB_TYPE => frames.push(obsolete(bytes, offset, total, big_endian, interfaces)?),
+        EPB_TYPE => push_stamp(
+            frames,
+            enhanced(bytes, offset, total, big_endian, interfaces)?,
+            last_ts,
+        ),
+        SPB_TYPE => {
+            frames.push(simple(bytes, offset, total, big_endian, interfaces)?);
+            *last_ts = None;
+        }
+        OPB_TYPE => push_stamp(
+            frames,
+            obsolete(bytes, offset, total, big_endian, interfaces)?,
+            last_ts,
+        ),
         ISB_TYPE => isb(bytes, offset, total, big_endian)?,
         NRB_TYPE => nrb(bytes, offset, total, big_endian)?,
         DSB_TYPE => dsb(bytes, offset, total, big_endian)?,
-        CB_COPY | CB_NO_COPY => frames.push(custom(bytes, offset, total)?),
-        JOURNAL_TYPE => frames.push(journal(bytes, offset, total)?),
+        CB_COPY | CB_NO_COPY => {
+            let mut frame = custom(bytes, offset, total)?;
+            frame.timestamp = *last_ts;
+            frames.push(frame);
+        }
+        JOURNAL_TYPE => {
+            let frame = journal(bytes, offset, total)?;
+            *last_ts = frame.timestamp;
+            frames.push(frame);
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn push_stamp(frames: &mut Vec<Frame<'_>>, frame: Frame<'_>, last_ts: &mut Option<Timestamp>) {
+    *last_ts = frame.timestamp;
+    frames.push(frame);
 }
 
 fn interface(
