@@ -1493,6 +1493,24 @@ fn a_journal_timestamp_with_a_leading_plus_is_missing() {
 }
 
 #[test]
+fn a_journal_timestamp_with_a_leading_minus_is_missing() {
+    let entry = b"__REALTIME_TIMESTAMP=-1\nxxxx";
+    let journal = block(Endian::Little, 9, entry);
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(capture.frames[1].timestamp, None);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
 fn a_journal_timestamp_with_a_space_and_plus_is_read() {
     let entry = b"__REALTIME_TIMESTAMP= +1\nxxxx";
     let journal = block(Endian::Little, 9, &pad_four(entry));
