@@ -1,5 +1,10 @@
 # Cursor's own review events are invisible to outside watchers. Relay each
-# submitted cursor[bot] review as a normal PR comment.
+# submitted Cursor review as a normal PR comment, authored by RELAY_TOKEN
+# (Brice) when that secret is set.
+#
+# Only reviews whose body contains CURSOR_AUTOMATION_ID are relayed. Thread
+# replies from the fix agent post as cursor with an empty review body and
+# must not trigger a relay.
 name: cursor-review-relay
 
 on:
@@ -11,12 +16,12 @@ permissions:
 
 jobs:
   relay:
-    if: ${{ github.event.review.user.login == 'cursor[bot]' || github.event.review.user.login == 'cursor' }}
+    if: ${{ contains(github.event.review.body, 'CURSOR_AUTOMATION_ID') }}
     runs-on: ubuntu-latest
     steps:
       - name: Post relay comment
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           STATE: ${{ github.event.review.state }}
@@ -24,6 +29,12 @@ jobs:
           REVIEW_ID: ${{ github.event.review.id }}
         run: |
           set -euo pipefail
+          if [ -n "${RELAY_TOKEN}" ]; then
+            export GH_TOKEN="${RELAY_TOKEN}"
+          else
+            echo "::warning::RELAY_TOKEN is empty; posting as github-actions[bot] with GITHUB_TOKEN"
+            export GH_TOKEN="${GITHUB_TOKEN}"
+          fi
           state=$(printf '%s' "$STATE" | tr '[:upper:]' '[:lower:]')
           count=$(gh api "repos/${GH_REPO}/pulls/${PR}/reviews/${REVIEW_ID}/comments" --jq 'length')
           body="cursor-review-relay: ${state} — ${REVIEW_URL}"
