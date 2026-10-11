@@ -87,7 +87,7 @@ fn records<'a>(
         frames.push(Frame {
             link_type,
             timestamp: Some(Timestamp {
-                seconds: u64::from(seconds),
+                seconds: i64::from(seconds),
                 fraction,
                 unit,
             }),

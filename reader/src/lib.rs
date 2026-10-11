@@ -30,7 +30,7 @@ pub struct Frame<'a> {
 /// A timestamp taken from the file, split into whole seconds and a fraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
-    pub seconds: u64,
+    pub seconds: i64,
     pub fraction: u32,
     pub unit: TimeUnit,
 }
@@ -78,6 +78,11 @@ pub enum Fault {
     UnsupportedPcapngVersion {
         major: u16,
         minor: u16,
+        later: bool,
+    },
+    UnsupportedTsresol {
+        binary: bool,
+        exponent: u8,
     },
 }
 
@@ -98,12 +103,14 @@ impl Fault {
             Fault::NotACaptureFile
             | Fault::TruncatedHeader
             | Fault::UnsupportedPcapVersion { .. }
-            | Fault::UnsupportedPcapngVersion { .. } => 3,
+            | Fault::UnsupportedPcapngVersion { later: false, .. }
+            | Fault::UnsupportedTsresol { .. } => 3,
             Fault::UnsupportedLinkType { .. } => 1,
             Fault::CutShort
             | Fault::CapturedLengthTooBig { .. }
             | Fault::BadInterface { .. }
-            | Fault::BlockLengths { .. } => 14,
+            | Fault::BlockLengths { .. }
+            | Fault::UnsupportedPcapngVersion { later: true, .. } => 14,
         }
     }
 
@@ -141,9 +148,17 @@ impl Fault {
             Fault::UnsupportedPcapVersion { major } => {
                 format!("pcap: major version {major} unsupported")
             }
-            Fault::UnsupportedPcapngVersion { major, minor } => {
+            Fault::UnsupportedPcapngVersion { major, minor, .. } => {
                 format!("pcapng: unknown SHB version {major}.{minor}")
             }
+            Fault::UnsupportedTsresol {
+                binary: true,
+                exponent,
+            } => format!("pcapng: IDB power-of-2 time stamp resolution {exponent} > 63"),
+            Fault::UnsupportedTsresol {
+                binary: false,
+                exponent,
+            } => format!("pcapng: IDB power-of-10 time stamp resolution {exponent} > 19"),
         }
     }
 }

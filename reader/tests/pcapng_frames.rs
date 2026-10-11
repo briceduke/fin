@@ -401,6 +401,160 @@ fn if_tsoffset_is_added_to_the_packet_timestamp() {
 }
 
 #[test]
+fn a_negative_if_tsoffset_is_a_negative_epoch() {
+    let offset = option(Endian::Little, 14, &pack_i64(-3600, Endian::Little));
+    assert_eq!(
+        offset,
+        [0x0e, 0x00, 0x08, 0x00, 0xf0, 0xf1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+    );
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &offset),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: -3600,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn a_negative_if_tsoffset_adds_to_the_whole_seconds() {
+    let offset = option(Endian::Little, 14, &pack_i64(-3600, Endian::Little));
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &offset),
+        &enhanced_packet(Endian::Little, 0, 1_500_000, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: -3599,
+            fraction: 500_000,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn options_after_endofopt_are_ignored() {
+    let options = concat(&[
+        &option(Endian::Little, 0, &[]),
+        &option(Endian::Little, 9, &[9]),
+    ]);
+    assert_eq!(
+        options,
+        [0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00]
+    );
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &options),
+        &enhanced_packet(Endian::Little, 0, 1_000_000_005, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 1000,
+            fraction: 5,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn tsoffset_after_endofopt_is_ignored() {
+    let options = concat(&[
+        &option(Endian::Little, 0, &[]),
+        &option(Endian::Little, 14, &pack_i64(3600, Endian::Little)),
+    ]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &options),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn power_of_ten_tsresol_above_19_is_unsupported() {
+    let resol = option(Endian::Little, 9, &[20]);
+    assert_eq!(resol, [0x09, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &resol),
+        &enhanced_packet(Endian::Little, 0, 10, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::UnsupportedTsresol {
+            binary: false,
+            exponent: 20,
+        }
+    );
+    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: IDB power-of-10 time stamp resolution 20 > 19"
+    );
+}
+
+#[test]
+fn power_of_two_tsresol_above_63_is_unsupported() {
+    let resol = option(Endian::Little, 9, &[0xc0]);
+    assert_eq!(resol, [0x09, 0x00, 0x01, 0x00, 0xc0, 0x00, 0x00, 0x00]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &resol),
+        &enhanced_packet(Endian::Little, 0, 10, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::UnsupportedTsresol {
+            binary: true,
+            exponent: 64,
+        }
+    );
+    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: IDB power-of-2 time stamp resolution 64 > 63"
+    );
+}
+
+#[test]
 fn shb_version_1_1_is_unsupported() {
     let header = section_header_version(Endian::Little, 1, 1);
     assert_eq!(
@@ -418,9 +572,40 @@ fn shb_version_1_1_is_unsupported() {
     assert_eq!(capture.frames.len(), 0);
     assert_eq!(
         fault,
-        Fault::UnsupportedPcapngVersion { major: 1, minor: 1 }
+        Fault::UnsupportedPcapngVersion {
+            major: 1,
+            minor: 1,
+            later: false,
+        }
     );
     assert_eq!(fault.exit_code(), 3);
+    assert_eq!(fault.phrase(), "pcapng: unknown SHB version 1.1");
+}
+
+#[test]
+fn a_later_shb_1_1_keeps_the_earlier_frame() {
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x01], &[]),
+        &section_header_version(Endian::Little, 1, 1),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0x01]);
+    assert_eq!(
+        fault,
+        Fault::UnsupportedPcapngVersion {
+            major: 1,
+            minor: 1,
+            later: true,
+        }
+    );
+    assert_eq!(fault.exit_code(), 14);
     assert_eq!(fault.phrase(), "pcapng: unknown SHB version 1.1");
 }
 
