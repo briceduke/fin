@@ -37,6 +37,56 @@ pub fn run_pair(tshark: &Path, fin: &Path, args: &[OsString]) -> Result<PairOutp
     })
 }
 
+/// Stdout, stderr, and status from one tool run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+/// Run tshark 4.6.9 with a fresh empty `WIRESHARK_CONFIG_DIR`.
+pub fn run_tshark(tshark: &Path, args: &[OsString]) -> Result<ToolOutput, RunError> {
+    TsharkSession::open(tshark)?.run(args)
+}
+
+/// A tshark 4.6.9 binary, version-checked once.
+pub struct TsharkSession {
+    path: PathBuf,
+}
+
+impl TsharkSession {
+    /// Reject anything that is not tshark 4.6.9.
+    pub fn open(tshark: &Path) -> Result<Self, RunError> {
+        let config = ConfigDir::create()?;
+        let version = spawn(
+            "tshark",
+            tshark,
+            &[OsString::from("--version")],
+            Some(config.path()),
+        )?;
+        if !accepts_version(&version.stdout) {
+            return Err(RunError::Version {
+                found: version_line(&version.stdout),
+            });
+        }
+        Ok(Self {
+            path: tshark.to_path_buf(),
+        })
+    }
+
+    /// Run one capture with a fresh empty `WIRESHARK_CONFIG_DIR`.
+    pub fn run(&self, args: &[OsString]) -> Result<ToolOutput, RunError> {
+        let config = ConfigDir::create()?;
+        let run = spawn("tshark", &self.path, args, Some(config.path()))?;
+        Ok(ToolOutput {
+            stdout: run.stdout,
+            stderr: run.stderr,
+            exit_code: run.exit_code,
+        })
+    }
+}
+
 fn accepts_version(stdout: &str) -> bool {
     stdout
         .split_whitespace()
