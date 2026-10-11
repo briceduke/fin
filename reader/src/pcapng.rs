@@ -226,7 +226,7 @@ fn roundup4_u32(n: u32) -> u32 {
     n.wrapping_add(3) & !3
 }
 
-fn content<'a>(bytes: &'a [u8], offset: usize, total: usize) -> &'a [u8] {
+fn content(bytes: &[u8], offset: usize, total: usize) -> &[u8] {
     &bytes[offset + 8..offset + total - 4]
 }
 
