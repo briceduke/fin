@@ -82,7 +82,12 @@ fn stopped<'a>(frames: Vec<Frame<'a>>, fault: Fault) -> Capture<'a> {
 }
 
 fn u32_at(bytes: &[u8], offset: usize, big_endian: bool) -> u32 {
-    let raw = [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]];
+    let raw = [
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ];
     if big_endian {
         u32::from_be_bytes(raw)
     } else {
