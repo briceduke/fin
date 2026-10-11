@@ -107,13 +107,16 @@ fn systematic() -> Vec<Vec<u8>> {
     files.push(extra_after_packet(9, &[]));
     files.push(extra_only(9, &[]));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=0\n\x00"));
+    files.push(extra_solo(9, b"__REALTIME_TIMESTAMP=0\n\x00"));
     files.push(extra_after_packet(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x0000_0BAD, &[]));
     files.push(extra_only(0x0000_0BAD, &[]));
+    files.push(extra_solo(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x4000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x4000_0BAD, &[]));
     files.push(extra_after_packet(10, &[]));
     files.push(extra_after_packet(7, &[]));
+    files.push(extra_after_packet(11, &[]));
     let mut isb = Vec::from([0u8; 12]);
     isb.extend_from_slice(&opt(2988, &[]));
     files.push(extra_after_packet(5, &isb));
@@ -126,9 +129,13 @@ fn systematic() -> Vec<Vec<u8>> {
         &[1, 0, 2, 0, 0xaa, 0xbb, 0x00, 0x00, 0, 0, 0, 0],
     ));
     files.push(epb_trailer(36, 35));
+    files.push(epb_trailer(36, 33));
     files.push(epb_trailer(36, 32));
+    files.push(later_epb_trailer(36, 35));
     files.push(later_unaligned_trailer());
     files.push(huge_later());
+    files.push(opening_shb_totals(27, 27));
+    files.push(opening_shb_totals(28, 27));
     for length in [0u16, 1, 2, 4, 8, 9, 16] {
         files.push(capture(false, &[raw_opt(9, length, &[9])], true));
         files.push(capture(
@@ -142,27 +149,63 @@ fn systematic() -> Vec<Vec<u8>> {
 }
 
 fn random_file(rng: &mut Rng) -> Vec<u8> {
+    if rng.bounded(3) == 0 {
+        return random_extra(rng);
+    }
     let prior = rng.bit();
     let mut options = Vec::new();
     let count = rng.bounded(4) + 1;
     for _ in 0..count {
-        let code = if rng.bounded(8) == 0 {
-            [2988, 2989, 19372, 19373][rng.bounded(4) as usize]
-        } else {
-            rng.bounded(20)
-        };
-        let length = if rng.bounded(10) == 0 {
-            100
-        } else {
-            rng.bounded(17)
-        };
-        let mut value = vec![0u8; usize::from(length.min(24))];
-        for byte in &mut value {
-            *byte = rng.bounded(256) as u8;
-        }
-        options.push(raw_opt(code, length, &value));
+        options.push(random_option(rng));
     }
     capture(prior, &options, rng.bit())
+}
+
+fn random_option(rng: &mut Rng) -> Vec<u8> {
+    let code = if rng.bounded(8) == 0 {
+        [2988, 2989, 19372, 19373][rng.bounded(4) as usize]
+    } else {
+        rng.bounded(20)
+    };
+    let length = if rng.bounded(10) == 0 {
+        100
+    } else {
+        rng.bounded(17)
+    };
+    let mut value = vec![0u8; usize::from(length.min(24))];
+    for byte in &mut value {
+        *byte = rng.bounded(256) as u8;
+    }
+    raw_opt(code, length, &value)
+}
+
+fn random_extra(rng: &mut Rng) -> Vec<u8> {
+    let types = [4u32, 5, 7, 9, 10, 11, 0x0000_0BAD, 0x4000_0BAD, 100];
+    let block_type = types[rng.bounded(types.len() as u16) as usize];
+    extra(rng.bit(), block_type, &random_extra_body(rng, block_type))
+}
+
+fn random_extra_body(rng: &mut Rng, block_type: u32) -> Vec<u8> {
+    match block_type {
+        9 if rng.bit() => b"__REALTIME_TIMESTAMP=0\n".to_vec(),
+        0x0000_0BAD | 0x4000_0BAD if rng.bit() => 1u32.to_le_bytes().to_vec(),
+        5 => {
+            let mut body = vec![0u8; 12];
+            if rng.bit() {
+                body.extend_from_slice(&random_option(rng));
+            }
+            body
+        }
+        4 => {
+            let mut body = vec![0, 0, 0, 0];
+            if rng.bit() {
+                body.extend_from_slice(&random_option(rng));
+            }
+            body
+        }
+        10 if rng.bit() => vec![0u8; 8],
+        _ => vec![0; rng.bounded(8) as usize],
+    }
 }
 
 fn capture(prior_packet: bool, idb_options: &[Vec<u8>], trailing_packet: bool) -> Vec<u8> {
@@ -216,6 +259,12 @@ fn extra_only(block_type: u32, body: &[u8]) -> Vec<u8> {
     extra(false, block_type, body)
 }
 
+fn extra_solo(block_type: u32, body: &[u8]) -> Vec<u8> {
+    let mut file = shb(1, 0);
+    file.extend_from_slice(&block(block_type, body));
+    file
+}
+
 fn extra(prior_packet: bool, block_type: u32, body: &[u8]) -> Vec<u8> {
     let mut file = shb(1, 0);
     file.extend_from_slice(&idb(&[]));
@@ -228,6 +277,14 @@ fn extra(prior_packet: bool, block_type: u32, body: &[u8]) -> Vec<u8> {
 }
 
 fn epb_trailer(first: u32, second: u32) -> Vec<u8> {
+    epb_trailer_file(false, first, second)
+}
+
+fn later_epb_trailer(first: u32, second: u32) -> Vec<u8> {
+    epb_trailer_file(true, first, second)
+}
+
+fn epb_trailer_file(prior_packet: bool, first: u32, second: u32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
@@ -237,7 +294,19 @@ fn epb_trailer(first: u32, second: u32) -> Vec<u8> {
     body.extend_from_slice(&[0xaa, 0, 0, 0]);
     let mut file = shb(1, 0);
     file.extend_from_slice(&idb(&[]));
+    if prior_packet {
+        file.extend_from_slice(&epb(0, 0, &[0x01], &[]));
+    }
     file.extend_from_slice(&block_with_totals(6, &body, first, second));
+    file
+}
+
+fn opening_shb_totals(first: u32, second: u32) -> Vec<u8> {
+    let mut file = shb(1, 0);
+    file[4..8].copy_from_slice(&first.to_le_bytes());
+    file[24..28].copy_from_slice(&second.to_le_bytes());
+    file.extend_from_slice(&idb(&[]));
+    file.extend_from_slice(&epb(0, 0, &[0xaa], &[]));
     file
 }
 
