@@ -239,7 +239,7 @@ fn consume<'a>(
     Ok(())
 }
 
-fn push_stamp(frames: &mut Vec<Frame<'_>>, frame: Frame<'_>, last_ts: &mut Option<Timestamp>) {
+fn push_stamp<'a>(frames: &mut Vec<Frame<'a>>, frame: Frame<'a>, last_ts: &mut Option<Timestamp>) {
     *last_ts = frame.timestamp;
     frames.push(frame);
 }
