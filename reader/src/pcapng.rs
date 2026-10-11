@@ -9,6 +9,7 @@ const OPB_TYPE: u32 = 2;
 const SPB_TYPE: u32 = 3;
 const EPB_TYPE: u32 = 6;
 const IF_TSRESOL: u16 = 9;
+const IF_TSOFFSET: u16 = 14;
 const DEFAULT_RESOL: u8 = 6;
 const LE_ORDER: [u8; 4] = [0x4d, 0x3c, 0x2b, 0x1a];
 const BE_ORDER: [u8; 4] = [0x1a, 0x2b, 0x3c, 0x4d];
@@ -17,6 +18,7 @@ struct Interface {
     link_type: u32,
     snaplen: u32,
     resol: u8,
+    tsoffset: i64,
 }
 
 struct Packet {
@@ -43,7 +45,18 @@ fn open_section(bytes: &[u8]) -> Result<(bool, usize), Fault> {
         None => return Err(Fault::NotACaptureFile),
     };
     let total = block_total(bytes, 0, big_endian, SHB_MIN, Fault::NotACaptureFile)?;
+    shb_version(bytes, 0, big_endian)?;
     Ok((big_endian, total))
+}
+
+fn shb_version(bytes: &[u8], offset: usize, big_endian: bool) -> Result<(), Fault> {
+    let major = u16_at(bytes, offset + 12, big_endian);
+    let minor = u16_at(bytes, offset + 14, big_endian);
+    if major == 1 && (minor == 0 || minor == 2) {
+        Ok(())
+    } else {
+        Err(Fault::UnsupportedPcapngVersion { major, minor })
+    }
 }
 
 fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Capture<'a> {
@@ -131,7 +144,10 @@ fn consume<'a>(
     frames: &mut Vec<Frame<'a>>,
 ) -> Result<(), Fault> {
     match block_type {
-        SHB_TYPE => interfaces.clear(),
+        SHB_TYPE => {
+            shb_version(bytes, offset, big_endian)?;
+            interfaces.clear();
+        }
         IDB_TYPE => interfaces.push(interface(bytes, offset, total, big_endian)?),
         EPB_TYPE => frames.push(enhanced(bytes, offset, total, big_endian, interfaces)?),
         SPB_TYPE => frames.push(simple(bytes, offset, total, big_endian, interfaces)?),
@@ -151,14 +167,18 @@ fn interface(
         return Err(Fault::CutShort);
     }
     let at = offset + 8;
+    let (resol, tsoffset) = id_options(bytes, at + 8, offset + total - 4, big_endian);
     Ok(Interface {
         link_type: u32::from(u16_at(bytes, at, big_endian)),
         snaplen: u32_at(bytes, at + 4, big_endian),
-        resol: resolution(bytes, at + 8, offset + total - 4, big_endian),
+        resol,
+        tsoffset,
     })
 }
 
-fn resolution(bytes: &[u8], mut cursor: usize, end: usize, big_endian: bool) -> u8 {
+fn id_options(bytes: &[u8], mut cursor: usize, end: usize, big_endian: bool) -> (u8, i64) {
+    let mut resol = None;
+    let mut tsoffset = None;
     while cursor + 4 <= end {
         let code = u16_at(bytes, cursor, big_endian);
         let len = usize::from(u16_at(bytes, cursor + 2, big_endian));
@@ -166,8 +186,11 @@ fn resolution(bytes: &[u8], mut cursor: usize, end: usize, big_endian: bool) -> 
         if value_at.saturating_add(len) > end {
             break;
         }
-        if code == IF_TSRESOL && len >= 1 {
-            return bytes[value_at];
+        if resol.is_none() && code == IF_TSRESOL && len >= 1 {
+            resol = Some(bytes[value_at]);
+        }
+        if tsoffset.is_none() && code == IF_TSOFFSET && len >= 8 {
+            tsoffset = Some(i64_at(bytes, value_at, big_endian));
         }
         let Some(next) = cursor.checked_add(4 + align4(len)) else {
             break;
@@ -177,7 +200,7 @@ fn resolution(bytes: &[u8], mut cursor: usize, end: usize, big_endian: bool) -> 
         }
         cursor = next;
     }
-    DEFAULT_RESOL
+    (resol.unwrap_or(DEFAULT_RESOL), tsoffset.unwrap_or(0))
 }
 
 fn align4(len: usize) -> usize {
@@ -293,10 +316,28 @@ fn frame<'a>(
     };
     Ok(Frame {
         link_type: iface.link_type,
-        timestamp: packet.ticks.map(|ticks| timestamp(ticks, iface.resol)),
+        timestamp: packet
+            .ticks
+            .map(|ticks| with_offset(timestamp(ticks, iface.resol), iface.tsoffset)),
         original_length: packet.original_len,
         captured: packet_bytes(bytes, packet.packet_at, packet.captured_len, data_end)?,
     })
+}
+
+fn with_offset(stamp: Timestamp, offset: i64) -> Timestamp {
+    Timestamp {
+        seconds: add_seconds(stamp.seconds, offset),
+        fraction: stamp.fraction,
+        unit: stamp.unit,
+    }
+}
+
+fn add_seconds(seconds: u64, offset: i64) -> u64 {
+    if offset >= 0 {
+        seconds.saturating_add(offset as u64)
+    } else {
+        seconds.saturating_sub(offset.unsigned_abs())
+    }
 }
 
 fn packet_bytes<'a>(
@@ -374,6 +415,24 @@ fn endian_at(bytes: &[u8], offset: usize) -> Option<bool> {
         LE_ORDER => Some(false),
         BE_ORDER => Some(true),
         _ => None,
+    }
+}
+
+fn i64_at(bytes: &[u8], offset: usize, big_endian: bool) -> i64 {
+    let raw = [
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ];
+    if big_endian {
+        i64::from_be_bytes(raw)
+    } else {
+        i64::from_le_bytes(raw)
     }
 }
 

@@ -51,11 +51,15 @@ fn is_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn section_header(endian: Endian) -> Vec<u8> {
+    section_header_version(endian, 1, 0)
+}
+
+fn section_header_version(endian: Endian, major: u16, minor: u16) -> Vec<u8> {
     let block_type = [0x0a, 0x0d, 0x0d, 0x0a];
     let total = pack_u32(28, endian);
     let order = pack_u32(0x1A2B3C4D, endian);
-    let major = pack_u16(1, endian);
-    let minor = pack_u16(0, endian);
+    let major = pack_u16(major, endian);
+    let minor = pack_u16(minor, endian);
     let section_length = pack_i64(-1, endian);
     concat(&[
         &block_type,
@@ -366,6 +370,58 @@ fn simple_packet_snaplen_zero_above_the_maximum_is_not_a_frame() {
             .contains("larger than maximum supported length 262144"),
         true
     );
+}
+
+#[test]
+fn if_tsoffset_is_added_to_the_packet_timestamp() {
+    let offset = option(Endian::Little, 14, &pack_i64(3600, Endian::Little));
+    assert_eq!(
+        offset,
+        [0x0e, 0x00, 0x08, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &offset),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
+    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 3600,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn shb_version_1_1_is_unsupported() {
+    let header = section_header_version(Endian::Little, 1, 1);
+    assert_eq!(
+        &header[8..16],
+        [0x4d, 0x3c, 0x2b, 0x1a, 0x01, 0x00, 0x01, 0x00]
+    );
+    let bytes = concat(&[
+        &header,
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::UnsupportedPcapngVersion { major: 1, minor: 1 }
+    );
+    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(fault.phrase(), "pcapng: unknown SHB version 1.1");
 }
 
 #[test]

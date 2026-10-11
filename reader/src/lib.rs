@@ -72,6 +72,13 @@ pub enum Fault {
     UnsupportedLinkType {
         link_type: u32,
     },
+    UnsupportedPcapVersion {
+        major: u16,
+    },
+    UnsupportedPcapngVersion {
+        major: u16,
+        minor: u16,
+    },
 }
 
 /// Which capture container produced a captured-length fault.
@@ -88,7 +95,10 @@ impl Fault {
     /// opens that file. The status is 1.
     pub fn exit_code(self) -> i32 {
         match self {
-            Fault::NotACaptureFile | Fault::TruncatedHeader => 3,
+            Fault::NotACaptureFile
+            | Fault::TruncatedHeader
+            | Fault::UnsupportedPcapVersion { .. }
+            | Fault::UnsupportedPcapngVersion { .. } => 3,
             Fault::UnsupportedLinkType { .. } => 1,
             Fault::CutShort
             | Fault::CapturedLengthTooBig { .. }
@@ -127,6 +137,12 @@ impl Fault {
             ),
             Fault::UnsupportedLinkType { link_type } => {
                 format!("unsupported link type {link_type}")
+            }
+            Fault::UnsupportedPcapVersion { major } => {
+                format!("pcap: major version {major} unsupported")
+            }
+            Fault::UnsupportedPcapngVersion { major, minor } => {
+                format!("pcapng: unknown SHB version {major}.{minor}")
             }
         }
     }
