@@ -29,7 +29,7 @@ fn empty_file_is_not_a_capture() {
     assert_eq!(capture.frames.len(), 0);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::NotACaptureFile);
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(fault.phrase(), "isn't a capture file");
 }
 
@@ -39,7 +39,7 @@ fn unrecognized_bytes_are_not_a_capture() {
     assert_eq!(capture.frames.len(), 0);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::NotACaptureFile);
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(fault.phrase(), "isn't a capture file");
 }
 
@@ -49,7 +49,7 @@ fn truncated_magic_tail() {
     assert_eq!(capture.frames.len(), 0);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::TruncatedHeader);
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert!(fault.phrase().contains("or other data"));
 }
 
@@ -62,7 +62,7 @@ fn truncated_global_header() {
     assert_eq!(capture.frames.len(), 0);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::TruncatedHeader);
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert!(fault.phrase().contains("or other data"));
 }
 
@@ -74,7 +74,7 @@ fn a_body_cut_off_mid_packet_returns_no_frame() {
     assert_eq!(capture.frames.len(), 0);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::CutShort);
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         fault.phrase(),
         "appears to have been cut short in the middle of a packet"
@@ -102,7 +102,7 @@ fn an_earlier_frame_survives_a_cut_short_header() {
     );
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::CutShort);
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert!(!fault.phrase().contains("or other data"));
 }
 
@@ -121,7 +121,7 @@ fn first_packet_bigger_than_262144_is_not_read() {
         }
     );
     assert!(fault.phrase().contains("bigger than maximum of 262144"));
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn a_later_packet_bigger_than_262144_keeps_the_earlier_frame() {
             kind: CaptureKind::Pcap,
         }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn version_2_3_swaps_when_incl_exceeds_orig() {
     assert_eq!(capture.frames[0].original_length, 4);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::CutShort);
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         fault.phrase(),
         "appears to have been cut short in the middle of a packet"
@@ -171,7 +171,7 @@ fn major_version_1_is_unsupported() {
     assert_eq!(capture.frames.len(), 0);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::UnsupportedPcapVersion { major: 1 });
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(fault.phrase(), "pcap: major version 1 unsupported");
 }
 
@@ -184,5 +184,5 @@ fn unclaimed_link_type_fails_before_any_frame() {
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::UnsupportedLinkType { link_type: 104 });
     assert_eq!(fault.phrase(), "unsupported link type 104");
-    assert_eq!(fault.exit_code(), 1);
+    assert_eq!(capture.exit_code(), 1);
 }

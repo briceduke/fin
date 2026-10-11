@@ -363,7 +363,7 @@ fn simple_packet_snaplen_zero_above_the_maximum_is_not_a_frame() {
             kind: CaptureKind::Pcapng,
         }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         fault
             .phrase()
@@ -520,7 +520,7 @@ fn power_of_ten_tsresol_above_19_is_unsupported() {
             exponent: 20,
         }
     );
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(
         fault.phrase(),
         "pcapng: IDB power-of-10 time stamp resolution 20 > 19"
@@ -547,7 +547,7 @@ fn power_of_two_tsresol_above_63_is_unsupported() {
             exponent: 64,
         }
     );
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(
         fault.phrase(),
         "pcapng: IDB power-of-2 time stamp resolution 64 > 63"
@@ -572,13 +572,9 @@ fn shb_version_1_1_is_unsupported() {
     assert_eq!(capture.frames.len(), 0);
     assert_eq!(
         fault,
-        Fault::UnsupportedPcapngVersion {
-            major: 1,
-            minor: 1,
-            later: false,
-        }
+        Fault::UnsupportedPcapngVersion { major: 1, minor: 1 }
     );
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(fault.phrase(), "pcapng: unknown SHB version 1.1");
 }
 
@@ -599,13 +595,9 @@ fn a_later_shb_1_1_keeps_the_earlier_frame() {
     assert_eq!(capture.frames[0].captured, &[0x01]);
     assert_eq!(
         fault,
-        Fault::UnsupportedPcapngVersion {
-            major: 1,
-            minor: 1,
-            later: true,
-        }
+        Fault::UnsupportedPcapngVersion { major: 1, minor: 1 }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(fault.phrase(), "pcapng: unknown SHB version 1.1");
 }
 
@@ -799,7 +791,7 @@ fn a_short_preamble_is_not_a_capture() {
 
     assert_eq!(capture.frames.len(), 0);
     assert_eq!(fault, Fault::NotACaptureFile);
-    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(capture.exit_code(), 3);
     assert_eq!(fault.phrase(), "isn't a capture file");
 }
 
@@ -817,7 +809,7 @@ fn a_truncated_block_keeps_the_earlier_frame() {
 
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(fault, Fault::CutShort);
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         phrase,
         "appears to have been cut short in the middle of a packet"
@@ -845,7 +837,7 @@ fn captured_length_above_the_maximum_is_not_a_frame() {
             kind: CaptureKind::Pcapng,
         }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         fault
             .phrase()
@@ -874,7 +866,7 @@ fn a_bad_interface_keeps_the_earlier_frame() {
             interfaces: 1,
         }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(
         fault
             .phrase()
@@ -900,7 +892,7 @@ fn a_packet_before_any_interface_is_a_bad_interface() {
             interfaces: 0,
         }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
 }
 
 #[test]
@@ -931,6 +923,239 @@ fn mismatched_block_lengths_stop() {
             second: 40
         }
     );
-    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(capture.exit_code(), 14);
     assert_eq!(fault.phrase().contains("first 36 and second 40"), true);
+}
+
+#[test]
+fn if_tsresol_is_used_only_when_the_length_is_one() {
+    let resol = option(Endian::Little, 9, &[9, 0]);
+    assert_eq!(resol, [0x09, 0x00, 0x02, 0x00, 0x09, 0x00, 0x00, 0x00]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &resol),
+        &enhanced_packet(Endian::Little, 0, 1_000_000_005, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 1000,
+            fraction: 5,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn if_tsoffset_is_used_only_when_the_length_is_eight() {
+    let offset_nine = option(
+        Endian::Little,
+        14,
+        &[0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    );
+    assert_eq!(
+        &offset_nine[..13],
+        [0x0e, 0x00, 0x09, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &offset_nine),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+
+    let mut offset_sixteen =
+        concat(&[&pack_u16(14, Endian::Little), &pack_u16(16, Endian::Little)]);
+    offset_sixteen.extend_from_slice(&pack_i64(3600, Endian::Little));
+    offset_sixteen.extend_from_slice(&pack_i64(7200, Endian::Little));
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &offset_sixteen),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn an_option_overrun_fails_the_idb() {
+    let overrun = [0x09, 0x00, 0x64, 0x00, 0x09, 0x00, 0x00, 0x00];
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x01], &[]),
+        &interface_block(Endian::Little, 1, 65535, &overrun),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0x01]);
+    assert_eq!(fault, Fault::OptionOverrun { length: 100 });
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: Not enough data to handle option of length 100"
+    );
+
+    let opening = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &overrun),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&opening);
+    let fault = capture.fault.unwrap();
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(fault, Fault::OptionOverrun { length: 100 });
+    assert_eq!(capture.exit_code(), 3);
+}
+
+#[test]
+fn if_filter_length_zero_fails_the_idb() {
+    let filter = option(Endian::Little, 11, &[]);
+    assert_eq!(filter, [0x0b, 0x00, 0x00, 0x00]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x01], &[]),
+        &interface_block(Endian::Little, 1, 65535, &filter),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(fault, Fault::IdbFilter { length: 0 });
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: IDB interface filter option length 0 is < 1"
+    );
+
+    let opening = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &filter),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&opening);
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(capture.fault, Some(Fault::IdbFilter { length: 0 }));
+    assert_eq!(capture.exit_code(), 3);
+}
+
+#[test]
+fn if_tsoffset_wraps_like_a_signed_time_t() {
+    let offset = option(Endian::Little, 14, &pack_i64(i64::MAX - 9, Endian::Little));
+    assert_eq!(
+        offset,
+        [0x0e, 0x00, 0x08, 0x00, 0xf6, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    );
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &offset),
+        &enhanced_packet(Endian::Little, 0, 20_000_000, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(
+        capture.frames[0].timestamp,
+        Some(Timestamp {
+            seconds: -9223372036854775798,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+}
+
+#[test]
+fn a_fault_after_a_frame_exits_14() {
+    let resol = option(Endian::Little, 9, &[20]);
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x01], &[]),
+        &interface_block(Endian::Little, 1, 65535, &resol),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        fault,
+        Fault::UnsupportedTsresol {
+            binary: false,
+            exponent: 20,
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: IDB power-of-10 time stamp resolution 20 > 19"
+    );
+}
+
+#[test]
+fn a_later_shb_1_1_before_any_frame_exits_3() {
+    let bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &section_header_version(Endian::Little, 1, 1),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::UnsupportedPcapngVersion { major: 1, minor: 1 }
+    );
+    assert_eq!(capture.exit_code(), 3);
+    assert_eq!(fault.phrase(), "pcapng: unknown SHB version 1.1");
+}
+
+#[test]
+fn opening_shb_mismatched_lengths_exit_3() {
+    let mut header = section_header(Endian::Little);
+    header[24..28].copy_from_slice(&32u32.to_le_bytes());
+    let capture = read_capture(&header);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::BlockLengths {
+            first: 28,
+            second: 32,
+        }
+    );
+    assert_eq!(capture.exit_code(), 3);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: total block lengths (first 28 and second 32) don't match"
+    );
 }

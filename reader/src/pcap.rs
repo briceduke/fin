@@ -12,17 +12,17 @@ enum Lengths {
 
 pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
     if bytes.len() < HEADER_LEN {
-        return stopped(Vec::new(), Fault::TruncatedHeader);
+        return Capture::halt(Vec::new(), Fault::TruncatedHeader, false);
     }
     let (big_endian, unit) = layout(bytes);
     let major = u16_at(bytes, 4, big_endian);
     if major < 2 {
-        return stopped(Vec::new(), Fault::UnsupportedPcapVersion { major });
+        return Capture::halt(Vec::new(), Fault::UnsupportedPcapVersion { major }, false);
     }
     let minor = u16_at(bytes, 6, big_endian);
     let link_type = u32_at(bytes, 20, big_endian);
     if !matches!(link_type, 1 | 113 | 276) {
-        return stopped(Vec::new(), Fault::UnsupportedLinkType { link_type });
+        return Capture::halt(Vec::new(), Fault::UnsupportedLinkType { link_type }, false);
     }
     records(bytes, big_endian, unit, link_type, lengths(major, minor))
 }
@@ -66,22 +66,23 @@ fn records<'a>(
     let mut offset = HEADER_LEN;
     while offset < bytes.len() {
         if bytes.len() - offset < RECORD_LEN {
-            return stopped(frames, Fault::CutShort);
+            return Capture::halt(frames, Fault::CutShort, true);
         }
         let [seconds, fraction, included, original] = header_words(bytes, offset, big_endian);
         let (included, original) = order(included, original, lengths);
         if included > MAX_CAPTURED_LENGTH {
-            return stopped(
+            return Capture::halt(
                 frames,
                 Fault::CapturedLengthTooBig {
                     length: included,
                     kind: CaptureKind::Pcap,
                 },
+                true,
             );
         }
         let start = offset + RECORD_LEN;
         if bytes.len() - start < included as usize {
-            return stopped(frames, Fault::CutShort);
+            return Capture::halt(frames, Fault::CutShort, true);
         }
         let end = start + included as usize;
         frames.push(Frame {
@@ -96,10 +97,7 @@ fn records<'a>(
         });
         offset = end;
     }
-    Capture {
-        frames,
-        fault: None,
-    }
+    Capture::ok(frames)
 }
 
 fn header_words(bytes: &[u8], offset: usize, big_endian: bool) -> [u32; 4] {
@@ -109,13 +107,6 @@ fn header_words(bytes: &[u8], offset: usize, big_endian: bool) -> [u32; 4] {
         u32_at(bytes, offset + 8, big_endian),
         u32_at(bytes, offset + 12, big_endian),
     ]
-}
-
-fn stopped<'a>(frames: Vec<Frame<'a>>, fault: Fault) -> Capture<'a> {
-    Capture {
-        frames,
-        fault: Some(fault),
-    }
 }
 
 fn u16_at(bytes: &[u8], offset: usize, big_endian: bool) -> u16 {

@@ -3,6 +3,7 @@
 //! One core, front to back. Classic pcap and pcapng become frames. A later
 //! chunked reader falls back to this when a seam does not prove.
 
+mod options;
 mod pcap;
 mod pcapng;
 
@@ -47,6 +48,7 @@ pub enum TimeUnit {
 pub struct Capture<'a> {
     pub frames: Vec<Frame<'a>>,
     pub fault: Option<Fault>,
+    after_packet: bool,
 }
 
 /// Why the reader stopped. Earlier complete frames stay in [`Capture::frames`].
@@ -78,11 +80,24 @@ pub enum Fault {
     UnsupportedPcapngVersion {
         major: u16,
         minor: u16,
-        later: bool,
     },
     UnsupportedTsresol {
         binary: bool,
         exponent: u8,
+    },
+    OptionHeader,
+    OptionOverrun {
+        length: u32,
+    },
+    IdbFilter {
+        length: u32,
+    },
+    CustomOption {
+        length: u32,
+    },
+    PacketOption {
+        kind: PacketOption,
+        length: u32,
     },
 }
 
@@ -93,27 +108,52 @@ pub enum CaptureKind {
     Pcapng,
 }
 
-impl Fault {
-    /// Process status tshark 4.6.9 uses for this fault.
-    ///
-    /// [`Fault::UnsupportedLinkType`] is fin's own rejection. tshark still
-    /// opens that file. The status is 1.
-    pub fn exit_code(self) -> i32 {
-        match self {
-            Fault::NotACaptureFile
-            | Fault::TruncatedHeader
-            | Fault::UnsupportedPcapVersion { .. }
-            | Fault::UnsupportedPcapngVersion { later: false, .. }
-            | Fault::UnsupportedTsresol { .. } => 3,
-            Fault::UnsupportedLinkType { .. } => 1,
-            Fault::CutShort
-            | Fault::CapturedLengthTooBig { .. }
-            | Fault::BadInterface { .. }
-            | Fault::BlockLengths { .. }
-            | Fault::UnsupportedPcapngVersion { later: true, .. } => 14,
+/// An EPB/OPB option tshark 4.6.9 rejects for a wrong length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketOption {
+    Flags,
+    Hash,
+    DropCount,
+    PacketId,
+    Queue,
+    Verdict,
+    VerdictTc,
+    VerdictXdp,
+    ProcThread,
+}
+
+impl<'a> Capture<'a> {
+    pub(crate) fn ok(frames: Vec<Frame<'a>>) -> Self {
+        Self {
+            frames,
+            fault: None,
+            after_packet: false,
         }
     }
 
+    pub(crate) fn halt(frames: Vec<Frame<'a>>, fault: Fault, after_packet: bool) -> Self {
+        Self {
+            frames,
+            fault: Some(fault),
+            after_packet,
+        }
+    }
+
+    /// Process status tshark 4.6.9 uses for this capture.
+    ///
+    /// [`Fault::UnsupportedLinkType`] is fin's own rejection. The status is 1.
+    /// Any other fault is 3 before a packet block is reached, and 14 after.
+    pub fn exit_code(&self) -> i32 {
+        match self.fault {
+            None => 0,
+            Some(Fault::UnsupportedLinkType { .. }) => 1,
+            Some(_) if self.frames.is_empty() && !self.after_packet => 3,
+            Some(_) => 14,
+        }
+    }
+}
+
+impl Fault {
     /// The distinctive phrase, without a program name or a file path.
     pub fn phrase(self) -> String {
         match self {
@@ -148,7 +188,7 @@ impl Fault {
             Fault::UnsupportedPcapVersion { major } => {
                 format!("pcap: major version {major} unsupported")
             }
-            Fault::UnsupportedPcapngVersion { major, minor, .. } => {
+            Fault::UnsupportedPcapngVersion { major, minor } => {
                 format!("pcapng: unknown SHB version {major}.{minor}")
             }
             Fault::UnsupportedTsresol {
@@ -159,6 +199,51 @@ impl Fault {
                 binary: false,
                 exponent,
             } => format!("pcapng: IDB power-of-10 time stamp resolution {exponent} > 19"),
+            Fault::OptionHeader => "pcapng: Not enough data for option header".to_string(),
+            Fault::OptionOverrun { length } => {
+                format!("pcapng: Not enough data to handle option of length {length}")
+            }
+            Fault::IdbFilter { length } => {
+                format!("pcapng: IDB interface filter option length {length} is < 1")
+            }
+            Fault::CustomOption { length } => {
+                format!("pcapng: option length ({length}) too small for custom option")
+            }
+            Fault::PacketOption { kind, length } => kind.phrase(length),
+        }
+    }
+}
+
+impl PacketOption {
+    fn phrase(self, length: u32) -> String {
+        match self {
+            PacketOption::Flags => {
+                format!("pcapng: packet block flags option length {length} is not 4")
+            }
+            PacketOption::Hash => {
+                format!("pcapng: packet block hash option length {length} is < 1")
+            }
+            PacketOption::DropCount => {
+                format!("pcapng: packet block drop count option length {length} is not 8")
+            }
+            PacketOption::PacketId => {
+                format!("pcapng: packet block packet id option length {length} is not 8")
+            }
+            PacketOption::Queue => {
+                format!("pcapng: packet block queue option length {length} is not 4")
+            }
+            PacketOption::Verdict => {
+                format!("pcapng: packet block verdict option length {length} is < 1")
+            }
+            PacketOption::VerdictTc => {
+                format!("pcapng: packet block TC verdict option length {length} is != 9")
+            }
+            PacketOption::VerdictXdp => {
+                format!("pcapng: packet block XDP verdict option length {length} is != 9")
+            }
+            PacketOption::ProcThread => {
+                format!("pcapng: packet block process id thread id option length {length} is not 8")
+            }
         }
     }
 }
@@ -174,8 +259,5 @@ pub fn read_capture(bytes: &[u8]) -> Capture<'_> {
     if bytes.len() >= 4 && PCAP_MAGICS.iter().any(|magic| bytes.starts_with(magic)) {
         return pcap::read(bytes);
     }
-    Capture {
-        frames: Vec::new(),
-        fault: Some(Fault::NotACaptureFile),
-    }
+    Capture::halt(Vec::new(), Fault::NotACaptureFile, false)
 }
