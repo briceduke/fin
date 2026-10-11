@@ -10,3 +10,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "fin-diff"
 path = "src/bin/fin-diff.rs"
+
+[dev-dependencies]
+reader = { path = "../reader" }

@@ -1,5 +1,6 @@
-# cargo test only. The live tshark 4.6.9 check skips unless that binary is
-# installed. Install it in CI when the sequential reader exists.
+# cargo test against tshark 4.6.9. CI installs that binary from the
+# official source tarball (SHA256 pinned). Local runs skip the live
+# oracle tests when it is missing.
 name: test
 
 on:
@@ -7,10 +8,41 @@ on:
   push:
     branches: [main]
 
+env:
+  TSHARK_VERSION: "4.6.9"
+  TSHARK_SHA256: d062d416a1ab3a49975aafe3a671c882dde0562ccd71b078808ceb59d465fc0f
+  TSHARK_URL: https://www.wireshark.org/download/src/all-versions/wireshark-4.6.9.tar.xz
+  TSHARK_PREFIX: /tmp/tshark-4.6.9
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache tshark 4.6.9
+        id: tshark
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TSHARK_PREFIX }}
+          key: tshark-${{ env.TSHARK_VERSION }}-${{ env.TSHARK_SHA256 }}-${{ runner.os }}
+      - name: Install tshark 4.6.9 dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build flex python3 pkg-config \
+            libglib2.0-dev libgcrypt-dev libc-ares-dev \
+            libpcap-dev libpcre2-dev libxml2-dev \
+            zlib1g-dev liblz4-dev libzstd-dev
+      - name: Build tshark 4.6.9
+        if: steps.tshark.outputs.cache-hit != 'true'
+        run: bash .github/scripts/install-tshark-4.6.9.sh
+      - name: Put tshark 4.6.9 on PATH
+        run: |
+          echo "${TSHARK_PREFIX}/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=${TSHARK_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      - name: Check tshark 4.6.9
+        run: |
+          tshark --version
+          tshark --version | grep -F "$TSHARK_VERSION"
       - run: cargo test
