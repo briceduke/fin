@@ -1,0 +1,33 @@
+# Cursor's own review events are invisible to outside watchers. Relay each
+# submitted cursor[bot] review as a normal PR comment.
+name: cursor-review-relay
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  relay:
+    if: ${{ github.event.review.user.login == 'cursor[bot]' || github.event.review.user.login == 'cursor' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post relay comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          STATE: ${{ github.event.review.state }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+          REVIEW_ID: ${{ github.event.review.id }}
+        run: |
+          set -euo pipefail
+          state=$(printf '%s' "$STATE" | tr '[:upper:]' '[:lower:]')
+          count=$(gh api "repos/${GH_REPO}/pulls/${PR}/reviews/${REVIEW_ID}/comments" --jq 'length')
+          body="cursor-review-relay: ${state} — ${REVIEW_URL}"
+          if [ "$count" -gt 0 ]; then
+            body="${body} (${count} inline)"
+          fi
+          gh pr comment "$PR" --body "$body"
