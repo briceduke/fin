@@ -1,5 +1,8 @@
 use crate::options::{self, IdOptions};
-use crate::{Capture, CaptureKind, Fault, Frame, TimeUnit, Timestamp, MAX_CAPTURED_LENGTH};
+use crate::{
+    BlockKind, Capture, CaptureKind, Fault, Frame, TimeUnit, Timestamp, MAX_BLOCK_SIZE,
+    MAX_CAPTURED_LENGTH,
+};
 
 const SHB_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 const SHB_TYPE: u32 = 0x0A0D0D0A;
@@ -8,7 +11,15 @@ const BLOCK_MIN: u32 = 12;
 const IDB_TYPE: u32 = 1;
 const OPB_TYPE: u32 = 2;
 const SPB_TYPE: u32 = 3;
+const NRB_TYPE: u32 = 4;
+const ISB_TYPE: u32 = 5;
 const EPB_TYPE: u32 = 6;
+const JOURNAL_TYPE: u32 = 9;
+const DSB_TYPE: u32 = 10;
+const CB_COPY: u32 = 0x0000_0BAD;
+const CB_NO_COPY: u32 = 0x4000_0BAD;
+const JOURNAL_MIN: usize = 23;
+const JOURNAL_KEY: &[u8] = b"__REALTIME_TIMESTAMP=";
 const LE_ORDER: [u8; 4] = [0x4d, 0x3c, 0x2b, 0x1a];
 const BE_ORDER: [u8; 4] = [0x1a, 0x2b, 0x3c, 0x4d];
 
@@ -133,16 +144,24 @@ fn block_total(
         return Err(short);
     }
     let first = u32_at(bytes, offset + 4, big_endian);
-    if first < minimum || first % 4 != 0 {
+    if first < minimum {
         return Err(short);
     }
-    let total = first as usize;
+    let padded = roundup4_u32(first);
+    if padded < first || padded > MAX_BLOCK_SIZE {
+        return Err(Fault::BlockTooLarge { length: first });
+    }
+    let total = padded as usize;
     if rest < total {
         return Err(short);
     }
     let second = u32_at(bytes, offset + total - 4, big_endian);
-    if first != second {
-        return Err(Fault::BlockLengths { first, second });
+    let rounded_second = roundup4_u32(second);
+    if rounded_second != first {
+        return Err(Fault::BlockLengths {
+            first,
+            second: rounded_second,
+        });
     }
     Ok(total)
 }
@@ -166,6 +185,11 @@ fn consume<'a>(
         EPB_TYPE => frames.push(enhanced(bytes, offset, total, big_endian, interfaces)?),
         SPB_TYPE => frames.push(simple(bytes, offset, total, big_endian, interfaces)?),
         OPB_TYPE => frames.push(obsolete(bytes, offset, total, big_endian, interfaces)?),
+        ISB_TYPE => isb(bytes, offset, total, big_endian)?,
+        NRB_TYPE => nrb(bytes, offset, total, big_endian)?,
+        DSB_TYPE => dsb(bytes, offset, total, big_endian)?,
+        CB_COPY | CB_NO_COPY => frames.push(custom(bytes, offset, total)?),
+        JOURNAL_TYPE => frames.push(journal(bytes, offset, total)?),
         _ => {}
     }
     Ok(())
@@ -193,6 +217,173 @@ fn interface(
 
 fn align4(len: usize) -> usize {
     len.saturating_add(3) & !3
+}
+
+fn roundup4_u32(n: u32) -> u32 {
+    n.wrapping_add(3) & !3
+}
+
+fn content<'a>(bytes: &'a [u8], offset: usize, total: usize) -> &'a [u8] {
+    &bytes[offset + 8..offset + total - 4]
+}
+
+fn too_small(kind: BlockKind, length: usize) -> Fault {
+    Fault::BlockBody {
+        kind,
+        length: length as u32,
+    }
+}
+
+fn isb(bytes: &[u8], offset: usize, total: usize, big_endian: bool) -> Result<(), Fault> {
+    let body = content(bytes, offset, total);
+    if body.len() < 12 {
+        return Err(too_small(BlockKind::Isb, body.len()));
+    }
+    options::walk_common(bytes, offset + 20, offset + total - 4, big_endian)
+}
+
+fn nrb(bytes: &[u8], offset: usize, total: usize, big_endian: bool) -> Result<(), Fault> {
+    let end = offset + total - 4;
+    let mut cursor = offset + 8;
+    if end - cursor < 4 {
+        return Err(too_small(BlockKind::Nrb, end - cursor));
+    }
+    loop {
+        let left = end - cursor;
+        if left == 0 {
+            return Ok(());
+        }
+        if left < 4 {
+            return Err(Fault::NrbShort { left: left as u32 });
+        }
+        let rec_type = u16_at(bytes, cursor, big_endian);
+        let rec_len = u16_at(bytes, cursor + 2, big_endian);
+        cursor += 4;
+        let need = align4(usize::from(rec_len));
+        let remaining = end - cursor;
+        if remaining < need {
+            return Err(Fault::NrbPad {
+                left: remaining as u32,
+                need: need as u32,
+            });
+        }
+        match rec_type {
+            0 => return options::walk_common(bytes, cursor, end, big_endian),
+            1 => {
+                if rec_len < 4 {
+                    return Err(Fault::NrbIpv4 {
+                        length: u32::from(rec_len),
+                    });
+                }
+                nrb_names(&bytes[cursor + 4..cursor + usize::from(rec_len)])?;
+            }
+            2 => {
+                if rec_len < 16 {
+                    return Err(Fault::NrbIpv6 {
+                        length: u32::from(rec_len),
+                    });
+                }
+                nrb_names(&bytes[cursor + 16..cursor + usize::from(rec_len)])?;
+            }
+            _ => {}
+        }
+        cursor += need;
+    }
+}
+
+fn nrb_names(names: &[u8]) -> Result<(), Fault> {
+    let mut rest = names;
+    while !rest.is_empty() {
+        match rest.iter().position(|&byte| byte == 0) {
+            Some(end) => rest = &rest[end + 1..],
+            None => return Err(Fault::NrbName),
+        }
+    }
+    Ok(())
+}
+
+fn dsb(bytes: &[u8], offset: usize, total: usize, big_endian: bool) -> Result<(), Fault> {
+    let body = content(bytes, offset, total);
+    if body.len() < 8 {
+        return Err(too_small(BlockKind::Dsb, body.len()));
+    }
+    let secrets_len = u32_at(bytes, offset + 12, big_endian);
+    let needed = 8u32.saturating_add(secrets_len);
+    if (body.len() as u32) < needed {
+        return Err(Fault::DsbSecrets {
+            length: body.len() as u32,
+            needed,
+        });
+    }
+    if secrets_len > 1024 * 1024 * 1024 {
+        return Err(Fault::DsbHuge {
+            length: secrets_len,
+        });
+    }
+    Ok(())
+}
+
+fn custom(bytes: &[u8], offset: usize, total: usize) -> Result<Frame<'_>, Fault> {
+    let body = content(bytes, offset, total);
+    if body.len() < 4 {
+        return Err(too_small(BlockKind::Custom, body.len()));
+    }
+    let captured = &body[4..];
+    Ok(Frame {
+        link_type: 0,
+        timestamp: None,
+        original_length: captured.len() as u32,
+        captured,
+    })
+}
+
+fn journal(bytes: &[u8], offset: usize, total: usize) -> Result<Frame<'_>, Fault> {
+    let body = content(bytes, offset, total);
+    if body.len() < JOURNAL_MIN {
+        return Err(too_small(BlockKind::Journal, body.len()));
+    }
+    let mut length = body.len();
+    while length > 0 && body[length - 1] == 0 {
+        length -= 1;
+    }
+    if length < JOURNAL_MIN {
+        return Err(Fault::JournalEntry {
+            length: length as u32,
+        });
+    }
+    let captured = &body[..length];
+    Ok(Frame {
+        link_type: 0,
+        timestamp: journal_time(captured),
+        original_length: captured.len() as u32,
+        captured,
+    })
+}
+
+fn journal_time(entry: &[u8]) -> Option<Timestamp> {
+    let start = entry
+        .windows(JOURNAL_KEY.len())
+        .position(|window| window == JOURNAL_KEY)?;
+    let digits = &entry[start + JOURNAL_KEY.len()..];
+    let mut ticks = 0u64;
+    let mut seen = false;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        seen = true;
+        ticks = ticks
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'));
+    }
+    if !seen {
+        return None;
+    }
+    Some(Timestamp {
+        seconds: (ticks / 1_000_000) as i64,
+        fraction: (ticks % 1_000_000) as u32,
+        unit: TimeUnit::Microsecond,
+    })
 }
 
 fn enhanced<'a>(

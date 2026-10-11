@@ -1,4 +1,4 @@
-use reader::{read_capture, CaptureKind, Fault, TimeUnit, Timestamp};
+use reader::{read_capture, BlockKind, CaptureKind, Fault, TimeUnit, Timestamp};
 
 #[derive(Clone, Copy)]
 enum Endian {
@@ -288,7 +288,7 @@ fn a_new_section_resets_interface_ids() {
 
 #[test]
 fn an_unknown_block_between_packets_is_skipped() {
-    let skipped = unknown_block(Endian::Little, 9);
+    let skipped = unknown_block(Endian::Little, 7);
     assert_eq!(skipped.len(), 12);
     let bytes = concat(&[
         &section_header(Endian::Little),
@@ -1157,5 +1157,315 @@ fn opening_shb_mismatched_lengths_exit_3() {
     assert_eq!(
         fault.phrase(),
         "pcapng: total block lengths (first 28 and second 32) don't match"
+    );
+}
+
+fn prefix(packet: Option<u8>) -> Vec<u8> {
+    let mut bytes = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1, 65535, &[]),
+    ]);
+    if let Some(byte) = packet {
+        bytes.extend_from_slice(&enhanced_packet(Endian::Little, 0, 0, 1, 1, &[byte], &[]));
+    }
+    bytes
+}
+
+fn epb_lengths(first: u32, second: u32) -> Vec<u8> {
+    let body = concat(&[
+        &pack_u32(0, Endian::Little),
+        &pack_u32(0, Endian::Little),
+        &pack_u32(0, Endian::Little),
+        &pack_u32(1, Endian::Little),
+        &pack_u32(1, Endian::Little),
+        &[0xaa, 0x00, 0x00, 0x00],
+    ]);
+    block_with_lengths(Endian::Little, 6, &body, first, second)
+}
+
+#[test]
+fn a_trailer_three_below_the_first_length_is_accepted() {
+    let bytes = concat(&[&prefix(None), &epb_lengths(36, 35)]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn a_trailer_that_does_not_round_to_the_first_length_fails() {
+    let bytes = concat(&[&prefix(None), &epb_lengths(36, 32)]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(
+        fault,
+        Fault::BlockLengths {
+            first: 36,
+            second: 32
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+}
+
+#[test]
+fn a_later_block_first_length_rounds_up_before_the_trailer() {
+    let later = block_with_lengths(Endian::Little, 100, &[0, 0, 0, 0], 13, 16);
+    let bytes = concat(&[&prefix(Some(1)), &later]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        fault,
+        Fault::BlockLengths {
+            first: 13,
+            second: 16
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: total block lengths (first 13 and second 16) don't match"
+    );
+}
+
+#[test]
+fn a_block_above_max_size_fails_after_a_frame() {
+    let mut later = pack_u32(100, Endian::Little).to_vec();
+    later.extend_from_slice(&200_000_000u32.to_le_bytes());
+    let bytes = concat(&[&prefix(Some(1)), &later]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        fault,
+        Fault::BlockTooLarge {
+            length: 200_000_000
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: total block length 200000000 is too large (> 134348832)"
+    );
+}
+
+#[test]
+fn a_journal_export_between_packets_is_a_frame() {
+    let entry = b"__REALTIME_TIMESTAMP=0\n";
+    let journal = block(Endian::Little, 9, &[entry.as_slice(), &[0]].concat());
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &journal,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, entry.as_slice());
+    assert_eq!(capture.frames[1].original_length, 23);
+    assert_eq!(
+        capture.frames[1].timestamp,
+        Some(Timestamp {
+            seconds: 0,
+            fraction: 0,
+            unit: TimeUnit::Microsecond,
+        })
+    );
+    assert_eq!(capture.frames[2].captured, &[0x02]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn an_empty_journal_export_stops_the_file() {
+    let bytes = concat(&[&prefix(Some(1)), &unknown_block(Endian::Little, 9)]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        fault,
+        Fault::BlockBody {
+            kind: BlockKind::Journal,
+            length: 0
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: block content length 0 of a systemd journal export is less than the minimum systemd journal export content size 23"
+    );
+}
+
+#[test]
+fn an_opening_journal_export_fault_exits_3() {
+    let bytes = concat(&[&prefix(None), &unknown_block(Endian::Little, 9)]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(capture.exit_code(), 3);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: block content length 0 of a systemd journal export is less than the minimum systemd journal export content size 23"
+    );
+}
+
+#[test]
+fn a_custom_block_between_packets_is_a_frame() {
+    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &custom,
+        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+    ]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.fault, None);
+    assert_eq!(capture.frames.len(), 3);
+    assert_eq!(capture.frames[1].captured, b"");
+    assert_eq!(capture.frames[1].original_length, 0);
+    assert_eq!(capture.frames[2].captured, &[0x02]);
+    assert_eq!(capture.exit_code(), 0);
+}
+
+#[test]
+fn an_empty_custom_block_stops_the_file() {
+    let bytes = concat(&[
+        &prefix(Some(1)),
+        &unknown_block(Endian::Little, 0x0000_0BAD),
+    ]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        fault,
+        Fault::BlockBody {
+            kind: BlockKind::Custom,
+            length: 0
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: block content length 0 of a CB is less than the minimum CB content size 4"
+    );
+}
+
+#[test]
+fn an_isb_custom_option_stops_the_file() {
+    let isb = block(
+        Endian::Little,
+        5,
+        &concat(&[
+            &pack_u32(0, Endian::Little),
+            &pack_u32(0, Endian::Little),
+            &pack_u32(0, Endian::Little),
+            &option(Endian::Little, 2988, &[]),
+        ]),
+    );
+    let bytes = concat(&[&prefix(Some(1)), &isb]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(fault, Fault::CustomOption { length: 0 });
+    assert_eq!(capture.exit_code(), 14);
+}
+
+#[test]
+fn an_opening_isb_custom_option_exits_3() {
+    let isb = block(
+        Endian::Little,
+        5,
+        &concat(&[
+            &pack_u32(0, Endian::Little),
+            &pack_u32(0, Endian::Little),
+            &pack_u32(0, Endian::Little),
+            &option(Endian::Little, 2988, &[]),
+        ]),
+    );
+    let bytes = concat(&[&prefix(None), &isb]);
+    let capture = read_capture(&bytes);
+
+    assert_eq!(capture.frames.len(), 0);
+    assert_eq!(capture.exit_code(), 3);
+    assert_eq!(
+        capture.fault.unwrap().phrase(),
+        "pcapng: option length (0) too small for custom option"
+    );
+}
+
+#[test]
+fn an_empty_dsb_stops_the_file() {
+    let bytes = concat(&[&prefix(Some(1)), &unknown_block(Endian::Little, 10)]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(
+        fault,
+        Fault::BlockBody {
+            kind: BlockKind::Dsb,
+            length: 0
+        }
+    );
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: block content length 0 of an DSB is less than the minimum DSB content size 8"
+    );
+}
+
+#[test]
+fn an_nrb_custom_option_stops_the_file() {
+    let nrb = block(
+        Endian::Little,
+        4,
+        &concat(&[
+            &pack_u16(0, Endian::Little),
+            &pack_u16(0, Endian::Little),
+            &option(Endian::Little, 2988, &[]),
+        ]),
+    );
+    let bytes = concat(&[&prefix(Some(1)), &nrb]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(fault, Fault::CustomOption { length: 0 });
+    assert_eq!(capture.exit_code(), 14);
+}
+
+#[test]
+fn an_nrb_ipv4_record_length_two_stops_the_file() {
+    let nrb = block(
+        Endian::Little,
+        4,
+        &concat(&[
+            &pack_u16(1, Endian::Little),
+            &pack_u16(2, Endian::Little),
+            &[0xaa, 0xbb, 0x00, 0x00],
+            &pack_u16(0, Endian::Little),
+            &pack_u16(0, Endian::Little),
+        ]),
+    );
+    let bytes = concat(&[&prefix(Some(1)), &nrb]);
+    let capture = read_capture(&bytes);
+    let fault = capture.fault.unwrap();
+
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(fault, Fault::NrbIpv4 { length: 2 });
+    assert_eq!(capture.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "pcapng: NRB IPv4 record length 2 < minimum length 4"
     );
 }

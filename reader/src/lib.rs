@@ -10,6 +10,9 @@ mod pcapng;
 /// Largest captured length tshark 4.6.9 will read.
 pub const MAX_CAPTURED_LENGTH: u32 = 262144;
 
+/// Largest pcapng block tshark 4.6.9 will read (`MIN_EPB_SIZE` + D-Bus packet + 128 KiB).
+pub const MAX_BLOCK_SIZE: u32 = 134348832;
+
 const PCAP_MAGICS: [[u8; 4]; 4] = [
     [0xa1, 0xb2, 0xc3, 0xd4],
     [0xd4, 0xc3, 0xb2, 0xa1],
@@ -99,6 +102,47 @@ pub enum Fault {
         kind: PacketOption,
         length: u32,
     },
+    BlockTooLarge {
+        length: u32,
+    },
+    BlockBody {
+        kind: BlockKind,
+        length: u32,
+    },
+    DsbSecrets {
+        length: u32,
+        needed: u32,
+    },
+    DsbHuge {
+        length: u32,
+    },
+    JournalEntry {
+        length: u32,
+    },
+    NrbShort {
+        left: u32,
+    },
+    NrbPad {
+        left: u32,
+        need: u32,
+    },
+    NrbIpv4 {
+        length: u32,
+    },
+    NrbIpv6 {
+        length: u32,
+    },
+    NrbName,
+}
+
+/// A pcapng block tshark 4.6.9 still reads besides SHB/IDB/packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    Isb,
+    Nrb,
+    Dsb,
+    Custom,
+    Journal,
 }
 
 /// Which capture container produced a captured-length fault.
@@ -210,6 +254,54 @@ impl Fault {
                 format!("pcapng: option length ({length}) too small for custom option")
             }
             Fault::PacketOption { kind, length } => kind.phrase(length),
+            Fault::BlockTooLarge { length } => {
+                format!("pcapng: total block length {length} is too large (> {MAX_BLOCK_SIZE})")
+            }
+            Fault::BlockBody { kind, length } => kind.too_small(length),
+            Fault::DsbSecrets { length, needed } => format!(
+                "pcapng: block content length {length} of an DSB is less the size needed for the secrets in the DSB {needed}"
+            ),
+            Fault::DsbHuge { length } => format!("pcapng: secrets block is too large: {length}"),
+            Fault::JournalEntry { length } => {
+                format!("pcapng: entry length {length} is too small (< 23)")
+            }
+            Fault::NrbShort { left } => {
+                format!("pcapng: {left} bytes left in the block < NRB record header size 4")
+            }
+            Fault::NrbPad { left, need } => {
+                format!(
+                    "pcapng: {left} bytes left in the block < NRB record length + padding {need}"
+                )
+            }
+            Fault::NrbIpv4 { length } => {
+                format!("pcapng: NRB IPv4 record length {length} < minimum length 4")
+            }
+            Fault::NrbIpv6 { length } => {
+                format!("pcapng: NRB record length for IPv6 record {length} < minimum length 16")
+            }
+            Fault::NrbName => "pcapng: NRB record has non-null-terminated host name".to_string(),
+        }
+    }
+}
+
+impl BlockKind {
+    fn too_small(self, length: u32) -> String {
+        match self {
+            BlockKind::Isb => format!(
+                "pcapng: block content length {length} of an ISB is less than the minimum ISB content size 12"
+            ),
+            BlockKind::Nrb => format!(
+                "pcapng: block content length {length} of an NRB is less than the minimum NRB content size 4"
+            ),
+            BlockKind::Dsb => format!(
+                "pcapng: block content length {length} of an DSB is less than the minimum DSB content size 8"
+            ),
+            BlockKind::Custom => format!(
+                "pcapng: block content length {length} of a CB is less than the minimum CB content size 4"
+            ),
+            BlockKind::Journal => format!(
+                "pcapng: block content length {length} of a systemd journal export is less than the minimum systemd journal export content size 23"
+            ),
         }
     }
 }

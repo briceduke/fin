@@ -70,6 +70,15 @@ pub(crate) fn walk_shb(
     end: usize,
     big_endian: bool,
 ) -> Result<(), Fault> {
+    walk_common(bytes, start, end, big_endian)
+}
+
+pub(crate) fn walk_common(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    big_endian: bool,
+) -> Result<(), Fault> {
     walk(bytes, start, end, big_endian, Role::Section)
 }
 

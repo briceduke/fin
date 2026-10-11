@@ -65,7 +65,7 @@ Any other field, flag, or display filter is an error, never a silently empty col
 Each step is checked against the one before it.
 
 1. The checker and a corpus of test captures. Done.
-2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type, timestamp, original length, and the captured bytes. Forty-two tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises.
+2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type, timestamp, original length, and the captured bytes. Seventy-seven tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises, including ISB, NRB, DSB, custom blocks, and systemd journal export.
 3. `ip.src`. Next.
 4. The chunk split, checked against the sequential reader.
 5. TLS server names.
