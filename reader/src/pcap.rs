@@ -3,16 +3,28 @@ use crate::{Capture, CaptureKind, Fault, Frame, TimeUnit, Timestamp, MAX_CAPTURE
 const HEADER_LEN: usize = 24;
 const RECORD_LEN: usize = 16;
 
+#[derive(Clone, Copy)]
+enum Lengths {
+    NotSwapped,
+    Swapped,
+    MaybeSwapped,
+}
+
 pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
     if bytes.len() < HEADER_LEN {
         return stopped(Vec::new(), Fault::TruncatedHeader);
     }
     let (big_endian, unit) = layout(bytes);
+    let major = u16_at(bytes, 4, big_endian);
+    if major < 2 {
+        return stopped(Vec::new(), Fault::UnsupportedPcapVersion { major });
+    }
+    let minor = u16_at(bytes, 6, big_endian);
     let link_type = u32_at(bytes, 20, big_endian);
     if !matches!(link_type, 1 | 113 | 276) {
         return stopped(Vec::new(), Fault::UnsupportedLinkType { link_type });
     }
-    records(bytes, big_endian, unit, link_type)
+    records(bytes, big_endian, unit, link_type, lengths(major, minor))
 }
 
 fn layout(bytes: &[u8]) -> (bool, TimeUnit) {
@@ -25,7 +37,31 @@ fn layout(bytes: &[u8]) -> (bool, TimeUnit) {
     }
 }
 
-fn records<'a>(bytes: &'a [u8], big_endian: bool, unit: TimeUnit, link_type: u32) -> Capture<'a> {
+fn lengths(major: u16, minor: u16) -> Lengths {
+    match (major, minor) {
+        (2, 0..=2) => Lengths::Swapped,
+        (2, 3) => Lengths::MaybeSwapped,
+        (543, _) => Lengths::Swapped,
+        _ => Lengths::NotSwapped,
+    }
+}
+
+fn order(included: u32, original: u32, lengths: Lengths) -> (u32, u32) {
+    match lengths {
+        Lengths::NotSwapped => (included, original),
+        Lengths::Swapped => (original, included),
+        Lengths::MaybeSwapped if included <= original => (included, original),
+        Lengths::MaybeSwapped => (original, included),
+    }
+}
+
+fn records<'a>(
+    bytes: &'a [u8],
+    big_endian: bool,
+    unit: TimeUnit,
+    link_type: u32,
+    lengths: Lengths,
+) -> Capture<'a> {
     let mut frames = Vec::new();
     let mut offset = HEADER_LEN;
     while offset < bytes.len() {
@@ -33,6 +69,7 @@ fn records<'a>(bytes: &'a [u8], big_endian: bool, unit: TimeUnit, link_type: u32
             return stopped(frames, Fault::CutShort);
         }
         let [seconds, fraction, included, original] = header_words(bytes, offset, big_endian);
+        let (included, original) = order(included, original, lengths);
         if included > MAX_CAPTURED_LENGTH {
             return stopped(
                 frames,
@@ -50,7 +87,7 @@ fn records<'a>(bytes: &'a [u8], big_endian: bool, unit: TimeUnit, link_type: u32
         frames.push(Frame {
             link_type,
             timestamp: Some(Timestamp {
-                seconds: u64::from(seconds),
+                seconds: i64::from(seconds),
                 fraction,
                 unit,
             }),
@@ -81,8 +118,22 @@ fn stopped<'a>(frames: Vec<Frame<'a>>, fault: Fault) -> Capture<'a> {
     }
 }
 
+fn u16_at(bytes: &[u8], offset: usize, big_endian: bool) -> u16 {
+    let raw = [bytes[offset], bytes[offset + 1]];
+    if big_endian {
+        u16::from_be_bytes(raw)
+    } else {
+        u16::from_le_bytes(raw)
+    }
+}
+
 fn u32_at(bytes: &[u8], offset: usize, big_endian: bool) -> u32 {
-    let raw = [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]];
+    let raw = [
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ];
     if big_endian {
         u32::from_be_bytes(raw)
     } else {

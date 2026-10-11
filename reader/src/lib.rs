@@ -30,7 +30,7 @@ pub struct Frame<'a> {
 /// A timestamp taken from the file, split into whole seconds and a fraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
-    pub seconds: u64,
+    pub seconds: i64,
     pub fraction: u32,
     pub unit: TimeUnit,
 }
@@ -72,6 +72,18 @@ pub enum Fault {
     UnsupportedLinkType {
         link_type: u32,
     },
+    UnsupportedPcapVersion {
+        major: u16,
+    },
+    UnsupportedPcapngVersion {
+        major: u16,
+        minor: u16,
+        later: bool,
+    },
+    UnsupportedTsresol {
+        binary: bool,
+        exponent: u8,
+    },
 }
 
 /// Which capture container produced a captured-length fault.
@@ -88,12 +100,17 @@ impl Fault {
     /// opens that file. The status is 1.
     pub fn exit_code(self) -> i32 {
         match self {
-            Fault::NotACaptureFile | Fault::TruncatedHeader => 3,
+            Fault::NotACaptureFile
+            | Fault::TruncatedHeader
+            | Fault::UnsupportedPcapVersion { .. }
+            | Fault::UnsupportedPcapngVersion { later: false, .. }
+            | Fault::UnsupportedTsresol { .. } => 3,
             Fault::UnsupportedLinkType { .. } => 1,
             Fault::CutShort
             | Fault::CapturedLengthTooBig { .. }
             | Fault::BadInterface { .. }
-            | Fault::BlockLengths { .. } => 14,
+            | Fault::BlockLengths { .. }
+            | Fault::UnsupportedPcapngVersion { later: true, .. } => 14,
         }
     }
 
@@ -128,6 +145,20 @@ impl Fault {
             Fault::UnsupportedLinkType { link_type } => {
                 format!("unsupported link type {link_type}")
             }
+            Fault::UnsupportedPcapVersion { major } => {
+                format!("pcap: major version {major} unsupported")
+            }
+            Fault::UnsupportedPcapngVersion { major, minor, .. } => {
+                format!("pcapng: unknown SHB version {major}.{minor}")
+            }
+            Fault::UnsupportedTsresol {
+                binary: true,
+                exponent,
+            } => format!("pcapng: IDB power-of-2 time stamp resolution {exponent} > 63"),
+            Fault::UnsupportedTsresol {
+                binary: false,
+                exponent,
+            } => format!("pcapng: IDB power-of-10 time stamp resolution {exponent} > 19"),
         }
     }
 }

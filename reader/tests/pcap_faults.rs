@@ -1,10 +1,14 @@
 use reader::{read_capture, CaptureKind, Fault, TimeUnit, Timestamp};
 
 fn header(link_type: u32) -> Vec<u8> {
-    let mut bytes = vec![
-        0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00,
-    ];
+    header_version(2, 4, link_type)
+}
+
+fn header_version(major: u16, minor: u16, link_type: u32) -> Vec<u8> {
+    let mut bytes = vec![0xd4, 0xc3, 0xb2, 0xa1];
+    bytes.extend_from_slice(&major.to_le_bytes());
+    bytes.extend_from_slice(&minor.to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
     bytes.extend_from_slice(&65_535u32.to_le_bytes());
     bytes.extend_from_slice(&link_type.to_le_bytes());
     bytes
@@ -137,6 +141,38 @@ fn a_later_packet_bigger_than_262144_keeps_the_earlier_frame() {
         }
     );
     assert_eq!(fault.exit_code(), 14);
+}
+
+#[test]
+fn version_2_3_swaps_when_incl_exceeds_orig() {
+    let bytes = [
+        0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x0b, 0x0c, 0x0d,
+    ];
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0x0a, 0x0b]);
+    assert_eq!(capture.frames[0].original_length, 4);
+    let fault = capture.fault.unwrap();
+    assert_eq!(fault, Fault::CutShort);
+    assert_eq!(fault.exit_code(), 14);
+    assert_eq!(
+        fault.phrase(),
+        "appears to have been cut short in the middle of a packet"
+    );
+}
+
+#[test]
+fn major_version_1_is_unsupported() {
+    let mut bytes = header_version(1, 4, 1);
+    bytes.extend(record(1, 0, 4, 4, &[0x0a, 0x0b, 0x0c, 0x0d]));
+    let capture = read_capture(&bytes);
+    assert_eq!(capture.frames.len(), 0);
+    let fault = capture.fault.unwrap();
+    assert_eq!(fault, Fault::UnsupportedPcapVersion { major: 1 });
+    assert_eq!(fault.exit_code(), 3);
+    assert_eq!(fault.phrase(), "pcap: major version 1 unsupported");
 }
 
 #[test]

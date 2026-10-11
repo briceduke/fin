@@ -56,7 +56,7 @@ fn push_packet(file: &mut Vec<u8>, seconds: u32, fraction: u32, original_length:
     file.extend_from_slice(body);
 }
 
-fn stamp(seconds: u64, fraction: u32, unit: TimeUnit) -> Timestamp {
+fn stamp(seconds: i64, fraction: u32, unit: TimeUnit) -> Timestamp {
     Timestamp {
         seconds,
         fraction,
