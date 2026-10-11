@@ -1434,7 +1434,7 @@ fn a_journal_export_without_packets_is_a_frame() {
 #[test]
 fn an_overflowing_journal_timestamp_is_missing() {
     let entry = b"__REALTIME_TIMESTAMP=18446744073709551616\n";
-    let journal = block(Endian::Little, 9, entry);
+    let journal = block(Endian::Little, 9, &pad_four(entry));
     let bytes = concat(&[
         &prefix(Some(1)),
         &journal,
