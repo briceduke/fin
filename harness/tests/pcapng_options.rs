@@ -119,6 +119,17 @@ fn systematic() -> Vec<Vec<u8>> {
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= -1\nxxxx"));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= +1\nxx"));
     files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP= -1\nxx"));
+    for space in [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c] {
+        files.push(extra_after_packet(
+            9,
+            &journal_stamp(&[space, b'+', b'1', b'\n']),
+        ));
+        files.push(extra_after_packet(
+            9,
+            &journal_stamp(&[space, b'-', b'1', b'\n']),
+        ));
+    }
+    files.push(extra_after_packet(9, b"__REALTIME_TIMESTAMP=   +2\n"));
     files.push(extra_after_packet(0x0000_0BAD, &1u32.to_le_bytes()));
     files.push(extra_after_packet(0x0000_0BAD, &[]));
     files.push(extra_only(0x0000_0BAD, &[]));
@@ -200,7 +211,7 @@ fn random_extra(rng: &mut Rng) -> Vec<u8> {
 
 fn random_extra_body(rng: &mut Rng, block_type: u32) -> Vec<u8> {
     match block_type {
-        9 => match rng.bounded(8) {
+        9 => match rng.bounded(9) {
             0 => b"__REALTIME_TIMESTAMP=0\n".to_vec(),
             1 => b"__REALTIME_TIMESTAMP=18446744073709551616\n".to_vec(),
             2 => b"__REALTIME_TIMESTAMP= 1\nxxxx".to_vec(),
@@ -208,6 +219,15 @@ fn random_extra_body(rng: &mut Rng, block_type: u32) -> Vec<u8> {
             4 => b"__REALTIME_TIMESTAMP=-1\nxxxx".to_vec(),
             5 => b"__REALTIME_TIMESTAMP= +1\nxxxx".to_vec(),
             6 => b"__REALTIME_TIMESTAMP= -1\nxxxx".to_vec(),
+            7 => {
+                let spaces = [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c];
+                journal_stamp(&[
+                    spaces[rng.bounded(6) as usize],
+                    if rng.bit() { b'+' } else { b'-' },
+                    b'1',
+                    b'\n',
+                ])
+            }
             _ => vec![0; rng.bounded(8) as usize],
         },
         0x0000_0BAD | 0x4000_0BAD if rng.bit() => 1u32.to_le_bytes().to_vec(),
@@ -271,6 +291,12 @@ fn epb_option(code: u16, value: &[u8]) -> Vec<u8> {
     file.extend_from_slice(&idb(&[]));
     file.extend_from_slice(&epb(0, 0, &[0xaa], &opt(code, value)));
     file
+}
+
+fn journal_stamp(after_eq: &[u8]) -> Vec<u8> {
+    let mut entry = b"__REALTIME_TIMESTAMP=".to_vec();
+    entry.extend_from_slice(after_eq);
+    entry
 }
 
 fn extra_after_packet(block_type: u32, body: &[u8]) -> Vec<u8> {

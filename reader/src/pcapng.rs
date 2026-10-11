@@ -429,7 +429,8 @@ fn ws_strtou64(bytes: &[u8]) -> Option<u64> {
     }
     let mut rest = bytes;
     while let Some((&byte, tail)) = rest.split_first() {
-        if !byte.is_ascii_whitespace() {
+        // C isspace / g_ascii_isspace. Rust is_ascii_whitespace omits `\v`.
+        if !matches!(byte, b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r' | b' ') {
             break;
         }
         rest = tail;
