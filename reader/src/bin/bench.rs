@@ -1,9 +1,11 @@
 //! Throwaway bench: one `read_capture` walk. `--in-process` times that walk alone.
 
 use std::env;
-use std::fs;
+use std::fs::File;
 use std::hint::black_box;
+use std::io::{Read, Seek, SeekFrom};
 use std::process::ExitCode;
+use std::thread;
 use std::time::Instant;
 
 use reader::read_capture;
@@ -18,10 +20,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Ok(bytes) = fs::read(path) else {
+    let load_started = Instant::now();
+    let Ok(bytes) = load_capture(path) else {
         eprintln!("read failed");
         return ExitCode::from(1);
     };
+    if env::var_os("FIN_PHASES").is_some() {
+        eprintln!("load {:.6}", load_started.elapsed().as_secs_f64());
+    }
     let mut timed = [0.0; 3];
     for index in 0..passes {
         let started = Instant::now();
@@ -43,6 +49,9 @@ fn main() -> ExitCode {
         }
         if index == 0 {
             eprintln!("1000000");
+            if env::var_os("FIN_PHASES").is_some() {
+                eprintln!("walk {:.6}", elapsed);
+            }
         } else {
             timed[index - 1] = elapsed;
         }
@@ -52,4 +61,34 @@ fn main() -> ExitCode {
         eprintln!("median {:.6}", timed[1]);
     }
     ExitCode::SUCCESS
+}
+
+/// Read the whole file on several threads. Each thread fills a disjoint range.
+fn load_capture(path: &str) -> std::io::Result<Vec<u8>> {
+    let len = usize::try_from(File::open(path)?.metadata()?.len()).unwrap_or(0);
+    let mut bytes = Vec::<u8>::with_capacity(len);
+    // 16 threads. 32 was no faster on the million-packet file.
+    let threads = 16.min(len.max(1));
+    let chunk = len.div_ceil(threads);
+    let start = bytes.as_mut_ptr() as usize;
+    thread::scope(|scope| {
+        for index in 0..threads {
+            let offset = index * chunk;
+            if offset >= len {
+                break;
+            }
+            let end = (offset + chunk).min(len);
+            scope.spawn(move || {
+                let mut file = File::open(path).expect("open");
+                file.seek(SeekFrom::Start(offset as u64)).expect("seek");
+                let slice = unsafe {
+                    std::slice::from_raw_parts_mut((start + offset) as *mut u8, end - offset)
+                };
+                file.read_exact(slice).expect("read");
+            });
+        }
+    });
+    // Every range was written before this. A panic above leaves len at 0.
+    unsafe { bytes.set_len(len) };
+    Ok(bytes)
 }
