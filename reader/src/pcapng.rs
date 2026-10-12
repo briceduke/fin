@@ -1,7 +1,6 @@
-use crate::options::{self, IdOptions};
+use crate::options;
 use crate::{
-    BlockKind, Capture, CaptureKind, Fault, Frame, TimeUnit, Timestamp, MAX_BLOCK_SIZE,
-    MAX_CAPTURED_LENGTH,
+    BlockKind, Capture, CaptureKind, Fault, Frame, MAX_BLOCK_SIZE, MAX_CAPTURED_LENGTH,
 };
 
 const SHB_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
@@ -19,7 +18,6 @@ const DSB_TYPE: u32 = 10;
 const CB_COPY: u32 = 0x0000_0BAD;
 const CB_NO_COPY: u32 = 0x4000_0BAD;
 const JOURNAL_MIN: usize = 23;
-const JOURNAL_KEY: &[u8] = b"__REALTIME_TIMESTAMP=";
 const LE_ORDER: [u8; 4] = [0x4d, 0x3c, 0x2b, 0x1a];
 const BE_ORDER: [u8; 4] = [0x1a, 0x2b, 0x3c, 0x4d];
 
@@ -43,15 +41,11 @@ const BLOCKS: &[(u32, bool)] = &[
 struct Interface {
     link_type: u32,
     snaplen: u32,
-    resol: u8,
-    tsoffset: i64,
 }
 
 struct Packet {
     interface_id: u32,
-    ticks: Option<u64>,
     captured_len: u32,
-    original_len: u32,
     packet_at: usize,
 }
 
@@ -90,7 +84,6 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
     let mut frames = Vec::new();
     let mut interfaces = Vec::new();
     let mut after_packet = false;
-    let mut last_ts = None;
     while offset < bytes.len() {
         let (block_type, total, endian) = match block_at(bytes, offset, big_endian) {
             Ok(found) => found,
@@ -113,7 +106,6 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
             big_endian,
             &mut interfaces,
             &mut frames,
-            &mut last_ts,
         ) {
             return Capture::halt(frames, fault, after_packet);
         }
@@ -197,7 +189,6 @@ fn consume<'a>(
     big_endian: bool,
     interfaces: &mut Vec<Interface>,
     frames: &mut Vec<Frame<'a>>,
-    last_ts: &mut Option<Timestamp>,
 ) -> Result<(), Fault> {
     // Same set as BLOCKS. Unknown types are skipped.
     match block_type {
@@ -207,41 +198,17 @@ fn consume<'a>(
             interfaces.clear();
         }
         IDB_TYPE => interfaces.push(interface(bytes, offset, total, big_endian)?),
-        EPB_TYPE => push_stamp(
-            frames,
-            enhanced(bytes, offset, total, big_endian, interfaces)?,
-            last_ts,
-        ),
-        SPB_TYPE => {
-            frames.push(simple(bytes, offset, total, big_endian, interfaces)?);
-            *last_ts = None;
-        }
-        OPB_TYPE => push_stamp(
-            frames,
-            obsolete(bytes, offset, total, big_endian, interfaces)?,
-            last_ts,
-        ),
+        EPB_TYPE => frames.push(enhanced(bytes, offset, total, big_endian, interfaces)?),
+        SPB_TYPE => frames.push(simple(bytes, offset, total, big_endian, interfaces)?),
+        OPB_TYPE => frames.push(obsolete(bytes, offset, total, big_endian, interfaces)?),
         ISB_TYPE => isb(bytes, offset, total, big_endian)?,
         NRB_TYPE => nrb(bytes, offset, total, big_endian)?,
         DSB_TYPE => dsb(bytes, offset, total, big_endian)?,
-        CB_COPY | CB_NO_COPY => {
-            let mut frame = custom(bytes, offset, total)?;
-            frame.timestamp = *last_ts;
-            frames.push(frame);
-        }
-        JOURNAL_TYPE => {
-            let frame = journal(bytes, offset, total)?;
-            *last_ts = frame.timestamp;
-            frames.push(frame);
-        }
+        CB_COPY | CB_NO_COPY => frames.push(custom(bytes, offset, total)?),
+        JOURNAL_TYPE => frames.push(journal(bytes, offset, total)?),
         _ => {}
     }
     Ok(())
-}
-
-fn push_stamp<'a>(frames: &mut Vec<Frame<'a>>, frame: Frame<'a>, last_ts: &mut Option<Timestamp>) {
-    *last_ts = frame.timestamp;
-    frames.push(frame);
 }
 
 fn interface(
@@ -254,13 +221,10 @@ fn interface(
         return Err(Fault::CutShort);
     }
     let at = offset + 8;
-    let IdOptions { resol, tsoffset } =
-        options::walk_idb(bytes, at + 8, offset + total - 4, big_endian)?;
+    options::walk_idb(bytes, at + 8, offset + total - 4, big_endian)?;
     Ok(Interface {
         link_type: u32::from(u16_at(bytes, at, big_endian)),
         snaplen: u32_at(bytes, at + 4, big_endian),
-        resol,
-        tsoffset,
     })
 }
 
@@ -380,8 +344,6 @@ fn custom(bytes: &[u8], offset: usize, total: usize) -> Result<Frame<'_>, Fault>
     let captured = &body[4..];
     Ok(Frame {
         link_type: 0,
-        timestamp: None,
-        original_length: captured.len() as u32,
         captured,
     })
 }
@@ -400,81 +362,10 @@ fn journal(bytes: &[u8], offset: usize, total: usize) -> Result<Frame<'_>, Fault
             length: length as u32,
         });
     }
-    let captured = &body[..length];
     Ok(Frame {
         link_type: 0,
-        timestamp: journal_time(captured),
-        original_length: captured.len() as u32,
-        captured,
+        captured: &body[..length],
     })
-}
-
-fn journal_time(entry: &[u8]) -> Option<Timestamp> {
-    // tshark writes a NUL at the stripped length, then strstr. Cut at
-    // the first embedded NUL or that length, whichever comes first.
-    let end = entry
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(entry.len());
-    let c_str = &entry[..end];
-    let start = c_str
-        .windows(JOURNAL_KEY.len())
-        .position(|window| window == JOURNAL_KEY)?;
-    let ticks = ws_strtou64(&c_str[start + JOURNAL_KEY.len()..])?;
-    Some(Timestamp {
-        seconds: (ticks / 1_000_000) as i64,
-        fraction: (ticks % 1_000_000) as u32,
-        unit: TimeUnit::Microsecond,
-    })
-}
-
-/// tshark 4.6.9 `ws_strtou64` with `endptr` set (pcapng.c journal stamp).
-fn ws_strtou64(bytes: &[u8]) -> Option<u64> {
-    match bytes.first() {
-        Some(b'+' | b'-') | None => return None,
-        _ => {}
-    }
-    let mut rest = bytes;
-    while let Some((&byte, tail)) = rest.split_first() {
-        if !isspace(byte) {
-            break;
-        }
-        rest = tail;
-    }
-    let negative = match rest.split_first() {
-        Some((b'+', tail)) => {
-            rest = tail;
-            false
-        }
-        Some((b'-', tail)) => {
-            rest = tail;
-            true
-        }
-        _ => false,
-    };
-    let mut ticks = 0u64;
-    let mut seen = false;
-    for &byte in rest {
-        if !byte.is_ascii_digit() {
-            break;
-        }
-        seen = true;
-        ticks = ticks.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
-    }
-    if !seen {
-        return None;
-    }
-    Some(if negative {
-        0u64.wrapping_sub(ticks)
-    } else {
-        ticks
-    })
-}
-
-/// GLib `g_parse_long_long` `ISSPACE` in `gstrfuncs.c`: space, tab, `\n`,
-/// `\v`, `\f`, `\r`. `g_ascii_isspace` and Rust `is_ascii_whitespace` omit `\v`.
-fn isspace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r')
 }
 
 fn enhanced<'a>(
@@ -492,9 +383,7 @@ fn enhanced<'a>(
         bytes,
         Packet {
             interface_id: u32_at(bytes, at, big_endian),
-            ticks: Some(ticks_at(bytes, at + 4, big_endian)),
             captured_len: u32_at(bytes, at + 12, big_endian),
-            original_len: u32_at(bytes, at + 16, big_endian),
             packet_at: at + 20,
         },
         offset + total - 4,
@@ -524,9 +413,7 @@ fn simple<'a>(
         bytes,
         Packet {
             interface_id: 0,
-            ticks: None,
             captured_len: captured_from_snaplen(original_len, snaplen),
-            original_len,
             packet_at: offset + 12,
         },
         offset + total - 4,
@@ -558,9 +445,7 @@ fn obsolete<'a>(
         bytes,
         Packet {
             interface_id: u32::from(u16_at(bytes, at, big_endian)),
-            ticks: Some(ticks_at(bytes, at + 4, big_endian)),
             captured_len: u32_at(bytes, at + 12, big_endian),
-            original_len: u32_at(bytes, at + 16, big_endian),
             packet_at: at + 20,
         },
         offset + total - 4,
@@ -599,24 +484,8 @@ fn frame<'a>(
     }
     Ok(Frame {
         link_type: iface.link_type,
-        timestamp: packet
-            .ticks
-            .map(|ticks| with_offset(timestamp(ticks, iface.resol), iface.tsoffset)),
-        original_length: packet.original_len,
         captured,
     })
-}
-
-fn with_offset(stamp: Timestamp, offset: i64) -> Timestamp {
-    Timestamp {
-        seconds: add_seconds(stamp.seconds, offset),
-        fraction: stamp.fraction,
-        unit: stamp.unit,
-    }
-}
-
-fn add_seconds(seconds: i64, offset: i64) -> i64 {
-    seconds.wrapping_add(offset)
 }
 
 fn packet_bytes<'a>(
@@ -632,56 +501,6 @@ fn packet_bytes<'a>(
         return Err(Fault::CutShort);
     }
     Ok(&bytes[packet_at..end])
-}
-
-fn timestamp(ticks: u64, resol: u8) -> Timestamp {
-    if resol & 0x80 != 0 {
-        let nanos = (u128::from(ticks) * 1_000_000_000) >> (resol & 0x7f);
-        return split(nanos, 1_000_000_000, TimeUnit::Nanosecond);
-    }
-    let resol = u32::from(resol);
-    if resol <= 6 {
-        let micros = u128::from(ticks) * pow10(6 - resol);
-        return split(micros, 1_000_000, TimeUnit::Microsecond);
-    }
-    let nanos = if resol < 9 {
-        u128::from(ticks) * pow10(9 - resol)
-    } else if resol == 9 {
-        u128::from(ticks)
-    } else {
-        div_pow10(u128::from(ticks), resol - 9)
-    };
-    split(nanos, 1_000_000_000, TimeUnit::Nanosecond)
-}
-
-fn split(ticks: u128, scale: u128, unit: TimeUnit) -> Timestamp {
-    Timestamp {
-        seconds: (ticks / scale) as i64,
-        fraction: (ticks % scale) as u32,
-        unit,
-    }
-}
-
-fn pow10(exp: u32) -> u128 {
-    let mut scale = 1u128;
-    for _ in 0..exp {
-        scale *= 10;
-    }
-    scale
-}
-
-fn div_pow10(value: u128, exp: u32) -> u128 {
-    let mut out = value;
-    for _ in 0..exp {
-        out /= 10;
-    }
-    out
-}
-
-fn ticks_at(bytes: &[u8], offset: usize, big_endian: bool) -> u64 {
-    let high = u64::from(u32_at(bytes, offset, big_endian));
-    let low = u64::from(u32_at(bytes, offset + 4, big_endian));
-    (high << 32) | low
 }
 
 fn endian_at(bytes: &[u8], offset: usize) -> Option<bool> {

@@ -1,4 +1,4 @@
-use reader::{read_capture, BlockKind, CaptureKind, Fault, TimeUnit, Timestamp};
+use reader::{read_capture, BlockKind, CaptureKind, Fault};
 
 #[derive(Clone, Copy)]
 enum Endian {
@@ -196,27 +196,10 @@ fn one_enhanced_packet_and_the_packet_after_padding() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].link_type, 1);
-    assert_eq!(capture.frames[0].original_length, 60);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 1,
-            fraction: 500_000,
-            unit: TimeUnit::Microsecond,
-        })
-    );
     assert_eq!(capture.frames[0].captured, &[0x10, 0x20, 0x30]);
     assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
     assert_eq!(capture.frames[1].captured, &[0x99]);
     assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
-    assert_eq!(
-        capture.frames[1].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 2,
-            unit: TimeUnit::Microsecond,
-        })
-    );
 }
 
 #[test]
@@ -231,14 +214,6 @@ fn big_endian_section_reads_one_packet() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 2,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
     assert_eq!(capture.frames[0].captured, &[0x07, 0x08]);
     assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
 }
@@ -323,7 +298,7 @@ fn an_unknown_block_between_packets_is_skipped() {
 }
 
 #[test]
-fn simple_packet_has_no_timestamp() {
+fn simple_packet_clips_to_snaplen() {
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 4, &[]),
@@ -333,8 +308,6 @@ fn simple_packet_has_no_timestamp() {
 
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].timestamp, None);
-    assert_eq!(capture.frames[0].original_length, 8);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x01, 0x02, 0x03, 0x04]);
     assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
@@ -352,8 +325,6 @@ fn simple_packet_snaplen_zero_keeps_the_original_length() {
 
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].timestamp, None);
-    assert_eq!(capture.frames[0].original_length, 8);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &packet);
     assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
@@ -388,81 +359,6 @@ fn simple_packet_snaplen_zero_above_the_maximum_is_not_a_frame() {
 }
 
 #[test]
-fn if_tsoffset_is_added_to_the_packet_timestamp() {
-    let offset = option(Endian::Little, 14, &pack_i64(3600, Endian::Little));
-    assert_eq!(
-        offset,
-        [0x0e, 0x00, 0x08, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-    );
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &offset),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 3600,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-}
-
-#[test]
-fn a_negative_if_tsoffset_is_a_negative_epoch() {
-    let offset = option(Endian::Little, 14, &pack_i64(-3600, Endian::Little));
-    assert_eq!(
-        offset,
-        [0x0e, 0x00, 0x08, 0x00, 0xf0, 0xf1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-    );
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &offset),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: -3600,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-}
-
-#[test]
-fn a_negative_if_tsoffset_adds_to_the_whole_seconds() {
-    let offset = option(Endian::Little, 14, &pack_i64(-3600, Endian::Little));
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &offset),
-        &enhanced_packet(Endian::Little, 0, 1_500_000, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: -3599,
-            fraction: 500_000,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-}
-
-#[test]
 fn options_after_endofopt_are_ignored() {
     let options = concat(&[
         &option(Endian::Little, 0, &[]),
@@ -481,38 +377,7 @@ fn options_after_endofopt_are_ignored() {
 
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 1000,
-            fraction: 5,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-}
-
-#[test]
-fn tsoffset_after_endofopt_is_ignored() {
-    let options = concat(&[
-        &option(Endian::Little, 0, &[]),
-        &option(Endian::Little, 14, &pack_i64(3600, Endian::Little)),
-    ]);
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &options),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
 }
 
 #[test]
@@ -617,117 +482,6 @@ fn a_later_shb_1_1_keeps_the_earlier_frame() {
 }
 
 #[test]
-fn nanosecond_interface_resolution() {
-    let resol = option(Endian::Little, 9, &[9]);
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &resol),
-        &enhanced_packet(Endian::Little, 0, 1_000_000_005, 1, 1, &[0x01], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 1,
-            fraction: 5,
-            unit: TimeUnit::Nanosecond,
-        })
-    );
-    assert_eq!(capture.frames[0].captured, &[0x01]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
-}
-
-#[test]
-fn power_of_two_interface_resolution() {
-    let resol = option(Endian::Little, 9, &[0x83]);
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &resol),
-        &enhanced_packet(Endian::Little, 0, 1, 1, 1, &[0x01], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 125_000_000,
-            unit: TimeUnit::Nanosecond,
-        })
-    );
-    assert_eq!(capture.frames[0].captured, &[0x01]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
-}
-
-#[test]
-fn millisecond_resolution_reports_microseconds() {
-    let resol = option(Endian::Little, 9, &[3]);
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &resol),
-        &enhanced_packet(Endian::Little, 0, 1, 1, 1, &[0x01], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 1000,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-}
-
-#[test]
-fn ten_nanosecond_resolution_reports_nanoseconds() {
-    let resol = option(Endian::Little, 9, &[8]);
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &resol),
-        &enhanced_packet(Endian::Little, 0, 1, 1, 1, &[0x01], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 10,
-            unit: TimeUnit::Nanosecond,
-        })
-    );
-}
-
-#[test]
-fn sub_nanosecond_resolution_truncates_to_nanoseconds() {
-    let resol = option(Endian::Little, 9, &[10]);
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &resol),
-        &enhanced_packet(Endian::Little, 0, 10, 1, 1, &[0x01], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 1,
-            unit: TimeUnit::Nanosecond,
-        })
-    );
-}
-
-#[test]
 fn a_packet_option_does_not_swallow_the_next_packet() {
     let comment = option(Endian::Little, 1, b"abc");
     let bytes = concat(&[
@@ -758,15 +512,6 @@ fn obsolete_packet_block_is_a_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
-    assert_eq!(capture.frames[0].original_length, 9);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 2,
-            fraction: 500_000,
-            unit: TimeUnit::Microsecond,
-        })
-    );
     assert_eq!(capture.frames[0].captured, &[0x0a, 0x0b]);
     assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
 }
@@ -783,7 +528,6 @@ fn an_unclaimed_pcapng_link_type_still_yields_the_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 127);
-    assert_eq!(capture.frames[0].original_length, 4);
     assert_eq!(capture.frames[0].captured, &[0x22]);
     assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
 }
@@ -954,62 +698,8 @@ fn if_tsresol_is_used_only_when_the_length_is_one() {
     let capture = read_capture(&bytes);
 
     assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 1000,
-            fraction: 5,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-}
-
-#[test]
-fn if_tsoffset_is_used_only_when_the_length_is_eight() {
-    let offset_nine = option(
-        Endian::Little,
-        14,
-        &[0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-    );
-    assert_eq!(
-        &offset_nine[..13],
-        [0x0e, 0x00, 0x09, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-    );
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &offset_nine),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-
-    let mut offset_sixteen =
-        concat(&[&pack_u16(14, Endian::Little), &pack_u16(16, Endian::Little)]);
-    offset_sixteen.extend_from_slice(&pack_i64(3600, Endian::Little));
-    offset_sixteen.extend_from_slice(&pack_i64(7200, Endian::Little));
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &offset_sixteen),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
+    assert_eq!(capture.frames.len(), 1);
+    assert_eq!(capture.frames[0].captured, &[0xaa]);
 }
 
 #[test]
@@ -1077,31 +767,6 @@ fn if_filter_length_zero_fails_the_idb() {
     assert_eq!(capture.frames.len(), 0);
     assert_eq!(capture.fault, Some(Fault::IdbFilter { length: 0 }));
     assert_eq!(capture.exit_code(), 3);
-}
-
-#[test]
-fn if_tsoffset_wraps_like_a_signed_time_t() {
-    let offset = option(Endian::Little, 14, &pack_i64(i64::MAX - 9, Endian::Little));
-    assert_eq!(
-        offset,
-        [0x0e, 0x00, 0x08, 0x00, 0xf6, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
-    );
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1, 65535, &offset),
-        &enhanced_packet(Endian::Little, 0, 20_000_000, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: -9223372036854775798,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
 }
 
 #[test]
@@ -1184,40 +849,6 @@ fn prefix(packet: Option<u8>) -> Vec<u8> {
         bytes.extend_from_slice(&enhanced_packet(Endian::Little, 0, 0, 1, 1, &[byte], &[]));
     }
     bytes
-}
-
-fn journal_between_packets(after_eq: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut entry = b"__REALTIME_TIMESTAMP=".to_vec();
-    entry.extend_from_slice(after_eq);
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &block(Endian::Little, 9, &pad_four(&entry)),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    (entry, bytes)
-}
-
-fn assert_journal_stamp(after_eq: &[u8], want: Option<Timestamp>) {
-    let (entry, bytes) = journal_between_packets(after_eq);
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.fault, None, "{after_eq:?}");
-    assert_eq!(capture.frames.len(), 3, "{after_eq:?}");
-    assert_eq!(capture.frames[1].captured, entry.as_slice(), "{after_eq:?}");
-    assert_eq!(capture.frames[1].timestamp, want, "{after_eq:?}");
-    assert_eq!(capture.exit_code(), 0, "{after_eq:?}");
-}
-
-fn assert_journal_entry(entry: &[u8], want: Option<Timestamp>) {
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &block(Endian::Little, 9, &pad_four(entry)),
-    ]);
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.fault, None, "{entry:?}");
-    assert_eq!(capture.frames.len(), 1, "{entry:?}");
-    assert_eq!(capture.frames[0].captured, entry, "{entry:?}");
-    assert_eq!(capture.frames[0].timestamp, want, "{entry:?}");
-    assert_eq!(capture.exit_code(), 0, "{entry:?}");
 }
 
 fn epb_lengths(first: u32, second: u32) -> Vec<u8> {
@@ -1403,15 +1034,6 @@ fn a_journal_export_between_packets_is_a_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 3);
     assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(capture.frames[1].original_length, 23);
-    assert_eq!(
-        capture.frames[1].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
     assert_eq!(capture.frames[2].captured, &[0x02]);
     assert_eq!(capture.exit_code(), 0);
 }
@@ -1461,230 +1083,7 @@ fn a_journal_export_without_packets_is_a_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured, entry.as_slice());
-    assert_eq!(capture.frames[0].original_length, 23);
     assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn an_overflowing_journal_timestamp_is_missing() {
-    let entry = b"__REALTIME_TIMESTAMP=18446744073709551616\n";
-    let journal = block(Endian::Little, 9, &pad_four(entry));
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &journal,
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(capture.frames[1].timestamp, None);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_journal_timestamp_with_a_leading_space_is_read() {
-    let entry = b"__REALTIME_TIMESTAMP= 1\nxxxx";
-    let journal = block(Endian::Little, 9, entry);
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &journal,
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(
-        capture.frames[1].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 1,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_journal_timestamp_with_a_leading_plus_is_missing() {
-    let entry = b"__REALTIME_TIMESTAMP=+1\nxxxx";
-    let journal = block(Endian::Little, 9, entry);
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &journal,
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(capture.frames[1].timestamp, None);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_journal_timestamp_with_a_leading_minus_is_missing() {
-    let entry = b"__REALTIME_TIMESTAMP=-1\nxxxx";
-    let journal = block(Endian::Little, 9, entry);
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &journal,
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(capture.frames[1].timestamp, None);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_journal_timestamp_skips_each_isspace() {
-    const SPACES: [u8; 6] = [b' ', b'\t', b'\n', 0x0b, b'\x0c', b'\r'];
-    let eight = Some(Timestamp {
-        seconds: 0,
-        fraction: 8,
-        unit: TimeUnit::Microsecond,
-    });
-    let plus = Some(Timestamp {
-        seconds: 0,
-        fraction: 1,
-        unit: TimeUnit::Microsecond,
-    });
-    let wrap = Some(Timestamp {
-        seconds: 18_446_744_073_709,
-        fraction: 551_615,
-        unit: TimeUnit::Microsecond,
-    });
-    for &space in &SPACES {
-        let digit = [space, b'8', b'\n', b'x', b'x', b'x', b'x'];
-        assert_journal_stamp(&digit, eight);
-        assert_journal_stamp(&[space, b'+', b'1', b'\n'], plus);
-        assert_journal_stamp(&[space, b'-', b'1', b'\n'], wrap);
-    }
-    assert_journal_stamp(
-        b"   +2\n",
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 2,
-            unit: TimeUnit::Microsecond,
-        }),
-    );
-}
-
-#[test]
-fn a_journal_timestamp_skips_a_vertical_tab_before_a_digit() {
-    let entry = b"__REALTIME_TIMESTAMP=\x0b8\nxxxx";
-    let bytes = concat(&[
-        &section_header(Endian::Little),
-        &block(Endian::Little, 9, entry),
-    ]);
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, entry.as_slice());
-    assert_eq!(capture.frames[0].captured.len(), 28);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 8,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_journal_timestamp_after_an_embedded_nul_is_missing() {
-    let entry = b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx";
-    assert_journal_entry(entry, None);
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &block(Endian::Little, 9, &pad_four(entry)),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(capture.frames[1].timestamp, None);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_custom_block_does_not_inherit_a_journal_stamp_past_nul() {
-    let entry = b"FOO=bar\x00__REALTIME_TIMESTAMP=8\nxxxx";
-    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
-    let bytes = concat(&[
-        &prefix(None),
-        &enhanced_packet(Endian::Little, 0, 1_500_000, 1, 1, &[0x01], &[]),
-        &block(Endian::Little, 9, &pad_four(entry)),
-        &custom,
-    ]);
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(Timestamp {
-            seconds: 1,
-            fraction: 500_000,
-            unit: TimeUnit::Microsecond,
-        })
-    );
-    assert_eq!(capture.frames[1].captured, entry.as_slice());
-    assert_eq!(capture.frames[1].timestamp, None);
-    assert_eq!(capture.frames[2].captured, b"");
-    assert_eq!(capture.frames[2].timestamp, None);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_journal_timestamp_before_an_embedded_nul_is_read() {
-    assert_journal_entry(
-        b"__REALTIME_TIMESTAMP=8\nxxxx\x00FOO=bar",
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 8,
-            unit: TimeUnit::Microsecond,
-        }),
-    );
-}
-
-#[test]
-fn a_journal_timestamp_inside_another_field_is_read() {
-    assert_journal_entry(
-        b"x__REALTIME_TIMESTAMP=8\nxxxx",
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 8,
-            unit: TimeUnit::Microsecond,
-        }),
-    );
-}
-
-#[test]
-fn a_journal_timestamp_with_no_value_bytes_is_missing() {
-    assert_journal_entry(b"xx__REALTIME_TIMESTAMP=", None);
-}
-
-#[test]
-fn a_journal_timestamp_stops_on_trailing_garbage() {
-    assert_journal_entry(
-        b"__REALTIME_TIMESTAMP=0x10\nxxxx",
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        }),
-    );
 }
 
 #[test]
@@ -1718,7 +1117,6 @@ fn a_custom_block_between_packets_is_a_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 3);
     assert_eq!(capture.frames[1].captured, b"");
-    assert_eq!(capture.frames[1].original_length, 0);
     assert_eq!(capture.frames[2].captured, &[0x02]);
     assert_eq!(capture.exit_code(), 0);
 }
@@ -1732,26 +1130,7 @@ fn a_custom_block_without_packets_is_a_frame() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured, b"");
-    assert_eq!(capture.frames[0].timestamp, None);
     assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_custom_block_keeps_the_previous_packet_timestamp() {
-    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
-    let bytes = concat(&[&prefix(Some(1)), &custom]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 2);
-    assert_eq!(
-        capture.frames[1].timestamp,
-        Some(Timestamp {
-            seconds: 0,
-            fraction: 0,
-            unit: TimeUnit::Microsecond,
-        })
-    );
 }
 
 #[test]

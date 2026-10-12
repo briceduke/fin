@@ -32,7 +32,7 @@ flowchart LR
   rows --> app[App]
 ```
 
-A capture file becomes frames: link type, timestamp, original length, and the captured bytes. The file is mapped and split across cores. Each core proves that its chunk starts where the previous one stopped. A seam that does not prove is reread by the sequential reader, front to back on one core. Stdin and live capture use that reader too, because they cannot be split.
+A capture file becomes frames: link type and the captured bytes. The file is mapped and split across cores. Each core proves that its chunk starts where the previous one stopped. A seam that does not prove is reread by the sequential reader, front to back on one core. Stdin and live capture use that reader too, because they cannot be split.
 
 Header fields are read from the packet in hand. A field that spans packets, such as a TLS server name, is reassembled on the connection and written on the packet that completes it. Rows from every core merge back into file order.
 
@@ -65,7 +65,7 @@ Any other field, flag, or display filter is an error, never a silently empty col
 Each step is checked against the one before it.
 
 1. The checker and a corpus of test captures. Done.
-2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type, timestamp, original length, and the captured bytes. Tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises, including ISB, NRB, DSB, custom blocks, and systemd journal export.
+2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type and the captured bytes. Tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises, including ISB, NRB, DSB, custom blocks, and systemd journal export.
 3. `ip.src`. Next.
 4. The chunk split, checked against the sequential reader.
 5. TLS server names.

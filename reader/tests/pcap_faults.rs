@@ -1,4 +1,4 @@
-use reader::{read_capture, CaptureKind, Fault, TimeUnit, Timestamp};
+use reader::{read_capture, CaptureKind, Fault};
 
 fn header(link_type: u32) -> Vec<u8> {
     header_version(2, 4, link_type)
@@ -91,15 +91,6 @@ fn an_earlier_frame_survives_a_cut_short_header() {
     assert_eq!(capture.frames.len(), 1);
     let frame = &capture.frames[0];
     assert_eq!(frame.captured, &[0x11, 0x22, 0x33, 0x44]);
-    assert_eq!(frame.original_length, 4);
-    assert_eq!(
-        frame.timestamp,
-        Some(Timestamp {
-            seconds: 1,
-            fraction: 2,
-            unit: TimeUnit::Microsecond,
-        })
-    );
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::CutShort);
     assert_eq!(capture.exit_code(), 14);
@@ -153,7 +144,6 @@ fn version_2_3_swaps_when_incl_exceeds_orig() {
     let capture = read_capture(&bytes);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured, &[0x0a, 0x0b]);
-    assert_eq!(capture.frames[0].original_length, 4);
     let fault = capture.fault.unwrap();
     assert_eq!(fault, Fault::CutShort);
     assert_eq!(capture.exit_code(), 14);

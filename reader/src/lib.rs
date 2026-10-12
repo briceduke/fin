@@ -26,24 +26,7 @@ const PCAPNG_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame<'a> {
     pub link_type: u32,
-    pub timestamp: Option<Timestamp>,
-    pub original_length: u32,
     pub captured: &'a [u8],
-}
-
-/// A timestamp taken from the file, split into whole seconds and a fraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Timestamp {
-    pub seconds: i64,
-    pub fraction: u32,
-    pub unit: TimeUnit,
-}
-
-/// The unit of [`Timestamp::fraction`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimeUnit {
-    Microsecond,
-    Nanosecond,
 }
 
 /// Frames read before the reader stopped, and the fault that stopped it.
