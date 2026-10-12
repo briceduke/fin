@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use harness::{RunError, TsharkSession};
-use reader::{read_capture, TimeUnit};
+use reader::read_capture;
 
 const CASES: u32 = 512;
 
@@ -455,8 +455,6 @@ fn diff_one(session: &TsharkSession, dir: &Path, index: usize, bytes: &[u8]) -> 
         OsString::from("frame.number"),
         OsString::from("-e"),
         OsString::from("frame.cap_len"),
-        OsString::from("-e"),
-        OsString::from("frame.time_epoch"),
     ];
     let tshark = session.run(&args).unwrap();
     let capture = read_capture(bytes);
@@ -505,22 +503,7 @@ fn diff_one(session: &TsharkSession, dir: &Path, index: usize, bytes: &[u8]) -> 
 fn fin_rows(capture: &reader::Capture<'_>) -> String {
     let mut out = String::new();
     for (index, frame) in capture.frames.iter().enumerate() {
-        let epoch = match frame.timestamp {
-            Some(stamp) => {
-                let nanos = match stamp.unit {
-                    TimeUnit::Microsecond => u64::from(stamp.fraction) * 1000,
-                    TimeUnit::Nanosecond => u64::from(stamp.fraction),
-                };
-                format!("{}.{:09}", stamp.seconds, nanos)
-            }
-            None => String::new(),
-        };
-        out.push_str(&format!(
-            "{}\t{}\t{}\n",
-            index + 1,
-            frame.captured.len(),
-            epoch
-        ));
+        out.push_str(&format!("{}\t{}\n", index + 1, frame.captured.len()));
     }
     out
 }

@@ -1,4 +1,4 @@
-use reader::{read_capture, Capture, Fault, Frame, TimeUnit, Timestamp};
+use reader::{read_capture, Capture, Fault, Frame};
 
 const LE_USEC: [u8; 4] = [0xd4, 0xc3, 0xb2, 0xa1];
 const BE_USEC: [u8; 4] = [0xa1, 0xb2, 0xc3, 0xd4];
@@ -56,29 +56,12 @@ fn push_packet(file: &mut Vec<u8>, seconds: u32, fraction: u32, original_length:
     file.extend_from_slice(body);
 }
 
-fn stamp(seconds: i64, fraction: u32, unit: TimeUnit) -> Timestamp {
-    Timestamp {
-        seconds,
-        fraction,
-        unit,
-    }
-}
-
 fn assert_clean(capture: &Capture<'_>) {
     assert_eq!(capture.fault, None::<Fault>);
 }
 
-fn assert_frame(
-    frame: &Frame<'_>,
-    bytes: &[u8],
-    link_type: u32,
-    timestamp: Timestamp,
-    original_length: u32,
-    captured: &[u8],
-) {
+fn assert_frame(frame: &Frame<'_>, bytes: &[u8], link_type: u32, captured: &[u8]) {
     assert_eq!(frame.link_type, link_type);
-    assert_eq!(frame.timestamp, Some(timestamp));
-    assert_eq!(frame.original_length, original_length);
     assert_eq!(frame.captured, captured);
     assert!(is_subslice(bytes, frame.captured));
 }
@@ -90,14 +73,7 @@ fn little_endian_microseconds_yield_one_frame() {
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 1);
-    assert_frame(
-        &capture.frames[0],
-        &bytes,
-        1,
-        stamp(5, 6, TimeUnit::Microsecond),
-        2,
-        &[0x09, 0x08, 0x07, 0x06],
-    );
+    assert_frame(&capture.frames[0], &bytes, 1, &[0x09, 0x08, 0x07, 0x06]);
 }
 
 #[test]
@@ -107,40 +83,27 @@ fn big_endian_microseconds_yield_one_frame() {
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 1);
-    assert_frame(
-        &capture.frames[0],
-        &bytes,
-        1,
-        stamp(11, 12, TimeUnit::Microsecond),
-        2,
-        &[0xde, 0xad],
-    );
+    assert_frame(&capture.frames[0], &bytes, 1, &[0xde, 0xad]);
 }
 
 #[test]
-fn little_endian_nanoseconds_keep_the_fraction() {
+fn little_endian_nanosecond_magic_opens() {
     let mut bytes = header(LE_NSEC, 65535, 1);
     push_packet(&mut bytes, 9, 1000, 1, &[0x01]);
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(stamp(9, 1000, TimeUnit::Nanosecond))
-    );
+    assert_frame(&capture.frames[0], &bytes, 1, &[0x01]);
 }
 
 #[test]
-fn big_endian_nanoseconds_keep_a_short_fraction() {
+fn big_endian_nanosecond_magic_opens() {
     let mut bytes = header(BE_NSEC, 65535, 1);
     push_packet(&mut bytes, 3, 250, 9, &[0xff]);
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 1);
-    let frame = &capture.frames[0];
-    assert_eq!(frame.original_length, 9);
-    assert_eq!(frame.captured.len(), 1);
-    assert_eq!(frame.timestamp, Some(stamp(3, 250, TimeUnit::Nanosecond)));
+    assert_frame(&capture.frames[0], &bytes, 1, &[0xff]);
 }
 
 #[test]
@@ -151,22 +114,8 @@ fn two_packets_stay_in_file_order() {
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 2);
-    assert_frame(
-        &capture.frames[0],
-        &bytes,
-        1,
-        stamp(1, 2, TimeUnit::Microsecond),
-        1,
-        &[0x11],
-    );
-    assert_frame(
-        &capture.frames[1],
-        &bytes,
-        1,
-        stamp(3, 4, TimeUnit::Microsecond),
-        1,
-        &[0x22],
-    );
+    assert_frame(&capture.frames[0], &bytes, 1, &[0x11]);
+    assert_frame(&capture.frames[1], &bytes, 1, &[0x22]);
 }
 
 #[test]
@@ -181,18 +130,9 @@ fn captured_length_steps_past_snaplen_and_original_length() {
         &capture.frames[0],
         &bytes,
         1,
-        stamp(5, 6, TimeUnit::Microsecond),
-        2,
         &[0x09, 0x08, 0x07, 0x06],
     );
-    assert_frame(
-        &capture.frames[1],
-        &bytes,
-        1,
-        stamp(7, 8, TimeUnit::Microsecond),
-        1,
-        &[0xab],
-    );
+    assert_frame(&capture.frames[1], &bytes, 1, &[0xab]);
 }
 
 #[test]
@@ -212,10 +152,6 @@ fn captured_length_262144_is_a_frame() {
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured.len(), 262144);
-    assert_eq!(
-        capture.frames[0].timestamp,
-        Some(stamp(1, 0, TimeUnit::Microsecond))
-    );
     assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 

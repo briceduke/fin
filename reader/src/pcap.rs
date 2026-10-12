@@ -1,4 +1,4 @@
-use crate::{Capture, CaptureKind, Fault, Frame, TimeUnit, Timestamp, MAX_CAPTURED_LENGTH};
+use crate::{Capture, CaptureKind, Fault, Frame, MAX_CAPTURED_LENGTH};
 
 const HEADER_LEN: usize = 24;
 const RECORD_LEN: usize = 16;
@@ -14,7 +14,7 @@ pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
     if bytes.len() < HEADER_LEN {
         return Capture::halt(Vec::new(), Fault::TruncatedHeader, false);
     }
-    let (big_endian, unit) = layout(bytes);
+    let big_endian = layout(bytes);
     let major = u16_at(bytes, 4, big_endian);
     if major < 2 {
         return Capture::halt(Vec::new(), Fault::UnsupportedPcapVersion { major }, false);
@@ -24,17 +24,14 @@ pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
     if !matches!(link_type, 1 | 113 | 276) {
         return Capture::halt(Vec::new(), Fault::UnsupportedLinkType { link_type }, false);
     }
-    records(bytes, big_endian, unit, link_type, lengths(major, minor))
+    records(bytes, big_endian, link_type, lengths(major, minor))
 }
 
-fn layout(bytes: &[u8]) -> (bool, TimeUnit) {
-    match [bytes[0], bytes[1], bytes[2], bytes[3]] {
-        [0xd4, 0xc3, 0xb2, 0xa1] => (false, TimeUnit::Microsecond),
-        [0xa1, 0xb2, 0xc3, 0xd4] => (true, TimeUnit::Microsecond),
-        [0x4d, 0x3c, 0xb2, 0xa1] => (false, TimeUnit::Nanosecond),
-        [0xa1, 0xb2, 0x3c, 0x4d] => (true, TimeUnit::Nanosecond),
-        _ => unreachable!(),
-    }
+fn layout(bytes: &[u8]) -> bool {
+    matches!(
+        [bytes[0], bytes[1], bytes[2], bytes[3]],
+        [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d]
+    )
 }
 
 fn lengths(major: u16, minor: u16) -> Lengths {
@@ -58,7 +55,6 @@ fn order(included: u32, original: u32, lengths: Lengths) -> (u32, u32) {
 fn records<'a>(
     bytes: &'a [u8],
     big_endian: bool,
-    unit: TimeUnit,
     link_type: u32,
     lengths: Lengths,
 ) -> Capture<'a> {
@@ -68,8 +64,9 @@ fn records<'a>(
         if bytes.len() - offset < RECORD_LEN {
             return Capture::halt(frames, Fault::CutShort, true);
         }
-        let [seconds, fraction, included, original] = header_words(bytes, offset, big_endian);
-        let (included, original) = order(included, original, lengths);
+        let included = u32_at(bytes, offset + 8, big_endian);
+        let original = u32_at(bytes, offset + 12, big_endian);
+        let (included, _) = order(included, original, lengths);
         if included > MAX_CAPTURED_LENGTH {
             return Capture::halt(
                 frames,
@@ -87,26 +84,11 @@ fn records<'a>(
         let end = start + included as usize;
         frames.push(Frame {
             link_type,
-            timestamp: Some(Timestamp {
-                seconds: i64::from(seconds),
-                fraction,
-                unit,
-            }),
-            original_length: original,
             captured: &bytes[start..end],
         });
         offset = end;
     }
     Capture::ok(frames)
-}
-
-fn header_words(bytes: &[u8], offset: usize, big_endian: bool) -> [u32; 4] {
-    [
-        u32_at(bytes, offset, big_endian),
-        u32_at(bytes, offset + 4, big_endian),
-        u32_at(bytes, offset + 8, big_endian),
-        u32_at(bytes, offset + 12, big_endian),
-    ]
 }
 
 fn u16_at(bytes: &[u8], offset: usize, big_endian: bool) -> u16 {

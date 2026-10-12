@@ -11,8 +11,7 @@
 //! SHB (`pcapng_process_section_header_block_option`): strings only, no length fail.
 //!
 //! IDB (`pcapng_process_if_descr_block_option`):
-//! - 9 `if_tsresol` → `pcapng_process_uint8_option` (store iff length == 1)
-//! - 14 `if_tsoffset` → `pcapng_process_int64_option` (store iff length == 8)
+//! - 9 `if_tsresol` → reject iff length == 1 and the exponent is out of range
 //! - 11 `if_filter` → fail if length < 1
 //!
 //! EPB/OPB (`pcapng_process_packet_block_option`):
@@ -35,8 +34,6 @@ const CUSTOM_BIN_NO_COPY: u16 = 19373;
 
 const IF_TSRESOL: u16 = 9;
 const IF_FILTER: u16 = 11;
-const IF_TSOFFSET: u16 = 14;
-const DEFAULT_RESOL: u8 = 6;
 
 const PKT_FLAGS: u16 = 2;
 const PKT_HASH: u16 = 3;
@@ -48,11 +45,6 @@ const PKT_PROCID: u16 = 8;
 const VERDICT_TC: u8 = 1;
 const VERDICT_XDP: u8 = 2;
 
-pub(crate) struct IdOptions {
-    pub resol: u8,
-    pub tsoffset: i64,
-}
-
 enum Role<'a> {
     Section,
     Interface(&'a mut Collected),
@@ -61,7 +53,6 @@ enum Role<'a> {
 
 struct Collected {
     resol: Option<u8>,
-    tsoffset: Option<i64>,
 }
 
 pub(crate) fn walk_shb(
@@ -87,11 +78,8 @@ pub(crate) fn walk_idb(
     start: usize,
     end: usize,
     big_endian: bool,
-) -> Result<IdOptions, Fault> {
-    let mut collected = Collected {
-        resol: None,
-        tsoffset: None,
-    };
+) -> Result<(), Fault> {
+    let mut collected = Collected { resol: None };
     walk(
         bytes,
         start,
@@ -102,10 +90,7 @@ pub(crate) fn walk_idb(
     if let Some(value) = collected.resol {
         check_tsresol(value)?;
     }
-    Ok(IdOptions {
-        resol: collected.resol.unwrap_or(DEFAULT_RESOL),
-        tsoffset: collected.tsoffset.unwrap_or(0),
-    })
+    Ok(())
 }
 
 pub(crate) fn walk_packet(
@@ -168,11 +153,11 @@ impl Role<'_> {
         code: u16,
         length: u16,
         content: &[u8],
-        big_endian: bool,
+        _big_endian: bool,
     ) -> Result<(), Fault> {
         match self {
             Role::Section => Ok(()),
-            Role::Interface(collected) => idb_option(code, length, content, collected, big_endian),
+            Role::Interface(collected) => idb_option(code, length, content, collected),
             Role::Packet => packet_option(code, length, content),
         }
     }
@@ -183,14 +168,10 @@ fn idb_option(
     length: u16,
     content: &[u8],
     collected: &mut Collected,
-    big_endian: bool,
 ) -> Result<(), Fault> {
     match code {
         IF_TSRESOL if length == 1 && collected.resol.is_none() => {
             collected.resol = Some(content[0]);
-        }
-        IF_TSOFFSET if length == 8 && collected.tsoffset.is_none() => {
-            collected.tsoffset = Some(i64_at(content, 0, big_endian));
         }
         IF_FILTER if length < 1 => {
             return Err(Fault::IdbFilter {
@@ -261,23 +242,5 @@ fn u16_at(bytes: &[u8], offset: usize, big_endian: bool) -> u16 {
         u16::from_be_bytes(raw)
     } else {
         u16::from_le_bytes(raw)
-    }
-}
-
-fn i64_at(bytes: &[u8], offset: usize, big_endian: bool) -> i64 {
-    let raw = [
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ];
-    if big_endian {
-        i64::from_be_bytes(raw)
-    } else {
-        i64::from_le_bytes(raw)
     }
 }
