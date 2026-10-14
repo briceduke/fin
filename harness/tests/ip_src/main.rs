@@ -1089,6 +1089,14 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
             "ipv6-dstopts-padn-overrun-header",
             pcap(LINK_ETHERNET, &[ipv6_opts_ipip(60, &[0x01, 6])]),
         ),
+        (
+            "ipv6-hopopt-calipso-8",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(0, &[0x07])]),
+        ),
+        (
+            "ipv6-dstopts-calipso-8",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(60, &[0x07])]),
+        ),
     ]
 }
 

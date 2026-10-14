@@ -610,6 +610,8 @@ fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
 /// `proto_tree_add_item` of `opt_len` bytes. Pad1 still reads the length byte
 /// but only consumes 1. A claimed non-Pad1 option longer than the remaining
 /// captured payload throws BoundsError, so `ipv6_dissect_next` is not called.
+/// CALIPSO (0x07) then ignores `opt_len` and reads DOI / cmpt / bitmap from
+/// that same payload; a short header still throws.
 fn take_opts(bytes: &[u8]) -> Option<(u8, &[u8])> {
     let (next, rest) = take_ext8(bytes)?;
     if opts_bounds_error(bytes) {
@@ -637,9 +639,21 @@ fn opts_bounds_error(payload: &[u8]) -> bool {
         if offset + 2 + opt_len > payload.len() {
             return true;
         }
+        if typ == 0x07 && calipso_bounds_error(&payload[offset + 2..]) {
+            return true;
+        }
         offset += 2 + opt_len;
     }
     false
+}
+
+/// tshark 4.6.9 `dissect_opt_calipso` always reads DOI (4), cmpt_length (1),
+/// sens (1), checksum (2), then `cmpt_length * 4` bitmap bytes.
+fn calipso_bounds_error(data: &[u8]) -> bool {
+    if data.len() < 8 {
+        return true;
+    }
+    data.len() < 8 + data[4] as usize * 4
 }
 
 /// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type
@@ -813,16 +827,23 @@ mod tests {
         eth_ipv6(43, payload.len() as u16, &payload)
     }
 
-    fn hopopt_opts(next: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
-        let mut ext = vec![next, 0, 0, 0, 0, 0, 0, 0];
-        let n = options.len().min(6);
+    fn hopopt_hdr(next: u8, hdrlen: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
+        let total = (hdrlen as usize + 1) * 8;
+        let mut ext = vec![0u8; total];
+        ext[0] = next;
+        ext[1] = hdrlen;
+        let n = options.len().min(total.saturating_sub(2));
         ext[2..2 + n].copy_from_slice(&options[..n]);
         ext.extend_from_slice(payload);
         ext
     }
 
     fn opts_frame(ext: u8, options: &[u8]) -> Vec<u8> {
-        let payload = hopopt_opts(4, options, &ipv4_udp_discard());
+        opts_frame_hdr(ext, 0, options)
+    }
+
+    fn opts_frame_hdr(ext: u8, hdrlen: u8, options: &[u8]) -> Vec<u8> {
+        let payload = hopopt_hdr(4, hdrlen, options, &ipv4_udp_discard());
         eth_ipv6(ext, payload.len() as u16, &payload)
     }
 
@@ -1182,5 +1203,28 @@ mod tests {
     fn hopopt_padn_len_40_walks_and_41_stays_blank() {
         assert_eq!(walk(&opts_frame(0, &[0x01, 40])), proved(&["10.9.9.9"]));
         assert_eq!(walk(&opts_frame(0, &[0x01, 41])), blank());
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_calipso_short_stays_blank() {
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame(ext, &[0x07])),
+                blank(),
+                "ext {ext} CALIPSO on 8-byte header"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_calipso_cmpt0_walks_ipip() {
+        let options = [0x07, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(walk(&opts_frame_hdr(0, 1, &options)), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn hopopt_calipso_cmpt255_stays_blank() {
+        let options = [0x07, 8, 0, 0, 0, 0, 255, 0, 0, 0];
+        assert_eq!(walk(&opts_frame_hdr(0, 1, &options)), blank());
     }
 }
