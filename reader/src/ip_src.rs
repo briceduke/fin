@@ -297,7 +297,13 @@ impl Walk<'_> {
         }
         let plen = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
         let mut next = bytes[6];
-        let mut rest = take_len(&bytes[IPV6_HEADER..], plen);
+        let body = &bytes[IPV6_HEADER..];
+        let want = if plen == 0 && next == IPV6_HOP {
+            jumbo_payload_len(body).unwrap_or(0)
+        } else {
+            plen
+        };
+        let mut rest = take_len(body, want);
         loop {
             match next {
                 IPV6_NO_NEXT => return,
@@ -522,6 +528,35 @@ fn take_len(bytes: &[u8], want: usize) -> &[u8] {
     }
 }
 
+/// tshark 4.6.9 `ipv6_get_jumbo_plen`: hop-by-hop option 0xC2, length 4, value > 65535.
+fn jumbo_payload_len(hop: &[u8]) -> Option<usize> {
+    if hop.len() < 2 {
+        return None;
+    }
+    let end = (hop[1] as usize + 1) * 8;
+    let mut offset = 2;
+    while offset < end && hop.len().saturating_sub(offset) >= 6 {
+        let opt_type = hop[offset];
+        offset += 1;
+        if opt_type == 0 {
+            continue;
+        }
+        let opt_len = hop[offset] as usize;
+        offset += 1;
+        if opt_type == 0xc2 && opt_len == 4 {
+            let jumbo = u32::from_be_bytes([
+                hop[offset],
+                hop[offset + 1],
+                hop[offset + 2],
+                hop[offset + 3],
+            ]);
+            return (jumbo > u16::MAX as u32).then_some(jumbo as usize);
+        }
+        offset += opt_len;
+    }
+    None
+}
+
 fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
     if bytes.len() < 2 {
         return None;
@@ -542,4 +577,106 @@ fn take_ah(bytes: &[u8]) -> Option<(u8, &[u8])> {
         return None;
     }
     Some((bytes[0], &bytes[len..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk(captured: &[u8]) -> Cell {
+        walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured,
+            },
+            &mut IpSrc::new(),
+        )
+    }
+
+    fn eth_ipv6(next: u8, plen: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60, 0, 0, 0,
+        ];
+        frame.extend_from_slice(&plen.to_be_bytes());
+        frame.push(next);
+        frame.push(64);
+        frame.extend_from_slice(&[0u8; 32]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn hopopt_jumbo(next: u8, jumbo: u32, payload: &[u8]) -> Vec<u8> {
+        let mut ext = vec![next, 0, 0xc2, 4];
+        ext.extend_from_slice(&jumbo.to_be_bytes());
+        ext.extend_from_slice(payload);
+        ext
+    }
+
+    fn ipv4_udp_discard() -> Vec<u8> {
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0];
+        let udp = [0, 9, 0, 9, 0, 16, 0, 0, b'f', b'i', b'n', 0, 0, 0, 0, 0];
+        let total = (20 + udp.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip.extend_from_slice(&[10, 9, 9, 9, 10, 255, 255, 1]);
+        ip.extend_from_slice(&udp);
+        ip
+    }
+
+    fn proved(values: &[&str]) -> Cell {
+        Cell {
+            values: values.iter().map(|value| (*value).to_string()).collect(),
+            counted: None,
+        }
+    }
+
+    fn blank() -> Cell {
+        Cell {
+            values: Vec::new(),
+            counted: None,
+        }
+    }
+
+    fn vxlan_inner_eth() -> Vec<u8> {
+        let inner = ipv4_udp_discard();
+        let mut eth = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
+        ];
+        eth.extend_from_slice(&inner);
+        let mut udp = vec![0xc3, 0x50, 0x12, 0xb5, 0, 0, 0, 0];
+        let payload_len = (8 + 8 + eth.len()) as u16;
+        udp[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        udp.extend_from_slice(&[0x08, 0, 0, 0, 0, 0, 1, 0]);
+        udp.extend_from_slice(&eth);
+        udp
+    }
+
+    #[test]
+    fn hopopt_jumbo_65536_walks_ipip() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 65536, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn hopopt_jumbo_65536_walks_vxlan() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(17, 65536, &vxlan_inner_eth()));
+        assert_eq!(walk(&frame), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn hopopt_jumbo_65535_stays_blank() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 65535, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), blank());
+    }
+
+    #[test]
+    fn zero_plen_without_hopopt_stays_blank() {
+        let frame = eth_ipv6(4, 0, &ipv4_udp_discard());
+        assert_eq!(walk(&frame), blank());
+    }
+
+    #[test]
+    fn dstopts_jumbo_is_ignored() {
+        let frame = eth_ipv6(60, 0, &hopopt_jumbo(4, 65536, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), blank());
+    }
 }

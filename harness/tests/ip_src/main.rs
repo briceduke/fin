@@ -492,6 +492,74 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                 )],
             ),
         ),
+        (
+            "ipv6-hopopt-jumbo-ipip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            65536,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-jumbo-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(17, 65536, &udp(50000, 4789, &vxlan(&inner_eth))),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-jumbo-65535",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            65535,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-dstopts-jumbo-ipip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        60,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            65536,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
         ("ipv4-short-totlen", pcap(LINK_ETHERNET, &short_totlen)),
         (
             "ipv4-short-totlen-ipip",

@@ -149,6 +149,13 @@ pub fn hopopt(next: u8, payload: &[u8]) -> Vec<u8> {
     ext
 }
 
+pub fn hopopt_jumbo(next: u8, jumbo: u32, payload: &[u8]) -> Vec<u8> {
+    let mut ext = vec![next, 0, 0xc2, 4];
+    ext.extend_from_slice(&jumbo.to_be_bytes());
+    ext.extend_from_slice(payload);
+    ext
+}
+
 pub fn ipv6_frag(next: u8, offset: u16, more: bool, id: u32, payload: &[u8]) -> Vec<u8> {
     let mut hdr = vec![next, 0, 0, 0, 0, 0, 0, 0];
     let field = (offset << 3) | if more { 1 } else { 0 };
