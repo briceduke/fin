@@ -315,8 +315,15 @@ impl Walk<'_> {
                     next = nxt;
                     rest = body;
                 }
-                IPV6_HOP | IPV6_ROUTE | IPV6_DEST => {
+                IPV6_HOP | IPV6_DEST => {
                     let Some((nxt, body)) = take_ext8(rest) else {
+                        return;
+                    };
+                    next = nxt;
+                    rest = body;
+                }
+                IPV6_ROUTE => {
+                    let Some((nxt, body)) = take_routing(rest) else {
                         return;
                     };
                     next = nxt;
@@ -598,6 +605,30 @@ fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
     Some((bytes[0], &bytes[len..]))
 }
 
+/// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type 2
+/// (`dissect_routing6_mipv6`) and type 4 (`dissect_routing6_srh`) read 16-byte
+/// addresses from the type-specific tvbuff (`total_len - 4`). A short read
+/// throws BoundsError, so the next header is not dissected.
+fn take_routing(bytes: &[u8]) -> Option<(u8, &[u8])> {
+    let (next, rest) = take_ext8(bytes)?;
+    let total = (bytes[1] as usize + 1) * 8;
+    if routing_bounds_error(bytes[2], &bytes[4..total]) {
+        return None;
+    }
+    Some((next, rest))
+}
+
+fn routing_bounds_error(typ: u8, body: &[u8]) -> bool {
+    match typ {
+        2 => body.len() < 20,
+        4 => match body.first() {
+            None => true,
+            Some(&last_entry) => body.len() < 4 + 16 * (last_entry as usize + 1),
+        },
+        _ => false,
+    }
+}
+
 fn take_ah(bytes: &[u8]) -> Option<(u8, &[u8])> {
     if bytes.len() < 2 {
         return None;
@@ -640,6 +671,23 @@ mod tests {
         ext.extend_from_slice(&jumbo.to_be_bytes());
         ext.extend_from_slice(payload);
         ext
+    }
+
+    fn routing6(next: u8, hdrlen: u8, typ: u8, specific: &[u8], payload: &[u8]) -> Vec<u8> {
+        let total = (hdrlen as usize + 1) * 8;
+        let mut hdr = vec![0u8; total];
+        hdr[0] = next;
+        hdr[1] = hdrlen;
+        hdr[2] = typ;
+        let n = specific.len().min(total - 4);
+        hdr[4..4 + n].copy_from_slice(&specific[..n]);
+        hdr.extend_from_slice(payload);
+        hdr
+    }
+
+    fn route_frame(hdrlen: u8, typ: u8, specific: &[u8]) -> Vec<u8> {
+        let payload = routing6(4, hdrlen, typ, specific, &ipv4_udp_discard());
+        eth_ipv6(43, payload.len() as u16, &payload)
     }
 
     fn ipv4_udp_discard() -> Vec<u8> {
@@ -857,5 +905,48 @@ mod tests {
         let cell = walk(&frame);
         assert_eq!(cell.values, ["10.0.0.1", "10.9.9.9"]);
         assert_eq!(cell.counted, Some("icmp"));
+    }
+
+    #[test]
+    fn routing_type2_type4_short_header_stays_blank() {
+        for (typ, hdrlen, specific) in [
+            (2, 0, &[] as &[u8]),
+            (2, 1, &[]),
+            (4, 0, &[]),
+            (4, 1, &[]),
+            (4, 2, &[255]),
+        ] {
+            assert_eq!(
+                walk(&route_frame(hdrlen, typ, specific)),
+                blank(),
+                "type {typ} hdrlen {hdrlen}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_hdrlen0_types_that_walk() {
+        for typ in [0, 3, 99] {
+            assert_eq!(
+                walk(&route_frame(0, typ, &[])),
+                proved(&["10.9.9.9"]),
+                "type {typ}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_type2_hdrlen2_walks_ipip() {
+        assert_eq!(walk(&route_frame(2, 2, &[])), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn routing_type4_hdrlen2_last_entry0_walks_ipip() {
+        assert_eq!(walk(&route_frame(2, 4, &[0])), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn routing_type4_hdrlen2_last_entry1_stays_blank() {
+        assert_eq!(walk(&route_frame(2, 4, &[1])), blank());
     }
 }

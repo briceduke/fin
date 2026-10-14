@@ -1,7 +1,5 @@
 use crate::options;
-use crate::{
-    BlockKind, Capture, CaptureKind, Fault, Frame, MAX_BLOCK_SIZE, MAX_CAPTURED_LENGTH,
-};
+use crate::{BlockKind, Capture, CaptureKind, Fault, Frame, MAX_BLOCK_SIZE, MAX_CAPTURED_LENGTH};
 
 const SHB_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 const SHB_TYPE: u32 = 0x0A0D0D0A;

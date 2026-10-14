@@ -116,6 +116,22 @@ fn icmp_v6_rfc4884(typ: u8, orig_words: u8, flow_low: u16) -> Vec<u8> {
     )
 }
 
+fn ipv6_routing_ipip(hdrlen: u8, typ: u8, specific: &[u8]) -> Vec<u8> {
+    eth(
+        0x86dd,
+        &ipv6(
+            43,
+            &routing6(
+                4,
+                hdrlen,
+                typ,
+                specific,
+                &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+            ),
+        ),
+    )
+}
+
 fn fixed() -> Vec<(&'static str, Vec<u8>)> {
     let inner_eth = eth(
         0x0800,
@@ -941,6 +957,46 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                     ),
                 )],
             ),
+        ),
+        (
+            "ipv6-routing-type2-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 2, &[])]),
+        ),
+        (
+            "ipv6-routing-type2-hdrlen1",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(1, 2, &[])]),
+        ),
+        (
+            "ipv6-routing-type4-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 4, &[])]),
+        ),
+        (
+            "ipv6-routing-type4-hdrlen1",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(1, 4, &[])]),
+        ),
+        (
+            "ipv6-routing-type4-hdrlen2-last-entry-255",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(2, 4, &[255])]),
+        ),
+        (
+            "ipv6-routing-type0-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 0, &[])]),
+        ),
+        (
+            "ipv6-routing-type3-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 3, &[])]),
+        ),
+        (
+            "ipv6-routing-type99-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 99, &[])]),
+        ),
+        (
+            "ipv6-routing-type2-hdrlen2",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(2, 2, &[])]),
+        ),
+        (
+            "ipv6-routing-type4-hdrlen2",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(2, 4, &[0])]),
         ),
     ]
 }

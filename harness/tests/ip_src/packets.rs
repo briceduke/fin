@@ -149,6 +149,18 @@ pub fn hopopt(next: u8, payload: &[u8]) -> Vec<u8> {
     ext
 }
 
+pub fn routing6(next: u8, hdrlen: u8, typ: u8, specific: &[u8], payload: &[u8]) -> Vec<u8> {
+    let total = (hdrlen as usize + 1) * 8;
+    let mut hdr = vec![0u8; total];
+    hdr[0] = next;
+    hdr[1] = hdrlen;
+    hdr[2] = typ;
+    let n = specific.len().min(total - 4);
+    hdr[4..4 + n].copy_from_slice(&specific[..n]);
+    hdr.extend_from_slice(payload);
+    hdr
+}
+
 pub fn hopopt_jumbo(next: u8, jumbo: u32, payload: &[u8]) -> Vec<u8> {
     let mut ext = vec![next, 0, 0xc2, 4];
     ext.extend_from_slice(&jumbo.to_be_bytes());

@@ -52,12 +52,7 @@ fn order(included: u32, original: u32, lengths: Lengths) -> (u32, u32) {
     }
 }
 
-fn records<'a>(
-    bytes: &'a [u8],
-    big_endian: bool,
-    link_type: u32,
-    lengths: Lengths,
-) -> Capture<'a> {
+fn records<'a>(bytes: &'a [u8], big_endian: bool, link_type: u32, lengths: Lengths) -> Capture<'a> {
     let mut frames = Vec::new();
     let mut offset = HEADER_LEN;
     while offset < bytes.len() {
