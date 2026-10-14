@@ -204,6 +204,17 @@ fn parse_port(key: &str) -> Option<u16> {
     }
 }
 
+/// Names the walker treats as always-claim, reaches-IP, or VXLAN.
+///
+/// The live dump pin only checks these. Official Windows tshark and the
+/// CI source build of 4.6.9 register different optional dissectors
+/// (OPC UA, EtherCAT, Gryphon vs UCI on 7000), so the full tables differ.
+pub fn is_pinned_name(name: &str) -> bool {
+    name == "vxlan"
+        || ALWAYS_CLAIM.iter().any(|&item| item == name)
+        || REACHES_IP.iter().any(|&item| item == name)
+}
+
 /// Raw dump text, for the live-tshark comparison test.
 pub fn checked_in_decodes() -> &'static str {
     DECODES

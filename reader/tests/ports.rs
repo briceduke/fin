@@ -1,11 +1,12 @@
 //! Live tshark 4.6.9 dump matches the checked-in port snapshot.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
-use reader::ports::{checked_in_decodes, checked_in_heuristics};
+use reader::ports::{checked_in_decodes, checked_in_heuristics, is_pinned_name};
 
 #[test]
 fn decodes_dump_matches_tshark_469() {
@@ -17,8 +18,30 @@ fn decodes_dump_matches_tshark_469() {
         eprintln!("skip: tshark version is not 4.6.9");
         return;
     }
-    let live = port_rows(&dump(&tshark, "decodes"));
-    assert_eq!(normalize(&live), normalize(checked_in_decodes()));
+    let live = first_wins(&port_rows(&dump(&tshark, "decodes")));
+    let pinned = first_wins(checked_in_decodes());
+    let mut mismatches = Vec::new();
+    for (key, name) in live.iter().chain(pinned.iter()) {
+        if !is_pinned_name(name) {
+            continue;
+        }
+        if live.get(key) != pinned.get(key) {
+            mismatches.push(format!(
+                "{}.port {} live={:?} dump={:?}",
+                key.0,
+                key.1,
+                live.get(key),
+                pinned.get(key)
+            ));
+        }
+    }
+    mismatches.sort();
+    mismatches.dedup();
+    assert!(
+        mismatches.is_empty(),
+        "pinned port names differ from tshark 4.6.9:\n{}",
+        mismatches.join("\n")
+    );
 }
 
 #[test]
@@ -57,6 +80,25 @@ fn version_ok(tshark: &PathBuf) -> bool {
             .any(|token| token == "4.6.9"),
         Err(_) => false,
     }
+}
+
+fn first_wins(text: &str) -> BTreeMap<(String, u16), String> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        let Some(table) = cols.next() else { continue };
+        let Some(key) = cols.next() else { continue };
+        let Some(name) = cols.next() else { continue };
+        let proto = match table {
+            "udp.port" => "udp",
+            "tcp.port" => "tcp",
+            _ => continue,
+        };
+        let Ok(port) = key.parse::<u16>() else { continue };
+        map.entry((proto.to_string(), port))
+            .or_insert_with(|| name.to_string());
+    }
+    map
 }
 
 fn port_rows(text: &str) -> String {
