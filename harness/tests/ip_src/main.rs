@@ -543,6 +543,78 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         (
+            "ipv6-hopopt-jumbo-ffffffd7",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            0xffff_ffd7,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-jumbo-ffffffd8",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            0xffff_ffd8,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-jumbo-fffffffe",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            0xffff_fffe,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-jumbo-ffffffff",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        0,
+                        0,
+                        &hopopt_jumbo(
+                            4,
+                            0xffff_ffff,
+                            &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
             "ipv6-dstopts-jumbo-ipip",
             pcap(
                 LINK_ETHERNET,

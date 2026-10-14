@@ -295,7 +295,7 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 6 {
             return;
         }
-        let plen = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        let plen = u16::from_be_bytes([bytes[4], bytes[5]]) as u32;
         let mut next = bytes[6];
         let body = &bytes[IPV6_HEADER..];
         let want = if plen == 0 && next == IPV6_HOP {
@@ -303,7 +303,7 @@ impl Walk<'_> {
         } else {
             plen
         };
-        let mut rest = take_len(body, want);
+        let mut rest = take_ipv6_payload(body, want);
         loop {
             match next {
                 IPV6_NO_NEXT => return,
@@ -528,8 +528,18 @@ fn take_len(bytes: &[u8], want: usize) -> &[u8] {
     }
 }
 
+/// tshark 4.6.9 `set_actual_length(tvb, 40 + plen)` in uint32.
+fn take_ipv6_payload(body: &[u8], plen: u32) -> &[u8] {
+    let actual = (IPV6_HEADER as u32).wrapping_add(plen);
+    if actual < IPV6_HEADER as u32 {
+        &[]
+    } else {
+        take_len(body, actual as usize - IPV6_HEADER)
+    }
+}
+
 /// tshark 4.6.9 `ipv6_get_jumbo_plen`: hop-by-hop option 0xC2, length 4, value > 65535.
-fn jumbo_payload_len(hop: &[u8]) -> Option<usize> {
+fn jumbo_payload_len(hop: &[u8]) -> Option<u32> {
     if hop.len() < 2 {
         return None;
     }
@@ -550,7 +560,7 @@ fn jumbo_payload_len(hop: &[u8]) -> Option<usize> {
                 hop[offset + 2],
                 hop[offset + 3],
             ]);
-            return (jumbo > u16::MAX as u32).then_some(jumbo as usize);
+            return (jumbo > u16::MAX as u32).then_some(jumbo);
         }
         offset += opt_len;
     }
@@ -665,6 +675,30 @@ mod tests {
     #[test]
     fn hopopt_jumbo_65535_stays_blank() {
         let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 65535, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), blank());
+    }
+
+    #[test]
+    fn hopopt_jumbo_ffffffd7_walks_ipip() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 0xffff_ffd7, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn hopopt_jumbo_ffffffd8_stays_blank() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 0xffff_ffd8, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), blank());
+    }
+
+    #[test]
+    fn hopopt_jumbo_fffffffe_stays_blank() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 0xffff_fffe, &ipv4_udp_discard()));
+        assert_eq!(walk(&frame), blank());
+    }
+
+    #[test]
+    fn hopopt_jumbo_ffffffff_stays_blank() {
+        let frame = eth_ipv6(0, 0, &hopopt_jumbo(4, 0xffff_ffff, &ipv4_udp_discard()));
         assert_eq!(walk(&frame), blank());
     }
 
