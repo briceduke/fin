@@ -99,6 +99,23 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     files
 }
 
+fn icmp_v6_rfc4884(typ: u8, orig_words: u8, flow_low: u16) -> Vec<u8> {
+    let inner = ipv6_flow(
+        4,
+        flow_low,
+        &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+    );
+    eth(
+        0x0800,
+        &ipv4(
+            OUTER,
+            [10, 255, 255, 1],
+            1,
+            &icmp_type_len(typ, orig_words, &inner),
+        ),
+    )
+}
+
 fn fixed() -> Vec<(&'static str, Vec<u8>)> {
     let inner_eth = eth(
         0x0800,
@@ -814,6 +831,57 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                 &[eth(
                     0x0800,
                     &ipv4(OUTER, [10, 255, 255, 1], 1, &icmp_type(5, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-3-embed-ipv6-len-0-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(3, 0, 0x0100)]),
+        ),
+        (
+            "icmp-3-embed-ipv6-len-1-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(3, 1, 0x0100)]),
+        ),
+        (
+            "icmp-4-embed-ipv6-len-1-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(4, 1, 0x0100)]),
+        ),
+        (
+            "icmp-11-embed-ipv6-len-1-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(11, 1, 0x0100)]),
+        ),
+        (
+            "icmp-12-embed-ipv6-len-1-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(12, 1, 0x0100)]),
+        ),
+        (
+            "icmp-3-embed-ipv6-len-1-flow-1",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(3, 1, 1)]),
+        ),
+        (
+            "icmp-3-embed-ipv6-len-13-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(3, 13, 0x0100)]),
+        ),
+        (
+            "icmp-3-embed-ipv6-len-14-flow-0100",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(3, 14, 0x0100)]),
+        ),
+        (
+            "icmp-5-embed-ipv6-len-14",
+            pcap(LINK_ETHERNET, &[icmp_v6_rfc4884(5, 14, 0x0100)]),
+        ),
+        (
+            "icmp-3-embed-ipv4-len-1",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        1,
+                        &icmp_type_len(3, 1, &ipv4(EMBED, [10, 1, 1, 1], 17, &udp(1, 2, PAYLOAD))),
+                    ),
                 )],
             ),
         ),

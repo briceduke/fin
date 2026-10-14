@@ -14,7 +14,8 @@ A counted miss is allowed. The table is only uncounted extras or uncounted drops
 | IPv4 tot_len | Print `ip.src` only when tot_len is 0 (TSO, default on) or tot_len ≥ IHL. | Printed when `0 < tot_len < IHL`. | Already fixed. |
 | UDP length | Length < 8 does not walk. IPv6 length 0 is a jumbogram. | Walked the captured tail. | Already fixed. |
 | IPv4 version 6 | `dissect_ip` / `dissect_ip_v4` hands version 6 to IPv6. | Returned without a count. | Already fixed. |
-| ICMP embed tot_len | Same tot_len rule as outer IPv4. Type 5 clips to IHL×4+8. Types 3/4/11/12 do not. | Printed embed src on short tot_len; missed version-6 embeds. | Already fixed. |
+| ICMP embed tot_len | Same tot_len rule as outer IPv4. | Printed embed src on short tot_len; missed version-6 embeds. | Already fixed. |
+| ICMP RFC 4884 embed | Types 3/4/11/12 clip when byte 5 is nonzero, ICMP is longer than `8 + length*4`, and `ntohs` at offset 10 (IPv4 tot_len / IPv6 flow low 16) is greater than `length*4`, to `(IHL_nibble + length)*4`. IPv6 IHL nibble is 0. Type 5 stays `IHL*4+8`. | Walked a version-6 ICMP embed past tshark's clip and printed inner `ip.src`. | Fixed: `rfc4884_embed_len` clips before `embedded_ipv4`. |
 | ICMP / ICMPv6 fragments, ICMP IPIP leftover, IPv4 AH / EtherIP, TEB 0x6558 | tshark prints an inner `ip.src`. | Dropped with no count. | Already fixed (walk or count). |
 
 ## Length arithmetic (wrap / width)
@@ -27,7 +28,7 @@ A counted miss is allowed. The table is only uncounted extras or uncounted drops
 | IPv6 hop/dest/routing `(hdrlen + 1) * 8` | `uint8` → int | No (max 2048). |
 | AH `(payload_len + 2) * 4` | `uint8` → int | No (max 1028). |
 | ICMP type 5 `IHL*4 + 8` | nibble | No (max 68). |
-| ICMP RFC 4884 `(IHL_nibble + orig_len) * 4` | `uint8` | No wrap. Length field 0 on the corpus; a nonzero field can clip an embed, and leftover inner bytes stay counted. |
+| ICMP RFC 4884 `(IHL_nibble + orig_len) * 4` | `uint8` | No wrap. Matched. Length 0 does not clip. Length 1–13 with flow `0x0100` clips an IPv6 embed short of the inner IPv4 src. Length 14 clips to 56 and still prints it. Flow `1` with length 1 fails `ntohs > length*4`. Type 5 stays `IHL*4+8`. |
 | IPv6 TSO `reported - 40` | unsigned, preference off | No. |
 
 IPv6 routing header length 0 still walks the next header on both (live: inner `10.9.9.9`). Shim6 (140) next=4 is a counted miss. Mobility (135) on an 8-byte stub is blank on both. ESP and no-next-header stop on both. GRE is counted. EtherIP still walks after a 2-byte header when the version is not 3 (tshark does too). AH payload-length 0 is an 8-byte header on both and still walks.

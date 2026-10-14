@@ -390,6 +390,8 @@ impl Walk<'_> {
             if bytes[0] == 5 && !embed.is_empty() {
                 let cap = ((embed[0] & 0x0f) as usize) * 4 + 8;
                 embed = take_len(embed, cap);
+            } else if let Some(cap) = rfc4884_embed_len(bytes) {
+                embed = take_len(embed, cap);
             }
             self.embedded_ipv4(embed);
         }
@@ -526,6 +528,24 @@ fn take_len(bytes: &[u8], want: usize) -> &[u8] {
     } else {
         bytes
     }
+}
+
+/// tshark 4.6.9 `dissect_icmp` RFC 4884 clip of the original datagram tvbuff.
+fn rfc4884_embed_len(icmp: &[u8]) -> Option<usize> {
+    let length = icmp[5] as usize;
+    if length == 0 || icmp.len() < ICMP_HEADER + 4 {
+        return None;
+    }
+    let orig = length * 4;
+    if icmp.len() <= ICMP_HEADER + orig {
+        return None;
+    }
+    let tot_len = u16::from_be_bytes([icmp[ICMP_HEADER + 2], icmp[ICMP_HEADER + 3]]) as usize;
+    if tot_len <= orig {
+        return None;
+    }
+    let ihl_nibble = (icmp[ICMP_HEADER] & 0x0f) as usize;
+    Some((ihl_nibble + length) * 4)
 }
 
 /// tshark 4.6.9 `set_actual_length(tvb, 40 + plen)` in uint32.
@@ -712,5 +732,130 @@ mod tests {
     fn dstopts_jumbo_is_ignored() {
         let frame = eth_ipv6(60, 0, &hopopt_jumbo(4, 65536, &ipv4_udp_discard()));
         assert_eq!(walk(&frame), blank());
+    }
+
+    fn eth_ipv4_icmp(icmp: &[u8]) -> Vec<u8> {
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0];
+        let total = (20 + icmp.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip.extend_from_slice(&[10, 0, 0, 1, 10, 255, 255, 1]);
+        ip.extend_from_slice(icmp);
+        let mut eth = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
+        ];
+        eth.extend_from_slice(&ip);
+        eth
+    }
+
+    fn icmp_embed(typ: u8, orig_words: u8, inner: &[u8]) -> Vec<u8> {
+        let mut icmp = vec![typ, 0, 0, 0, 0, orig_words, 0, 0];
+        icmp.extend_from_slice(inner);
+        icmp
+    }
+
+    fn ipv6_flow(next: u8, flow_low: u16, payload: &[u8]) -> Vec<u8> {
+        let mut ip = vec![0x60, 0, 0, 0, 0, 0, next, 64];
+        ip[2..4].copy_from_slice(&flow_low.to_be_bytes());
+        ip[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        ip.extend_from_slice(&[0u8; 32]);
+        ip.extend_from_slice(payload);
+        ip
+    }
+
+    fn icmp_v6_embed(typ: u8, orig_words: u8, flow_low: u16) -> Vec<u8> {
+        eth_ipv4_icmp(&icmp_embed(
+            typ,
+            orig_words,
+            &ipv6_flow(4, flow_low, &ipv4_udp_discard()),
+        ))
+    }
+
+    #[test]
+    fn rfc4884_ipv6_flow_0100_len_1_clips_to_4() {
+        let icmp = icmp_embed(3, 1, &ipv6_flow(4, 0x0100, &ipv4_udp_discard()));
+        assert_eq!(rfc4884_embed_len(&icmp), Some(4));
+    }
+
+    #[test]
+    fn rfc4884_ipv4_len_1_clips_to_ihl_plus_length() {
+        let icmp = icmp_embed(3, 1, &ipv4_udp_discard());
+        assert_eq!(rfc4884_embed_len(&icmp), Some(24));
+    }
+
+    #[test]
+    fn rfc4884_len_0_does_not_clip() {
+        let icmp = icmp_embed(3, 0, &ipv6_flow(4, 0x0100, &ipv4_udp_discard()));
+        assert_eq!(rfc4884_embed_len(&icmp), None);
+    }
+
+    #[test]
+    fn rfc4884_flow_1_len_1_does_not_clip() {
+        let icmp = icmp_embed(3, 1, &ipv6_flow(4, 1, &ipv4_udp_discard()));
+        assert_eq!(rfc4884_embed_len(&icmp), None);
+    }
+
+    #[test]
+    fn rfc4884_len_14_clips_to_56() {
+        let icmp = icmp_embed(3, 14, &ipv6_flow(4, 0x0100, &ipv4_udp_discard()));
+        assert_eq!(rfc4884_embed_len(&icmp), Some(56));
+    }
+
+    #[test]
+    fn icmp_rfc4884_ipv6_types_clip_flow_0100_len_1() {
+        for typ in [3, 4, 11, 12] {
+            assert_eq!(
+                walk(&icmp_v6_embed(typ, 1, 0x0100)),
+                proved(&["10.0.0.1"]),
+                "type {typ}"
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_rfc4884_ipv6_len_0_prints_inner() {
+        assert_eq!(
+            walk(&icmp_v6_embed(3, 0, 0x0100)),
+            proved(&["10.0.0.1", "10.9.9.9"])
+        );
+    }
+
+    #[test]
+    fn icmp_rfc4884_ipv6_flow_1_len_1_prints_inner() {
+        assert_eq!(
+            walk(&icmp_v6_embed(3, 1, 1)),
+            proved(&["10.0.0.1", "10.9.9.9"])
+        );
+    }
+
+    #[test]
+    fn icmp_rfc4884_ipv6_len_1_to_13_clips_flow_0100() {
+        for length in 1..=13 {
+            assert_eq!(
+                walk(&icmp_v6_embed(3, length, 0x0100)),
+                proved(&["10.0.0.1"]),
+                "length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_rfc4884_ipv6_len_14_prints_inner() {
+        assert_eq!(
+            walk(&icmp_v6_embed(3, 14, 0x0100)),
+            proved(&["10.0.0.1", "10.9.9.9"])
+        );
+    }
+
+    #[test]
+    fn icmp_type_5_len_14_stays_outer_only() {
+        assert_eq!(walk(&icmp_v6_embed(5, 14, 0x0100)), proved(&["10.0.0.1"]));
+    }
+
+    #[test]
+    fn icmp_rfc4884_ipv4_embed_len_1_prints_src() {
+        let frame = eth_ipv4_icmp(&icmp_embed(3, 1, &ipv4_udp_discard()));
+        let cell = walk(&frame);
+        assert_eq!(cell.values, ["10.0.0.1", "10.9.9.9"]);
+        assert_eq!(cell.counted, Some("icmp"));
     }
 }

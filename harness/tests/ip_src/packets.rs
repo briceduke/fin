@@ -198,9 +198,19 @@ pub fn icmp_error(inner: &[u8]) -> Vec<u8> {
 }
 
 pub fn icmp_type(typ: u8, inner: &[u8]) -> Vec<u8> {
-    let mut icmp = vec![typ, 0, 0, 0, 0, 0, 0, 0];
+    icmp_type_len(typ, 0, inner)
+}
+
+pub fn icmp_type_len(typ: u8, orig_words: u8, inner: &[u8]) -> Vec<u8> {
+    let mut icmp = vec![typ, 0, 0, 0, 0, orig_words, 0, 0];
     icmp.extend_from_slice(inner);
     icmp
+}
+
+pub fn ipv6_flow(next: u8, flow_low: u16, payload: &[u8]) -> Vec<u8> {
+    let mut ip = ipv6(next, payload);
+    ip[2..4].copy_from_slice(&flow_low.to_be_bytes());
+    ip
 }
 
 pub fn icmpv6_error(inner: &[u8]) -> Vec<u8> {
