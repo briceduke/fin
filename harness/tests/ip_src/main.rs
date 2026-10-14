@@ -150,17 +150,15 @@ fn ipv6_routing_ipip_segs(hdrlen: u8, typ: u8, segs_left: u8, specific: &[u8]) -
 }
 
 fn ipv6_opts_ipip(ext: u8, options: &[u8]) -> Vec<u8> {
-    eth(
-        0x86dd,
-        &ipv6(
-            ext,
-            &hopopt_opts(
-                4,
-                options,
-                &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
-            ),
-        ),
+    ipv6_opts(
+        ext,
+        options,
+        &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
     )
+}
+
+fn ipv6_opts(ext: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
+    eth(0x86dd, &ipv6(ext, &hopopt_opts(4, options, payload)))
 }
 
 fn fixed() -> Vec<(&'static str, Vec<u8>)> {
@@ -1096,6 +1094,72 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
         (
             "ipv6-dstopts-calipso-8",
             pcap(LINK_ETHERNET, &[ipv6_opts_ipip(60, &[0x07])]),
+        ),
+        (
+            "ipv6-hopopt-apn6-last-16",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts(
+                    0,
+                    &[0, 0, 0, 0, 0x13],
+                    &ipv4_tso(0x45, 16, INNER),
+                )],
+            ),
+        ),
+        (
+            "ipv6-dstopts-apn6-last-16",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts(
+                    60,
+                    &[0, 0, 0, 0, 0x13],
+                    &ipv4_tso(0x45, 16, INNER),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-apn6-last-20",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts(
+                    0,
+                    &[0, 0, 0, 0, 0x13],
+                    &ipv4_tso(0x45, 20, INNER),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-smf-last-16",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts(
+                    0,
+                    &[0, 0, 0, 0, 0x08],
+                    &ipv4_tso(0x4f, 16, INNER),
+                )],
+            ),
+        ),
+        (
+            "ipv6-dstopts-smf-last-16",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts(
+                    60,
+                    &[0, 0, 0, 0, 0x08],
+                    &ipv4_tso(0x4f, 16, INNER),
+                )],
+            ),
+        ),
+        (
+            "ipv6-hopopt-smf-last-17",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts(
+                    0,
+                    &[0, 0, 0, 0, 0x08],
+                    &ipv4_tso(0x4f, 17, INNER),
+                )],
+            ),
         ),
     ]
 }

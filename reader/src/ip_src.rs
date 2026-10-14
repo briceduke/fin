@@ -610,8 +610,8 @@ fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
 /// `proto_tree_add_item` of `opt_len` bytes. Pad1 still reads the length byte
 /// but only consumes 1. A claimed non-Pad1 option longer than the remaining
 /// captured payload throws BoundsError, so `ipv6_dissect_next` is not called.
-/// CALIPSO (0x07) then ignores `opt_len` and reads DOI / cmpt / bitmap from
-/// that same payload; a short header still throws.
+/// CALIPSO (0x07), SMF_DPD (0x08), and APN6 (0x13) then ignore `opt_len` and
+/// read type-specific fields from that same payload; a short header still throws.
 fn take_opts(bytes: &[u8]) -> Option<(u8, &[u8])> {
     let (next, rest) = take_ext8(bytes)?;
     if opts_bounds_error(bytes) {
@@ -639,12 +639,21 @@ fn opts_bounds_error(payload: &[u8]) -> bool {
         if offset + 2 + opt_len > payload.len() {
             return true;
         }
-        if typ == 0x07 && calipso_bounds_error(&payload[offset + 2..]) {
+        if opt_type_bounds_error(typ, &payload[offset + 2..]) {
             return true;
         }
         offset += 2 + opt_len;
     }
     false
+}
+
+fn opt_type_bounds_error(typ: u8, data: &[u8]) -> bool {
+    match typ {
+        0x07 => calipso_bounds_error(data),
+        0x08 => smf_dpd_bounds_error(data),
+        0x13 => apn6_bounds_error(data),
+        _ => false,
+    }
 }
 
 /// tshark 4.6.9 `dissect_opt_calipso` always reads DOI (4), cmpt_length (1),
@@ -654,6 +663,33 @@ fn calipso_bounds_error(data: &[u8]) -> bool {
         return true;
     }
     data.len() < 8 + data[4] as usize * 4
+}
+
+/// tshark 4.6.9 `dissect_opt_smf_dpd` I-DPD with tid bits reads `hash_tid`
+/// then `(hash_tid & 0x0f) + 1` tagger-id bytes from the parent payload.
+fn smf_dpd_bounds_error(data: &[u8]) -> bool {
+    let Some(&hash_tid) = data.first() else {
+        return true;
+    };
+    if hash_tid & 0x80 != 0 || hash_tid & 0x70 == 0 {
+        return false;
+    }
+    data.len() < 1 + (hash_tid & 0x0f) as usize + 1
+}
+
+/// tshark 4.6.9 `dissect_opt_apn6` always reads id-type (1) + flags (1) +
+/// param (2), then 4/8/16 more when `apn_id_type` is 1/2/≥3.
+fn apn6_bounds_error(data: &[u8]) -> bool {
+    let Some(&id_type) = data.first() else {
+        return true;
+    };
+    let need = match id_type {
+        0 => 4,
+        1 => 8,
+        2 => 12,
+        _ => 20,
+    };
+    data.len() < need
 }
 
 /// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type
@@ -843,8 +879,34 @@ mod tests {
     }
 
     fn opts_frame_hdr(ext: u8, hdrlen: u8, options: &[u8]) -> Vec<u8> {
-        let payload = hopopt_hdr(4, hdrlen, options, &ipv4_udp_discard());
+        opts_frame_ip(ext, hdrlen, options, &ipv4_udp_discard())
+    }
+
+    fn opts_frame_ip(ext: u8, hdrlen: u8, options: &[u8], ip: &[u8]) -> Vec<u8> {
+        let payload = hopopt_hdr(4, hdrlen, options, ip);
         eth_ipv6(ext, payload.len() as u16, &payload)
+    }
+
+    fn last_tlv(typ: u8) -> [u8; 5] {
+        [0, 0, 0, 0, typ]
+    }
+
+    fn ipv4_tso(ihl: u8, captured: usize) -> Vec<u8> {
+        let mut ip = vec![0u8; captured];
+        if captured == 0 {
+            return ip;
+        }
+        ip[0] = ihl;
+        if captured > 8 {
+            ip[8] = 64;
+        }
+        if captured > 9 {
+            ip[9] = 17;
+        }
+        if captured >= 16 {
+            ip[12..16].copy_from_slice(&[10, 9, 9, 9]);
+        }
+        ip
     }
 
     fn ipv4_udp_discard() -> Vec<u8> {
@@ -1226,5 +1288,58 @@ mod tests {
     fn hopopt_calipso_cmpt255_stays_blank() {
         let options = [0x07, 8, 0, 0, 0, 0, 255, 0, 0, 0];
         assert_eq!(walk(&opts_frame_hdr(0, 1, &options)), blank());
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_apn6_last_tlv_short_stays_blank() {
+        let ip = ipv4_tso(0x45, 16);
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame_ip(ext, 0, &last_tlv(0x13), &ip)),
+                blank(),
+                "ext {ext}"
+            );
+        }
+        assert_eq!(
+            walk(&opts_frame_ip(
+                0,
+                1,
+                &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x13],
+                &ip
+            )),
+            blank()
+        );
+        assert_eq!(
+            walk(&opts_frame_ip(0, 0, &last_tlv(0x13), &ipv4_tso(0x45, 19))),
+            blank()
+        );
+    }
+
+    #[test]
+    fn hopopt_apn6_last_tlv_20_walks_ipip() {
+        assert_eq!(
+            walk(&opts_frame_ip(0, 0, &last_tlv(0x13), &ipv4_tso(0x45, 20))),
+            proved(&["10.9.9.9"])
+        );
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_smf_last_tlv_short_stays_blank() {
+        let ip = ipv4_tso(0x4f, 16);
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame_ip(ext, 0, &last_tlv(0x08), &ip)),
+                blank(),
+                "ext {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_smf_last_tlv_17_walks_ipip() {
+        assert_eq!(
+            walk(&opts_frame_ip(0, 0, &last_tlv(0x08), &ipv4_tso(0x4f, 17))),
+            proved(&["10.9.9.9"])
+        );
     }
 }

@@ -110,6 +110,24 @@ pub fn ipv4_len(src: [u8; 4], dst: [u8; 4], proto: u8, total: u16, payload: &[u8
     ip
 }
 
+pub fn ipv4_tso(ihl: u8, captured: usize, src: [u8; 4]) -> Vec<u8> {
+    let mut ip = vec![0u8; captured];
+    if captured == 0 {
+        return ip;
+    }
+    ip[0] = ihl;
+    if captured > 8 {
+        ip[8] = 64;
+    }
+    if captured > 9 {
+        ip[9] = 17;
+    }
+    if captured >= 16 {
+        ip[12..16].copy_from_slice(&src);
+    }
+    ip
+}
+
 pub fn ipv4_ihl(src: [u8; 4], ihl_words: u8, payload: &[u8]) -> Vec<u8> {
     let header = ihl_words as usize * 4;
     let total = header + payload.len();
