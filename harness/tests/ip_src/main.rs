@@ -105,6 +105,22 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
         &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
     );
     let ip_udp = ipv4(OUTER, [10, 255, 255, 1], 17, &udp(12345, 53, PAYLOAD));
+    let mut ipv6_short_plen_vxlan = udp(50000, 4789, b"");
+    ipv6_short_plen_vxlan.extend_from_slice(&vxlan(&inner_eth));
+    let short_totlen: Vec<Vec<u8>> = (1..=19u16)
+        .map(|total| {
+            eth(
+                0x0800,
+                &ipv4_len(
+                    OUTER,
+                    [10, 255, 255, 1],
+                    17,
+                    total,
+                    &udp(12345, 53, PAYLOAD),
+                ),
+            )
+        })
+        .collect();
     let icmp_inner = ipv4(EMBED, [10, 1, 1, 1], 17, &udp(1, 2, PAYLOAD));
     let icmp = icmp_error(&icmp_inner);
     let icmp_first = icmp[..24].to_vec();
@@ -455,6 +471,70 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
         ),
         ("arp", pcap(LINK_ETHERNET, &[eth(0x0806, &[0u8; 28])])),
         ("teb", pcap(LINK_ETHERNET, &[eth(0x6558, &inner_eth)])),
+        (
+            "ipv6-short-plen-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(0x86dd, &ipv6_len(17, 8, &ipv6_short_plen_vxlan))],
+            ),
+        ),
+        (
+            "ipv6-zero-plen-ipip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6_len(
+                        4,
+                        0,
+                        &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                    ),
+                )],
+            ),
+        ),
+        ("ipv4-short-totlen", pcap(LINK_ETHERNET, &short_totlen)),
+        (
+            "ipv4-short-totlen-ipip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4_len(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        4,
+                        10,
+                        &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv4-zero-totlen",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4_len(OUTER, [10, 255, 255, 1], 17, 0, &udp(12345, 53, PAYLOAD)),
+                )],
+            ),
+        ),
+        (
+            "ipv4-zero-totlen-ipip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4_len(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        4,
+                        0,
+                        &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                    ),
+                )],
+            ),
+        ),
     ]
 }
 

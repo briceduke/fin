@@ -104,6 +104,12 @@ pub fn ipv4_frag(
     ip
 }
 
+pub fn ipv4_len(src: [u8; 4], dst: [u8; 4], proto: u8, total: u16, payload: &[u8]) -> Vec<u8> {
+    let mut ip = ipv4(src, dst, proto, payload);
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip
+}
+
 pub fn ipv4_ihl(src: [u8; 4], ihl_words: u8, payload: &[u8]) -> Vec<u8> {
     let header = ihl_words as usize * 4;
     let total = header + payload.len();
@@ -128,6 +134,12 @@ pub fn ipv6(next: u8, payload: &[u8]) -> Vec<u8> {
     ip.extend_from_slice(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     ip.extend_from_slice(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     ip.extend_from_slice(payload);
+    ip
+}
+
+pub fn ipv6_len(next: u8, plen: u16, payload: &[u8]) -> Vec<u8> {
+    let mut ip = ipv6(next, payload);
+    ip[4..6].copy_from_slice(&plen.to_be_bytes());
     ip
 }
 

@@ -210,6 +210,10 @@ impl Walk<'_> {
         if ihl < IPV4_MIN {
             return;
         }
+        let total = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        if total != 0 && total < ihl {
+            return;
+        }
         let src = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
         self.values.push(src.to_string());
         if bytes.len() < ihl {
@@ -221,17 +225,11 @@ impl Walk<'_> {
         let offset = frag & 0x1fff;
         let more = frag & 0x2000 != 0;
         let proto = bytes[9];
-        let total = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
         let rest = &bytes[ihl..];
-        let payload = if total >= ihl {
-            let want = total - ihl;
-            if rest.len() > want {
-                &rest[..want]
-            } else {
-                rest
-            }
-        } else {
+        let payload = if total == 0 {
             rest
+        } else {
+            take_len(rest, total - ihl)
         };
         let fragmented = more || offset != 0;
         if fragmented {
@@ -293,8 +291,9 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 6 {
             return;
         }
+        let plen = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
         let mut next = bytes[6];
-        let mut rest = &bytes[IPV6_HEADER..];
+        let mut rest = take_len(&bytes[IPV6_HEADER..], plen);
         loop {
             match next {
                 IPV6_NO_NEXT => return,
@@ -485,6 +484,14 @@ fn udp_ports(bytes: &[u8]) -> Option<(u16, u16)> {
 
 fn is_vlan(etype: u16) -> bool {
     matches!(etype, 0x8100 | 0x88a8 | 0x9100)
+}
+
+fn take_len(bytes: &[u8], want: usize) -> &[u8] {
+    if bytes.len() > want {
+        &bytes[..want]
+    } else {
+        bytes
+    }
 }
 
 fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
