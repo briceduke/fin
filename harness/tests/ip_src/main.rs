@@ -132,6 +132,37 @@ fn ipv6_routing_ipip(hdrlen: u8, typ: u8, specific: &[u8]) -> Vec<u8> {
     )
 }
 
+fn ipv6_routing_ipip_segs(hdrlen: u8, typ: u8, segs_left: u8, specific: &[u8]) -> Vec<u8> {
+    eth(
+        0x86dd,
+        &ipv6(
+            43,
+            &routing6_segs(
+                4,
+                hdrlen,
+                typ,
+                segs_left,
+                specific,
+                &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+            ),
+        ),
+    )
+}
+
+fn ipv6_opts_ipip(ext: u8, options: &[u8]) -> Vec<u8> {
+    eth(
+        0x86dd,
+        &ipv6(
+            ext,
+            &hopopt_opts(
+                4,
+                options,
+                &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+            ),
+        ),
+    )
+}
+
 fn fixed() -> Vec<(&'static str, Vec<u8>)> {
     let inner_eth = eth(
         0x0800,
@@ -997,6 +1028,66 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
         (
             "ipv6-routing-type4-hdrlen2",
             pcap(LINK_ETHERNET, &[ipv6_routing_ipip(2, 4, &[0])]),
+        ),
+        (
+            "ipv6-routing-type3-hdrlen1",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(1, 3, &[])]),
+        ),
+        (
+            "ipv6-routing-type3-hdrlen1-cmpr11",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(1, 3, &[0x11])]),
+        ),
+        (
+            "ipv6-routing-type3-hdrlen2",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(2, 3, &[])]),
+        ),
+        (
+            "ipv6-routing-type5-hdrlen0-sids-0001",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 5, &[0, 1, 0, 1])]),
+        ),
+        (
+            "ipv6-routing-type6-hdrlen0-sids-0001",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 6, &[0, 1, 0, 1])]),
+        ),
+        (
+            "ipv6-routing-type5-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 5, &[0, 0, 0, 0])]),
+        ),
+        (
+            "ipv6-routing-type6-hdrlen0",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip(0, 6, &[0, 0, 0, 0])]),
+        ),
+        (
+            "ipv6-routing-type5-hdrlen1-segleft-255",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip_segs(1, 5, 255, &[])]),
+        ),
+        (
+            "ipv6-routing-type6-hdrlen1-segleft-255",
+            pcap(LINK_ETHERNET, &[ipv6_routing_ipip_segs(1, 6, 255, &[])]),
+        ),
+        (
+            "ipv6-hopopt-rtalert-255",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(0, &[0x05, 255])]),
+        ),
+        (
+            "ipv6-hopopt-five-pad1-type1",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(0, &[0, 0, 0, 0, 0, 1])]),
+        ),
+        (
+            "ipv6-dstopts-rtalert-255",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(60, &[0x05, 255])]),
+        ),
+        (
+            "ipv6-dstopts-five-pad1-type1",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(60, &[0, 0, 0, 0, 0, 1])]),
+        ),
+        (
+            "ipv6-hopopt-padn-overrun-header",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(0, &[0x01, 6])]),
+        ),
+        (
+            "ipv6-dstopts-padn-overrun-header",
+            pcap(LINK_ETHERNET, &[ipv6_opts_ipip(60, &[0x01, 6])]),
         ),
     ]
 }

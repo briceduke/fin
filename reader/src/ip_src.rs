@@ -316,7 +316,7 @@ impl Walk<'_> {
                     rest = body;
                 }
                 IPV6_HOP | IPV6_DEST => {
-                    let Some((nxt, body)) = take_ext8(rest) else {
+                    let Some((nxt, body)) = take_opts(rest) else {
                         return;
                     };
                     next = nxt;
@@ -605,27 +605,138 @@ fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
     Some((bytes[0], &bytes[len..]))
 }
 
-/// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type 2
-/// (`dissect_routing6_mipv6`) and type 4 (`dissect_routing6_srh`) read 16-byte
-/// addresses from the type-specific tvbuff (`total_len - 4`). A short read
-/// throws BoundsError, so the next header is not dissected.
-fn take_routing(bytes: &[u8]) -> Option<(u8, &[u8])> {
+/// tshark 4.6.9 `dissect_opts` reads option type at `offset` and length at
+/// `offset + 1` from the remaining IPv6 payload tvbuff, then
+/// `proto_tree_add_item` of `opt_len` bytes. Pad1 still reads the length byte
+/// but only consumes 1. A claimed non-Pad1 option longer than the remaining
+/// captured payload throws BoundsError, so `ipv6_dissect_next` is not called.
+fn take_opts(bytes: &[u8]) -> Option<(u8, &[u8])> {
     let (next, rest) = take_ext8(bytes)?;
-    let total = (bytes[1] as usize + 1) * 8;
-    if routing_bounds_error(bytes[2], &bytes[4..total]) {
+    if opts_bounds_error(bytes) {
         return None;
     }
     Some((next, rest))
 }
 
-fn routing_bounds_error(typ: u8, body: &[u8]) -> bool {
+fn opts_bounds_error(payload: &[u8]) -> bool {
+    if payload.len() < 2 {
+        return false;
+    }
+    let end = (payload[1] as usize + 1) * 8;
+    let mut offset = 2;
+    while offset < end {
+        if offset + 1 >= payload.len() {
+            return true;
+        }
+        let typ = payload[offset];
+        let opt_len = payload[offset + 1] as usize;
+        if typ == 0 {
+            offset += 1;
+            continue;
+        }
+        if offset + 2 + opt_len > payload.len() {
+            return true;
+        }
+        offset += 2 + opt_len;
+    }
+    false
+}
+
+/// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type
+/// dissectors read past the type-specific tvbuff (`total_len - 4`) and throw
+/// BoundsError, so the next header is not dissected.
+fn take_routing(bytes: &[u8]) -> Option<(u8, &[u8])> {
+    let (next, rest) = take_ext8(bytes)?;
+    let total = (bytes[1] as usize + 1) * 8;
+    if routing_bounds_error(bytes[2], bytes[3], bytes[1], &bytes[4..total]) {
+        return None;
+    }
+    Some((next, rest))
+}
+
+fn routing_bounds_error(typ: u8, segs_left: u8, hdrlen: u8, body: &[u8]) -> bool {
     match typ {
         2 => body.len() < 20,
+        3 => rpl_bounds_error(hdrlen, body),
         4 => match body.first() {
             None => true,
             Some(&last_entry) => body.len() < 4 + 16 * (last_entry as usize + 1),
         },
+        5 => crh_bounds_error(2, hdrlen as usize * 4 + 2, segs_left, body),
+        6 => crh_bounds_error(4, hdrlen as usize * 2 + 1, segs_left, body),
         _ => false,
+    }
+}
+
+/// tshark 4.6.9 `dissect_routing6_rpl`: 4-byte Cmpr/Pad, then `hdrlen > 0`
+/// addresses of size `16 - CmprI` (last uses `CmprE`).
+fn rpl_bounds_error(hdrlen: u8, body: &[u8]) -> bool {
+    if body.len() < 4 {
+        return true;
+    }
+    if hdrlen == 0 {
+        return false;
+    }
+    let cmpr_i = body[0] >> 4;
+    let cmpr_e = body[0] & 0x0f;
+    let pad = body[1] >> 4;
+    let numer = i32::from(hdrlen) * 8 - i32::from(pad) - (16 - i32::from(cmpr_e));
+    let denom = 16 - i32::from(cmpr_i);
+    let addr_count = numer / denom + 1;
+    if addr_count <= 0 {
+        return false;
+    }
+    let mut offset = 4;
+    for idx in 1..=addr_count {
+        let size = if idx == addr_count {
+            16 - cmpr_e as usize
+        } else {
+            16 - cmpr_i as usize
+        };
+        if offset + size > body.len() {
+            return true;
+        }
+        offset += size;
+    }
+    false
+}
+
+/// tshark 4.6.9 `dissect_routing6_crh`: `current_sid` at
+/// `octets_per_sid * segments_left`, then SID words until a zero SID, always
+/// reading one word past the last nonzero SID.
+fn crh_bounds_error(octets_per_sid: usize, sid_count: usize, segs_left: u8, body: &[u8]) -> bool {
+    let current = octets_per_sid * segs_left as usize;
+    if current + octets_per_sid > body.len() {
+        return true;
+    }
+    if body.len() < octets_per_sid {
+        return true;
+    }
+    let mut offset = 0;
+    let mut sid = crh_sid(body, offset, octets_per_sid);
+    for _ in 0..sid_count {
+        if sid == 0 {
+            break;
+        }
+        offset += octets_per_sid;
+        if offset + octets_per_sid > body.len() {
+            return true;
+        }
+        sid = crh_sid(body, offset, octets_per_sid);
+    }
+    false
+}
+
+fn crh_sid(body: &[u8], offset: usize, octets: usize) -> u32 {
+    if octets == 2 {
+        u16::from_be_bytes([body[offset], body[offset + 1]]).into()
+    } else {
+        u32::from_be_bytes([
+            body[offset],
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+        ])
     }
 }
 
@@ -673,12 +784,20 @@ mod tests {
         ext
     }
 
-    fn routing6(next: u8, hdrlen: u8, typ: u8, specific: &[u8], payload: &[u8]) -> Vec<u8> {
+    fn routing6(
+        next: u8,
+        hdrlen: u8,
+        typ: u8,
+        segs_left: u8,
+        specific: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         let total = (hdrlen as usize + 1) * 8;
         let mut hdr = vec![0u8; total];
         hdr[0] = next;
         hdr[1] = hdrlen;
         hdr[2] = typ;
+        hdr[3] = segs_left;
         let n = specific.len().min(total - 4);
         hdr[4..4 + n].copy_from_slice(&specific[..n]);
         hdr.extend_from_slice(payload);
@@ -686,8 +805,25 @@ mod tests {
     }
 
     fn route_frame(hdrlen: u8, typ: u8, specific: &[u8]) -> Vec<u8> {
-        let payload = routing6(4, hdrlen, typ, specific, &ipv4_udp_discard());
+        route_frame_segs(hdrlen, typ, 0, specific)
+    }
+
+    fn route_frame_segs(hdrlen: u8, typ: u8, segs_left: u8, specific: &[u8]) -> Vec<u8> {
+        let payload = routing6(4, hdrlen, typ, segs_left, specific, &ipv4_udp_discard());
         eth_ipv6(43, payload.len() as u16, &payload)
+    }
+
+    fn hopopt_opts(next: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut ext = vec![next, 0, 0, 0, 0, 0, 0, 0];
+        let n = options.len().min(6);
+        ext[2..2 + n].copy_from_slice(&options[..n]);
+        ext.extend_from_slice(payload);
+        ext
+    }
+
+    fn opts_frame(ext: u8, options: &[u8]) -> Vec<u8> {
+        let payload = hopopt_opts(4, options, &ipv4_udp_discard());
+        eth_ipv6(ext, payload.len() as u16, &payload)
     }
 
     fn ipv4_udp_discard() -> Vec<u8> {
@@ -948,5 +1084,103 @@ mod tests {
     #[test]
     fn routing_type4_hdrlen2_last_entry1_stays_blank() {
         assert_eq!(walk(&route_frame(2, 4, &[1])), blank());
+    }
+
+    #[test]
+    fn routing_type3_hdrlen1_stays_blank() {
+        for cmpr in [0u8, 0x11] {
+            assert_eq!(
+                walk(&route_frame(1, 3, &[cmpr])),
+                blank(),
+                "cmpr {cmpr:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_type3_hdrlen2_walks_ipip() {
+        assert_eq!(walk(&route_frame(2, 3, &[])), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn routing_type3_hdrlen1_cmpr_ff_walks_ipip() {
+        assert_eq!(walk(&route_frame(1, 3, &[0xff])), proved(&["10.9.9.9"]));
+    }
+
+    #[test]
+    fn routing_type5_type6_nonzero_sids_stays_blank() {
+        assert_eq!(walk(&route_frame(0, 5, &[0, 1, 0, 1])), blank());
+        assert_eq!(walk(&route_frame(0, 6, &[0, 1, 0, 1])), blank());
+    }
+
+    #[test]
+    fn routing_type5_type6_zero_sids_walks_ipip() {
+        for typ in [5u8, 6] {
+            assert_eq!(
+                walk(&route_frame(0, typ, &[0, 0, 0, 0])),
+                proved(&["10.9.9.9"]),
+                "type {typ}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_type5_first_sid_nonzero_second_zero_walks_ipip() {
+        assert_eq!(
+            walk(&route_frame(0, 5, &[0, 1, 0, 0])),
+            proved(&["10.9.9.9"])
+        );
+    }
+
+    #[test]
+    fn routing_type5_type6_hdrlen1_segleft255_stays_blank() {
+        for typ in [5u8, 6] {
+            assert_eq!(
+                walk(&route_frame_segs(1, typ, 255, &[])),
+                blank(),
+                "type {typ}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_overrun_stays_blank() {
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame(ext, &[0x05, 255])),
+                blank(),
+                "ext {ext} rtalert 255"
+            );
+            assert_eq!(
+                walk(&opts_frame(ext, &[0, 0, 0, 0, 0, 1])),
+                blank(),
+                "ext {ext} five Pad1 then type 1"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_padn_overruns_header_walks_ipip() {
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame(ext, &[0x01, 6])),
+                proved(&["10.9.9.9"]),
+                "ext {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_six_pad1_walks_ipip() {
+        assert_eq!(
+            walk(&opts_frame(0, &[0, 0, 0, 0, 0, 0])),
+            proved(&["10.9.9.9"])
+        );
+    }
+
+    #[test]
+    fn hopopt_padn_len_40_walks_and_41_stays_blank() {
+        assert_eq!(walk(&opts_frame(0, &[0x01, 40])), proved(&["10.9.9.9"]));
+        assert_eq!(walk(&opts_frame(0, &[0x01, 41])), blank());
     }
 }

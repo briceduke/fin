@@ -144,17 +144,35 @@ pub fn ipv6_len(next: u8, plen: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn hopopt(next: u8, payload: &[u8]) -> Vec<u8> {
+    hopopt_opts(next, &[], payload)
+}
+
+pub fn hopopt_opts(next: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut ext = vec![next, 0, 0, 0, 0, 0, 0, 0];
+    let n = options.len().min(6);
+    ext[2..2 + n].copy_from_slice(&options[..n]);
     ext.extend_from_slice(payload);
     ext
 }
 
 pub fn routing6(next: u8, hdrlen: u8, typ: u8, specific: &[u8], payload: &[u8]) -> Vec<u8> {
+    routing6_segs(next, hdrlen, typ, 0, specific, payload)
+}
+
+pub fn routing6_segs(
+    next: u8,
+    hdrlen: u8,
+    typ: u8,
+    segs_left: u8,
+    specific: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
     let total = (hdrlen as usize + 1) * 8;
     let mut hdr = vec![0u8; total];
     hdr[0] = next;
     hdr[1] = hdrlen;
     hdr[2] = typ;
+    hdr[3] = segs_left;
     let n = specific.len().min(total - 4);
     hdr[4..4 + n].copy_from_slice(&specific[..n]);
     hdr.extend_from_slice(payload);
