@@ -651,6 +651,8 @@ fn opts_bounds_error(payload: &[u8]) -> bool {
 /// Bytes of option data tshark 4.6.9 actually advances, or None on BoundsError.
 fn opt_data_read(typ: u8, data: &[u8], opt_len: usize) -> Option<usize> {
     match typ {
+        0x04 => need(data, 1),
+        0x05 => need(data, 2),
         0x07 => calipso_read(data),
         0x08 => smf_dpd_read(data, opt_len),
         0x0f => need(data, 10),
@@ -659,7 +661,9 @@ fn opt_data_read(typ: u8, data: &[u8], opt_len: usize) -> Option<usize> {
         0x26 => quickstart_read(data),
         0x30 | 0x41 | 0xc2 => need(data, 4),
         0x31 => ioam_read(data),
+        0x6d => mpl_read(data),
         0xc9 => need(data, 16),
+        0xee => need(data, 3),
         _ => Some(opt_len),
     }
 }
@@ -722,6 +726,14 @@ fn ioam_read(data: &[u8]) -> Option<usize> {
         0 | 1 | 4 => need(data, 10),
         _ => Some(2),
     }
+}
+
+/// tshark 4.6.9 `dissect_opt_mpl` reads flags+sequence, then `seed_id_len`
+/// from `flags >> 6` (0 / 2 / 8 / 16).
+fn mpl_read(data: &[u8]) -> Option<usize> {
+    let flags = *data.first()?;
+    let seed = [0u8, 2, 8, 16][(flags >> 6) as usize] as usize;
+    need(data, 2 + seed)
 }
 
 /// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type
@@ -1393,6 +1405,30 @@ mod tests {
                 walk(&opts_frame(0, &[typ, 0, 0, 0, 0, 0x40])),
                 proved(&["10.9.9.9"]),
                 "typ {typ:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_tel_rtalert_dff_leftover_jumbo_stays_blank() {
+        for ext in [0u8, 60] {
+            for typ in [0x04u8, 0x05, 0xee] {
+                assert_eq!(
+                    walk(&opts_frame(ext, &[typ, 0, 0xc2, 0, 0, 0x40])),
+                    blank(),
+                    "ext {ext} typ {typ:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hopopt_mpl_len0_seed_walks_ipip() {
+        for flags in [0x40u8, 0x45, 0x4f, 0x80, 0xc0, 0xff] {
+            assert_eq!(
+                walk(&opts_frame(0, &[0x6d, 0, flags, 0, 0, 0x40])),
+                proved(&["10.9.9.9"]),
+                "flags {flags:#x}"
             );
         }
     }
