@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "fin"
+version = "0.1.0"
+dependencies = [
+ "reader",
+]
+
+[[package]]
 name = "harness"
 version = "0.1.0"
 dependencies = [

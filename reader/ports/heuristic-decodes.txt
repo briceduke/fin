@@ -1,0 +1,194 @@
+udp	xml	F	F	xml_udp	XML over UDP
+udp	wol	T	T	wol_udp	Wake On LAN over UDP
+udp	wg	T	T	wg	WireGuard
+udp	waveagent	T	T	waveagent_udp	WaveAgent over UDP
+udp	wassp	F	F	wassp_udp	WASSP over UDP
+udp	udt	T	T	udt_udp	UDT over UDP
+udp	trel	F	F	trel_udp	TREL over UDP
+udp	thrift	T	T	thrift_udp	Thrift over UDP
+udp	tftp	T	T	tftp	TFTP
+udp	teredo	F	F	teredo_udp	Teredo over UDP
+udp	t38	T	T	t38_acdr	T38 over AC DR
+udp	stun	T	T	stun_udp	STUN over UDP
+udp	srt	T	T	srt_udp	SRT over UDP
+udp	sprt	T	T	sprt_udp	SPRT over UDP
+udp	someip	F	F	someip_udp_heur	SOME/IP over UDP
+udp	skype	F	F	skype_udp	Skype over UDP
+udp	sip	T	T	sip_udp	SIP over UDP
+udp	shicp	T	T	shicp_udp	SHICP over UDP
+udp	rtps	T	T	rtps_udp	RTPS over UDP
+udp	rtp	F	F	rtp_udp	RTP over UDP
+udp	rtcp	T	T	rtcp_udp	RTCP over UDP
+udp	rpcap	T	T	rpcap_udp	RPCAP over UDP
+udp	rpc	T	T	rpc_udp	RPC over UDP
+udp	rlm	T	T	rlm_udp	Redundant Link Management over UDP
+udp	rlc-nr	F	F	rlc_nr_udp	RLC-NR over UDP
+udp	rlc-lte	F	F	rlc_lte_udp	RLC-LTE over UDP
+udp	rlc	F	F	rlc_udp	RLC over UDP
+udp	rftap	T	T	rftap	RFtap over UDP
+udp	reload-framing	T	T	reload_framing_udp	RELOAD Framing over UDP
+udp	reload	T	T	reload_udp	RELOAD over UDP
+udp	redbackli	T	T	redbackli_udp	Redback Lawful Intercept over UDP
+udp	raknet	T	T	raknet_udp	RakNet over UDP
+udp	quic	T	T	quic	QUIC
+udp	proxy	T	T	proxy_udp	PROXY over UDP
+udp	pktgen	T	T	pktgen_udp	Linux Kernel Packet Generator over UDP
+udp	peekremote	T	T	peekremote_udp	OmniPeek Remote over UDP
+udp	pdcp-nr	F	F	pdcp_nr_udp	PDCP-NR over UDP
+udp	pdcp-lte	F	F	pdcp_lte_udp	PDCP-LTE over UDP
+udp	pathport	T	T	pathport_udp	Pathport over UDP
+udp	pana	T	T	pana_udp	PANA over UDP
+udp	osc	F	F	osc_udp	Open Sound Control over UDP
+udp	ocp1	T	T	ocp1_udp	OCP.1 over UDP
+udp	netperfmeter	T	T	netperfmeter_udp	NetPerfMeter over UDP
+udp	norm	F	F	rmt_norm_udp	NORM over UDP
+udp	nmea0183	F	F	nmea0183_udp	NMEA0183 over UDP
+udp	njack	T	T	njack_udp	NJACK over UDP
+udp	nas-eps	F	F	nas_eps_udp	NAS-EPS over UDP
+udp	nas-5gs	F	F	nas_5gs_udp	NAS-5GS over UDP
+udp	nano	F	F	nano-udp	Nano UDP Heuristics
+udp	mp2t	T	T	mp2t_udp	MP2T over UDP
+udp	mojito	T	T	mojito_udp	Mojito over UDP
+udp	mndp	F	F	mndp_udp	MNDP over UDP
+udp	miop	T	T	miop_udp	MIOP over UDP
+udp	mac-nr	F	F	mac_nr_udp	MAC-NR over UDP
+udp	mac-lte	F	F	mac_lte_udp	MAC-LTE over UDP
+udp	ltp	F	F	ltp_udp	LTP over UDP
+udp	lsd	T	T	lsd_udp	LSD over UDP
+udp	lbtru	T	T	lbtru_udp	LBT Reliable Unicast over UDP
+udp	lbtrm	T	T	lbtrm_udp	LBT Reliable Multicast over UDP
+udp	lbmr	T	T	lbmr_udp	LBM Topic Resolution over UDP
+udp	lanforge	T	T	lanforge_udp	LANforge over UDP
+udp	jxta	T	T	jxta_udp	JXTA over UDP
+udp	json	T	T	json_acdr	JSON over AC DR
+udp	interlink	T	T	interlink_udp	Interlink over UDP
+udp	icep	T	T	icep_udp	ICEP over UDP
+udp	hsfz	F	F	hsfz_over_udp	HSFZ over UDP
+udp	hipercontracer	F	F	hipercontracer_udp	HiPerConTracer over UDP
+udp	gvsp	F	F	gvsp_udp	GigE Vision over UDP
+udp	gquic	T	T	gquic	Google QUIC
+udp	giop	T	T	giop_udp	DIOP (GIOP/UDP)
+udp	gelf	F	F	gelf_udp	GELF over UDP
+udp	fp_mux	F	F	fp_mux_udp	FP Mux over UDP
+udp	fp	F	F	fp_udp	FP over UDP
+udp	fortinet_sso	T	T	fortinet_sso	Fortinet SSO over UDP
+udp	e100	T	T	e100_udp	E100 over UDP
+udp	dvb-s2_modeadapt	F	F	dvb_s2_udp	DVB-S2 over UDP
+udp	dtls	T	T	dtls_udp	DTLS over UDP
+udp	dplay	T	T	dplay_udp	DirectPlay over UDP
+udp	dns	T	T	dns_udp	DNS over UDP
+udp	dnp3	F	F	dnp3_udp	DNP 3.0 over UDP
+udp	dcp-etsi	T	T	dcp_etsi_udp	DCP (ETSI) over UDP
+udp	dcerpc	T	T	dcerpc_udp	DCE/RPC over UDP
+udp	cltp	T	T	cltp_udp	CLTP over UDP
+udp	clique-rm	T	T	clique_rm_udp	Clique RM over UDP
+udp	classicstun	T	T	classicstun_udp	Classic STUN over UDP
+udp	cigi	T	T	cigi_udp	CIGI over UDP
+udp	cattp	F	F	cattp_udp	CAT-TP over UDP
+udp	caneth	T	T	caneth_udp	CAN-ETH over UDP
+udp	bt-utp	F	F	bt_utp_udp	BitTorrent UTP over UDP
+udp	bt-tracker	T	T	bt_tracker_udp	BitTorrent Tracker over UDP
+udp	bt-dht	T	T	bittorrent_dht_udp	BitTorrent DHT over UDP
+udp	bfcp	F	F	bfcp_udp	BFCP over UDP
+udp	asphodel	T	T	asphodel_inquiry	Asphodel over UDP
+udp	artnet	T	T	artnet_udp	ARTNET over UDP
+udp	ar_drone	T	T	ar_drone_udp	AR Drone over UDP
+udp	applemidi	T	T	applemidi_udp	Apple MIDI over UDP
+udp	alc	T	T	alc	Asynchronous Layered Coding
+udp	aeron	F	F	aeron_udp	Aeron over UDP
+udp	adwin_config	T	T	adwin_config_udp	ADwin-Config over UDP
+udp	acn	F	F	rdmnet_udp	RDMnet over UDP (LLRP)
+udp	acn	F	F	acn	ACN over UDP
+tcp	ziop	T	T	ziop_tcp	ZIOP over TCP
+tcp	ymsg	T	T	ymsg_tcp	Yahoo YMSG Messenger over TCP
+tcp	yhoo	T	T	yhoo_tcp	Yahoo Messenger over TCP
+tcp	xml	F	F	xml_tcp	XML over TCP
+tcp	xmcp	T	T	xmcp_tcp	XMCP over TCP
+tcp	xcsl	T	T	xcsl_tcp	XCSL over TCP
+tcp	websocket	F	F	websocket_tcp	WebSocket Heuristic
+tcp	vnc	T	T	vnc_tcp	VNC over TCP
+tcp	ucp	T	T	ucp_tcp	UCP over TCP
+tcp	tuxedo	T	T	tuxedo_tcp	Tuxedo over TCP
+tcp	tpkt	F	F	tpkt_tcp	TPKT over TCP
+tcp	thrift	T	T	thrift_tcp	Thrift over TCP
+tcp	tds	T	T	tds_tcp	Tabular Data Stream over TCP
+tcp	tcpros	F	F	tcpros_tcp	TCPROS over TCP
+tcp	tcpencap	T	T	ipsec_tcp	TCP Encapsulation of IPsec Packets
+tcp	tcpcl	T	T	tcpcl_tcp	TCPCL over TCP
+tcp	tali	T	T	tali_tcp	Tali over TCP
+tcp	stun	T	T	stun_tcp	STUN over TCP
+tcp	starteam	T	T	starteam_tcp	StarTeam over TCP
+tcp	tls	T	T	tls_tcp	SSL/TLS over TCP
+tcp	ssh	T	T	ssh_tcp	SSH over TCP
+tcp	spice	T	T	spice_tcp	Spice over TCP
+tcp	spdy	F	F	spdy_tcp	SPDY over TCP
+tcp	someip	F	F	someip_tcp_heur	SOME/IP over TCP
+tcp	smpp	T	T	smpp_tcp	SMPP over TCP Heuristics
+tcp	smc	T	T	smc_tcp	Shared Memory Communications over TCP
+tcp	sip	T	T	sip_tcp	SIP over TCP
+tcp	sick_cola.ascii	T	T	sick_cola_a_tcp	SICK CoLa A over TCP
+tcp	sick_cola.binary	T	T	sick_cola_b_tcp	SICK CoLa B over TCP
+tcp	rtps	T	T	rtps_tcp	RTPS over TCP
+tcp	rtmpt	F	F	rtmpt_tcp	RTMPT over TCP
+tcp	rtitcp	T	T	rtitcp	RTI TCP Layer
+tcp	rpcap	T	T	rpcap_tcp	RPCAP over TCP
+tcp	rpc	T	T	rpc_tcp	RPC over TCP
+tcp	rk512	T	T	rk512_tcp	RK512 over TCP
+tcp	reload-framing	T	T	reload_framing_tcp	RELOAD Framing over TCP
+tcp	reload	T	T	reload_tcp	RELOAD over TCP
+tcp	q931	T	T	q931_tcp	Q.931 over TPKT over TCP
+tcp	pvfs	T	T	pvfs_tcp	PVFS over TCP
+tcp	proxy	T	T	proxy_tcp	PROXY over TCP
+tcp	paltalk	T	T	paltalk_tcp	Paltalk over TCP
+tcp	openwire	T	T	openwire_tcp	OpenWire over TCP
+tcp	openflow	T	T	openflow_tcp	OpenFlow over TCP
+tcp	ocp1	T	T	ocp1_tcp	OCP.1 over TCP
+tcp	nstrace.rpc	F	F	nsrpc	NSRPC over TCP
+tcp	netperfmeter	T	T	netperfmeter_tcp	NetPerfMeter over TCP
+tcp	njack	F	F	njack_tcp	NJACK over TCP
+tcp	ndmp	T	T	ndmp_tcp	NDMP over TCP
+tcp	nbd	T	T	nbd_tcp	NBD over TCP
+tcp	nano	F	F	nano-tcp	Nano TCP Heuristics
+tcp	msrp	T	T	msrp_tcp	MSRP over TCP
+tcp	mq	T	T	mq_tcp	WebSphere MQ over TCP
+tcp	iwarp_mpa	T	T	iwarp_mpa_tcp	IWARP_MPA over TCP
+tcp	monero	T	T	monero_tcp	Monero over TCP
+tcp	http	T	T	http_tcp	HTTP over TCP
+tcp	lbttcp	T	T	lbttcp_tcp	LBT over TCP
+tcp	lbmsrs	T	T	lbmsrs_tcp	LBM Stateful Resolution Service over RSocket
+tcp	lbmpdm_tcp	T	T	lbmpdm_tcp	LBMPDM over TCP
+tcp	lanforge	T	T	lanforge_tcp	LANforge over TCP
+tcp	jxta	T	T	jxta_tcp	JXTA over TCP
+tcp	iscsi	T	T	iscsi_tcp	iSCSI over TCP
+tcp	ifcp	T	T	ifcp_tcp	iFCP over TCP
+tcp	icep	T	T	icep_tcp	ICEP over TCP
+tcp	http2	T	T	http2_tcp	HTTP2 over TCP
+tcp	hsfz	F	F	hsfz_over_tcp	HSFZ over TCP
+tcp	hl7	T	T	hl7_tcp	HL7 over TCP
+tcp	hislip	F	F	hislip_tcp	HiSLIP over TCP
+tcp	hipercontracer	F	F	hipercontracer_tcp	HiPerConTracer over TCP
+tcp	hdcp2	F	F	hdcp2_tcp	HDCP2 over TCP
+tcp	h1	T	T	hi_tcp	Sinec H1 over TCP
+tcp	giop	T	T	giop_tcp	GIOP over TCP
+tcp	fmtp	T	T	fmtp_tcp	FMTP over TCP
+tcp	fix	T	T	fix_tcp	FIX over TCP
+tcp	fcip	T	T	fcip_tcp	FCIP over TCP
+tcp	fb_zero	T	T	fb_zero	FBZero (QUIC) over TCP
+tcp	etch	T	T	etch_tcp	Etch over TCP
+tcp	drda	T	T	drda_tcp	DRDA over TCP
+tcp	drbd_lb_tcp	F	F	drbd_lb_tcp	DRBD Load-Balanced over TCP
+tcp	drbd	F	F	drbd_tcp	DRBD over TCP
+tcp	dplay	T	T	dplay_tcp	DirectPlay over TCP
+tcp	dnp3	F	F	dnp3_tcp	DNP 3.0 over TCP
+tcp	diameter	F	F	diameter_tcp	Diameter over TCP
+tcp	dicom	T	T	dicom_tcp	DICOM on any TCP port (heuristic)
+tcp	dcerpc	T	T	dcerpc_tcp	DCE/RPC over TCP
+tcp	ctdb	T	T	ctdb_tcp	Cluster TDB over TCP
+tcp	classicstun	T	T	classicstun_tcp	Classic STUN over TCP
+tcp	cimd	T	T	cimd_tcp	CIMD over TCP
+tcp	ceph	T	T	ceph_tcp	Ceph over TCP
+tcp	bittorrent	T	T	bittorrent_tcp	BitTorrent over TCP
+tcp	bitcoin	T	T	bitcoin_tcp	Bitcoin over TCP
+tcp	bfcp	F	F	bfcp_tcp	BFCP over TCP
+tcp	adwin_config	T	T	adwin_config_tcp	ADwin-Config over TCP
+tcp	acn	F	F	rdmnet_tcp	RDMnet over TCP (Broker, RPT, EPT)

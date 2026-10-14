@@ -3,9 +3,13 @@
 //! One core, front to back. Classic pcap and pcapng become frames. A later
 //! chunked reader falls back to this when a seam does not prove.
 
+mod ip_src;
 mod options;
 mod pcap;
 mod pcapng;
+pub mod ports;
+
+pub use ip_src::{walk_ip_src, Cell, IpSrc};
 
 /// Largest captured length tshark 4.6.9 will read.
 pub const MAX_CAPTURED_LENGTH: u32 = 262144;

@@ -2,7 +2,7 @@
 
 > TLS server names on a 368 MB capture: 0.226 seconds, against 7.87 seconds for tshark 4.6.9. Same 1,252 names. Preliminary, from a prototype that has since been removed.
 
-**Status:** the sequential reader walks classic pcap and pcapng into frames. It does not read fields yet. Next is `ip.src`.
+**Status:** `fin -r <file> [-n] -T fields -e ip.src` walks frames and prints IPv4 sources. Next is the chunk split.
 
 fin is an open-source packet analyzer.
 
@@ -66,9 +66,10 @@ Each step is checked against the one before it.
 
 1. The checker and a corpus of test captures. Done.
 2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type and the captured bytes. Tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises, including ISB, NRB, DSB, custom blocks, and systemd journal export.
-3. `ip.src`. Next.
+3. `ip.src`. Done. The walker covers Ethernet, classic SLL, SLL2, VLAN, QinQ, IPv4, IPv6 extension headers, ICMP errors, IP-in-IP, and VXLAN. UDP/TCP use the snapshotted tshark 4.6.9 port table. Any path it cannot prove is counted on stderr. HTTP is not in this step.
 4. The chunk split, checked against the sequential reader.
 5. TLS server names.
+6. HTTP.
 
 After TLS server names, QUIC Initials are decrypted and read with the same ClientHello parser. The index, the Parquet export, and the desktop app follow.
 
@@ -91,6 +92,17 @@ The prototype did not reassemble split TLS handshakes. bigFlows.pcap is older tr
 Inside tshark, the `ip.src` query costs about the same as printing the packet number. Disabling UDP, TCP, DNS, HTTP, TLS, and data dissection in tshark saves only 22%. The cost is tshark's per-packet engine itself.
 
 Notes: `study/mechanism.md`, `study/benchmark.md`, `study/spike.md`.
+
+## ip.src, 13 Oct 2026
+
+Same machine and method as the table above. Release `fin`, stdout and stderr discarded, one warmup, median of three.
+
+| Query | Capture | tshark 4.6.9 | fin |
+| --- | --- | ---: | ---: |
+| `ip.src` | 1,000,000 Ethernet + IPv4 + UDP, 74 MB | 7.55 s | 1.01 s |
+| `ip.src` | 1,000,000 QinQ + IPv4 + UDP, 82 MB | 8.59 s | 1.02 s |
+
+Counted-frame rate on real files: 0% on the 10-packet public VXLAN sample, 63% on challenge01 (1,670 packets), 59% on bigFlows (791,615 packets). Most of those counts are TCP payloads whose port dissector may reject (HTTP, TLS) or can reach IP. The walker does not model those accept paths yet.
 
 ## Frame walk, 10 Oct 2026
 
