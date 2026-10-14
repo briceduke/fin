@@ -461,7 +461,8 @@ fn diff_one(session: &TsharkSession, dir: &Path, index: usize, bytes: &[u8]) -> 
     let fin_stdout = fin_rows(&capture);
     let fin_exit = capture.exit_code();
     let mut problems = Vec::new();
-    if tshark.stdout != fin_stdout {
+    let tshark_stdout = tshark.stdout.replace('\r', "");
+    if tshark_stdout != fin_stdout {
         problems.push(format!(
             "stdout tshark={:?} fin={:?}",
             tshark.stdout, fin_stdout
