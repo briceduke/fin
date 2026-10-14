@@ -610,8 +610,9 @@ fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
 /// `proto_tree_add_item` of `opt_len` bytes. Pad1 still reads the length byte
 /// but only consumes 1. A claimed non-Pad1 option longer than the remaining
 /// captured payload throws BoundsError, so `ipv6_dissect_next` is not called.
-/// CALIPSO (0x07), SMF_DPD (0x08), and APN6 (0x13) then ignore `opt_len` and
-/// read type-specific fields from that same payload; a short header still throws.
+/// Type dissectors that ignore `opt_len` leave `offset` where they stopped;
+/// leftover header bytes are not a new TLV. CALIPSO / SMF_DPD / APN6 reads
+/// that overrun the captured payload still throw.
 fn take_opts(bytes: &[u8]) -> Option<(u8, &[u8])> {
     let (next, rest) = take_ext8(bytes)?;
     if opts_bounds_error(bytes) {
@@ -639,57 +640,88 @@ fn opts_bounds_error(payload: &[u8]) -> bool {
         if offset + 2 + opt_len > payload.len() {
             return true;
         }
-        if opt_type_bounds_error(typ, &payload[offset + 2..]) {
+        let Some(read) = opt_data_read(typ, &payload[offset + 2..], opt_len) else {
             return true;
-        }
-        offset += 2 + opt_len;
+        };
+        offset = (offset + 2 + read).max(offset + 2 + opt_len);
     }
     false
 }
 
-fn opt_type_bounds_error(typ: u8, data: &[u8]) -> bool {
+/// Bytes of option data tshark 4.6.9 actually advances, or None on BoundsError.
+fn opt_data_read(typ: u8, data: &[u8], opt_len: usize) -> Option<usize> {
     match typ {
-        0x07 => calipso_bounds_error(data),
-        0x08 => smf_dpd_bounds_error(data),
-        0x13 => apn6_bounds_error(data),
-        _ => false,
+        0x07 => calipso_read(data),
+        0x08 => smf_dpd_read(data, opt_len),
+        0x0f => need(data, 10),
+        0x13 => apn6_read(data),
+        0x23 | 0x63 => need(data, 4),
+        0x26 => quickstart_read(data),
+        0x30 | 0x41 | 0xc2 => need(data, 4),
+        0x31 => ioam_read(data),
+        0xc9 => need(data, 16),
+        _ => Some(opt_len),
     }
+}
+
+fn need(data: &[u8], n: usize) -> Option<usize> {
+    (data.len() >= n).then_some(n)
 }
 
 /// tshark 4.6.9 `dissect_opt_calipso` always reads DOI (4), cmpt_length (1),
 /// sens (1), checksum (2), then `cmpt_length * 4` bitmap bytes.
-fn calipso_bounds_error(data: &[u8]) -> bool {
+fn calipso_read(data: &[u8]) -> Option<usize> {
     if data.len() < 8 {
-        return true;
+        return None;
     }
-    data.len() < 8 + data[4] as usize * 4
+    need(data, 8 + data[4] as usize * 4)
 }
 
 /// tshark 4.6.9 `dissect_opt_smf_dpd` I-DPD with tid bits reads `hash_tid`
 /// then `(hash_tid & 0x0f) + 1` tagger-id bytes from the parent payload.
-fn smf_dpd_bounds_error(data: &[u8]) -> bool {
-    let Some(&hash_tid) = data.first() else {
-        return true;
-    };
-    if hash_tid & 0x80 != 0 || hash_tid & 0x70 == 0 {
-        return false;
+fn smf_dpd_read(data: &[u8], opt_len: usize) -> Option<usize> {
+    let hash_tid = *data.first()?;
+    if hash_tid & 0x80 != 0 {
+        return need(data, opt_len);
     }
-    data.len() < 1 + (hash_tid & 0x0f) as usize + 1
+    let mut n = 1;
+    if hash_tid & 0x70 != 0 {
+        n += (hash_tid & 0x0f) as usize + 1;
+    }
+    need(data, n)
 }
 
 /// tshark 4.6.9 `dissect_opt_apn6` always reads id-type (1) + flags (1) +
 /// param (2), then 4/8/16 more when `apn_id_type` is 1/2/≥3.
-fn apn6_bounds_error(data: &[u8]) -> bool {
-    let Some(&id_type) = data.first() else {
-        return true;
-    };
-    let need = match id_type {
+fn apn6_read(data: &[u8]) -> Option<usize> {
+    let id_type = *data.first()?;
+    let n = match id_type {
         0 => 4,
         1 => 8,
         2 => 12,
         _ => 20,
     };
-    data.len() < need
+    need(data, n)
+}
+
+/// tshark 4.6.9 `dissect_opt_quickstart`: Rate Request/Report consume 6.
+fn quickstart_read(data: &[u8]) -> Option<usize> {
+    let cmd = *data.first()?;
+    match cmd >> 4 {
+        0 | 8 => need(data, 6),
+        _ => Some(0),
+    }
+}
+
+/// tshark 4.6.9 `dissect_opt_ioam` reads 2, then trace/DEX type-specific bytes.
+fn ioam_read(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 {
+        return None;
+    }
+    match data[1] {
+        0 | 1 | 4 => need(data, 10),
+        _ => Some(2),
+    }
 }
 
 /// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type
@@ -1341,5 +1373,27 @@ mod tests {
             walk(&opts_frame_ip(0, 0, &last_tlv(0x08), &ipv4_tso(0x4f, 17))),
             proved(&["10.9.9.9"])
         );
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_jumbo_len0_trailing_0x40_walks_ipip() {
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame(ext, &[0xc2, 0, 0, 0, 0, 0x40])),
+                proved(&["10.9.9.9"]),
+                "ext {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_first_tlv_len0_trailing_0x40_walks_ipip() {
+        for typ in [0x0fu8, 0x13, 0x23, 0x26, 0x30, 0x31, 0x41, 0x63, 0xc9] {
+            assert_eq!(
+                walk(&opts_frame(0, &[typ, 0, 0, 0, 0, 0x40])),
+                proved(&["10.9.9.9"]),
+                "typ {typ:#x}"
+            );
+        }
     }
 }

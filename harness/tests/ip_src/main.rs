@@ -1161,6 +1161,27 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                 )],
             ),
         ),
+        (
+            "ipv6-hopopt-jumbo-len0-0x40",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts_ipip(0, &[0xc2, 0, 0, 0, 0, 0x40])],
+            ),
+        ),
+        (
+            "ipv6-dstopts-jumbo-len0-0x40",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts_ipip(60, &[0xc2, 0, 0, 0, 0, 0x40])],
+            ),
+        ),
+        (
+            "ipv6-hopopt-pdm-len0-0x40",
+            pcap(
+                LINK_ETHERNET,
+                &[ipv6_opts_ipip(0, &[0x0f, 0, 0, 0, 0, 0x40])],
+            ),
+        ),
     ]
 }
 
