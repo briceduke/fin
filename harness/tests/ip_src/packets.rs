@@ -41,10 +41,14 @@ pub fn eth(etype: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn vlan(inner: u16, payload: &[u8]) -> Vec<u8> {
+    vlan_etype(0x8100, inner, payload)
+}
+
+pub fn vlan_etype(outer: u16, inner: u16, payload: &[u8]) -> Vec<u8> {
     let mut tag = Vec::from(0x0001u16.to_be_bytes());
     tag.extend_from_slice(&inner.to_be_bytes());
     tag.extend_from_slice(payload);
-    eth(0x8100, &tag)
+    eth(outer, &tag)
 }
 
 pub fn qinq(payload: &[u8]) -> Vec<u8> {
@@ -133,6 +137,15 @@ pub fn hopopt(next: u8, payload: &[u8]) -> Vec<u8> {
     ext
 }
 
+pub fn ipv6_frag(next: u8, offset: u16, more: bool, id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut hdr = vec![next, 0, 0, 0, 0, 0, 0, 0];
+    let field = (offset << 3) | if more { 1 } else { 0 };
+    hdr[2..4].copy_from_slice(&field.to_be_bytes());
+    hdr[4..8].copy_from_slice(&id.to_be_bytes());
+    hdr.extend_from_slice(payload);
+    hdr
+}
+
 pub fn ah(next: u8, payload: &[u8]) -> Vec<u8> {
     let mut ext = vec![next, 4, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
     ext.extend_from_slice(&[0u8; 12]);
@@ -171,6 +184,12 @@ pub fn icmpv6_error(inner: &[u8]) -> Vec<u8> {
 
 pub fn vxlan(inner_eth: &[u8]) -> Vec<u8> {
     let mut hdr = vec![0x08, 0, 0, 0, 0, 0, 1, 0];
+    hdr.extend_from_slice(inner_eth);
+    hdr
+}
+
+pub fn etherip(inner_eth: &[u8]) -> Vec<u8> {
+    let mut hdr = vec![0x30, 0x00];
     hdr.extend_from_slice(inner_eth);
     hdr
 }

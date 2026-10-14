@@ -2,9 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use reader::ports::{checked_in_decodes, checked_in_heuristics, is_pinned_name};
 
@@ -61,6 +63,7 @@ fn heuristic_dump_matches_tshark_469() {
 fn dump(tshark: &PathBuf, report: &str) -> String {
     let output = Command::new(tshark)
         .args(["-G", report])
+        .env("WIRESHARK_CONFIG_DIR", empty_config_dir())
         .output()
         .unwrap_or_else(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -73,13 +76,26 @@ fn dump(tshark: &PathBuf, report: &str) -> String {
 }
 
 fn version_ok(tshark: &PathBuf) -> bool {
-    let output = Command::new(tshark).arg("--version").output();
+    let output = Command::new(tshark)
+        .arg("--version")
+        .env("WIRESHARK_CONFIG_DIR", empty_config_dir())
+        .output();
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
             .any(|token| token == "4.6.9"),
         Err(_) => false,
     }
+}
+
+fn empty_config_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let path = env::temp_dir().join(format!("fin-tshark-ports-{}", std::process::id()));
+        fs::create_dir_all(&path).expect("empty tshark config dir");
+        path
+    })
+    .clone()
 }
 
 fn first_wins(text: &str) -> BTreeMap<(String, u16), String> {
@@ -94,7 +110,9 @@ fn first_wins(text: &str) -> BTreeMap<(String, u16), String> {
             "tcp.port" => "tcp",
             _ => continue,
         };
-        let Ok(port) = key.parse::<u16>() else { continue };
+        let Ok(port) = key.parse::<u16>() else {
+            continue;
+        };
         map.entry((proto.to_string(), port))
             .or_insert_with(|| name.to_string());
     }

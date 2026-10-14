@@ -62,6 +62,35 @@ fn unknown_field_is_an_error() {
     assert!(stderr.contains("unsupported field"), "{stderr}");
 }
 
+#[test]
+fn claimed_preference_is_accepted() {
+    let fin = fin_bin();
+    let path = work_dir().join("claimed-o.pcap");
+    fs::write(
+        &path,
+        pcap(LINK_ETHERNET, &[eth_ipv4_udp(OUTER, 12345, 9, PAYLOAD)]),
+    )
+    .unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args([
+            "-n",
+            "-T",
+            "fields",
+            "-e",
+            "ip.src",
+            "-o",
+            "tcp.reassemble_out_of_order:TRUE",
+        ])
+        .output()
+        .expect("fin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("unrecognized flag"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "10.0.0.1\n");
+}
+
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
     let mut files = fixed();
     files.extend(truncations());
@@ -75,6 +104,15 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
         0x0800,
         &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
     );
+    let ip_udp = ipv4(OUTER, [10, 255, 255, 1], 17, &udp(12345, 53, PAYLOAD));
+    let icmp_inner = ipv4(EMBED, [10, 1, 1, 1], 17, &udp(1, 2, PAYLOAD));
+    let icmp = icmp_error(&icmp_inner);
+    let icmp_first = icmp[..24].to_vec();
+    let icmp_rest = icmp[24..].to_vec();
+    let icmpv6_inner = ipv6(4, &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)));
+    let icmpv6 = icmpv6_error(&icmpv6_inner);
+    let icmpv6_first = icmpv6[..32].to_vec();
+    let icmpv6_rest = icmpv6[32..].to_vec();
     vec![
         (
             "eth-udp-discard",
@@ -105,6 +143,18 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                     &udp(12345, 53, PAYLOAD),
                 ))],
             ),
+        ),
+        (
+            "vlan-9100",
+            pcap(LINK_ETHERNET, &[vlan_etype(0x9100, 0x0800, &ip_udp)]),
+        ),
+        (
+            "vlan-9200",
+            pcap(LINK_ETHERNET, &[vlan_etype(0x9200, 0x0800, &ip_udp)]),
+        ),
+        (
+            "vlan-9300",
+            pcap(LINK_ETHERNET, &[vlan_etype(0x9300, 0x0800, &ip_udp)]),
         ),
         (
             "sll",
@@ -163,6 +213,42 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         (
+            "icmp-ipip-embed",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        1,
+                        &icmp_error(&ipv4(
+                            INNER,
+                            [10, 1, 1, 1],
+                            4,
+                            &ipv4(EMBED, [10, 2, 2, 2], 17, &udp(9, 9, PAYLOAD)),
+                        )),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "icmp-frag",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth(
+                        0x0800,
+                        &ipv4_frag(OUTER, [10, 255, 255, 1], 1, 42, 0, true, &icmp_first),
+                    ),
+                    eth(
+                        0x0800,
+                        &ipv4_frag(OUTER, [10, 255, 255, 1], 1, 42, 3, false, &icmp_rest),
+                    ),
+                ],
+            ),
+        ),
+        (
             "icmpv6-error",
             pcap(
                 LINK_ETHERNET,
@@ -173,6 +259,16 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                         &icmpv6_error(&ipv4(EMBED, [10, 1, 1, 1], 17, &udp(1, 2, PAYLOAD))),
                     ),
                 )],
+            ),
+        ),
+        (
+            "icmpv6-frag",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth(0x86dd, &ipv6(44, &ipv6_frag(58, 0, true, 1, &icmpv6_first))),
+                    eth(0x86dd, &ipv6(44, &ipv6_frag(58, 4, false, 1, &icmpv6_rest))),
+                ],
             ),
         ),
         (
@@ -188,6 +284,38 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                         &ipv4(INNER, [10, 1, 1, 1], 17, &udp(12345, 53, PAYLOAD)),
                     ),
                 )],
+            ),
+        ),
+        (
+            "ipv4-ah",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        51,
+                        &ah(4, &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD))),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "etherip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(OUTER, [10, 255, 255, 1], 97, &etherip(&inner_eth)),
+                )],
+            ),
+        ),
+        (
+            "unknown-proto",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(0x0800, &ipv4(OUTER, [10, 255, 255, 1], 99, PAYLOAD))],
             ),
         ),
         (
@@ -326,6 +454,7 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         ("arp", pcap(LINK_ETHERNET, &[eth(0x0806, &[0u8; 28])])),
+        ("teb", pcap(LINK_ETHERNET, &[eth(0x6558, &inner_eth)])),
     ]
 }
 

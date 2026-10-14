@@ -80,6 +80,12 @@ fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
                 }
                 ip_src = true;
             }
+            "-o" => {
+                let value = next_str(&mut args, "-o")?;
+                if value != "tcp.reassemble_out_of_order:TRUE" {
+                    return Err(format!("unsupported -o {value}"));
+                }
+            }
             _ => return Err(format!("unrecognized flag {flag}")),
         }
     }

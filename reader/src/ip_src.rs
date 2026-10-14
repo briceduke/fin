@@ -34,6 +34,8 @@ const GRE: u8 = 47;
 const IPIP: u8 = 4;
 const IPV6: u8 = 41;
 const ICMPV6: u8 = 58;
+const ETHERIP: u8 = 97;
+const TEB: u16 = 0x6558;
 const DEPTH: usize = 8;
 
 /// Proved IPv4 sources from one frame, and a count if the walk stopped short.
@@ -179,10 +181,15 @@ impl Walk<'_> {
         match etype {
             0x0800 => self.ipv4(payload),
             0x86dd => self.ipv6(payload),
+            TEB => {
+                if self.nest() {
+                    self.ethernet(payload);
+                }
+            }
             0x8847 | 0x8848 => self.maybe("mpls", payload),
             0x8863 | 0x8864 => self.maybe("pppoe", payload),
             etype if etype <= 1536 => self.maybe("llc", payload),
-            _ => {}
+            _ => self.maybe("ethertype", payload),
         }
     }
 
@@ -243,11 +250,8 @@ impl Walk<'_> {
         offset: u16,
         payload: &[u8],
     ) {
-        if proto == GRE || proto == IPIP || proto == IPV6 {
-            self.count("fragment");
-            return;
-        }
         if proto != UDP {
+            self.count("fragment");
             return;
         }
         let key = Ipv4Frag {
@@ -318,9 +322,7 @@ impl Walk<'_> {
                     next = rest[0];
                     rest = &rest[8..];
                     if more || frag_off != 0 {
-                        if next == GRE || next == IPIP || next == IPV6 || next == UDP {
-                            self.count("fragment");
-                        }
+                        self.count("fragment");
                         return;
                     }
                 }
@@ -349,8 +351,24 @@ impl Walk<'_> {
                 }
             }
             GRE => self.maybe("gre", payload),
+            AH => {
+                let Some((nxt, body)) = take_ah(payload) else {
+                    return;
+                };
+                if self.nest() {
+                    self.ip_proto(nxt, body);
+                }
+            }
+            ETHERIP => {
+                if payload.len() < 2 {
+                    return;
+                }
+                if self.nest() {
+                    self.ethernet(&payload[2..]);
+                }
+            }
             ESP => {}
-            _ => {}
+            _ => self.maybe("ip-proto", payload),
         }
     }
 
@@ -379,11 +397,15 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 4 {
             return;
         }
-        if (bytes[0] & 0x0f) as usize * 4 < IPV4_MIN {
+        let ihl = (bytes[0] & 0x0f) as usize * 4;
+        if ihl < IPV4_MIN {
             return;
         }
         self.values
             .push(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]).to_string());
+        if bytes.len() > ihl {
+            self.count("icmp");
+        }
     }
 
     fn udp(&mut self, bytes: &[u8]) {
@@ -462,7 +484,7 @@ fn udp_ports(bytes: &[u8]) -> Option<(u16, u16)> {
 }
 
 fn is_vlan(etype: u16) -> bool {
-    matches!(etype, 0x8100 | 0x88a8 | 0x9100 | 0x9200 | 0x9300)
+    matches!(etype, 0x8100 | 0x88a8 | 0x9100)
 }
 
 fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
