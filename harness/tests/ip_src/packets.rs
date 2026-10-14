@@ -166,9 +166,13 @@ pub fn ah(next: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn udp(src: u16, dst: u16, payload: &[u8]) -> Vec<u8> {
+    udp_len(src, dst, (8 + payload.len()) as u16, payload)
+}
+
+pub fn udp_len(src: u16, dst: u16, length: u16, payload: &[u8]) -> Vec<u8> {
     let mut hdr = Vec::from(src.to_be_bytes());
     hdr.extend_from_slice(&dst.to_be_bytes());
-    hdr.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    hdr.extend_from_slice(&length.to_be_bytes());
     hdr.extend_from_slice(&[0, 0]);
     hdr.extend_from_slice(payload);
     hdr
@@ -183,7 +187,11 @@ pub fn tcp(src: u16, dst: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn icmp_error(inner: &[u8]) -> Vec<u8> {
-    let mut icmp = vec![3, 0, 0, 0, 0, 0, 0, 0];
+    icmp_type(3, inner)
+}
+
+pub fn icmp_type(typ: u8, inner: &[u8]) -> Vec<u8> {
+    let mut icmp = vec![typ, 0, 0, 0, 0, 0, 0, 0];
     icmp.extend_from_slice(inner);
     icmp
 }

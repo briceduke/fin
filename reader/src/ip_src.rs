@@ -203,6 +203,10 @@ impl Walk<'_> {
         if bytes.len() < IPV4_SRC + 4 {
             return;
         }
+        if bytes[0] >> 4 == 6 {
+            self.ipv6(bytes);
+            return;
+        }
         if bytes[0] >> 4 != 4 {
             return;
         }
@@ -236,7 +240,7 @@ impl Walk<'_> {
             self.ipv4_fragment(src, dst, id, proto, offset, payload);
             return;
         }
-        self.ip_proto(proto, payload);
+        self.ip_proto(proto, payload, false);
     }
 
     fn ipv4_fragment(
@@ -326,19 +330,19 @@ impl Walk<'_> {
                     }
                 }
                 _ => {
-                    self.ip_proto(next, rest);
+                    self.ip_proto(next, rest, true);
                     return;
                 }
             }
         }
     }
 
-    fn ip_proto(&mut self, proto: u8, payload: &[u8]) {
+    fn ip_proto(&mut self, proto: u8, payload: &[u8], over_ipv6: bool) {
         match proto {
             ICMP => self.icmp(payload),
             ICMPV6 => self.icmpv6(payload),
             TCP => self.tcp(payload),
-            UDP => self.udp(payload),
+            UDP => self.udp(payload, over_ipv6),
             IPIP => {
                 if self.nest() {
                     self.ipv4(payload);
@@ -355,7 +359,7 @@ impl Walk<'_> {
                     return;
                 };
                 if self.nest() {
-                    self.ip_proto(nxt, body);
+                    self.ip_proto(nxt, body, over_ipv6);
                 }
             }
             ETHERIP => {
@@ -376,7 +380,12 @@ impl Walk<'_> {
             return;
         }
         if matches!(bytes[0], 3 | 4 | 5 | 11 | 12) {
-            self.embedded_ipv4(&bytes[ICMP_HEADER..]);
+            let mut embed = &bytes[ICMP_HEADER..];
+            if bytes[0] == 5 && !embed.is_empty() {
+                let cap = ((embed[0] & 0x0f) as usize) * 4 + 8;
+                embed = take_len(embed, cap);
+            }
+            self.embedded_ipv4(embed);
         }
     }
 
@@ -393,11 +402,22 @@ impl Walk<'_> {
         if bytes.len() < IPV4_SRC + 4 {
             return;
         }
+        if bytes[0] >> 4 == 6 {
+            self.ipv6(bytes);
+            return;
+        }
         if bytes[0] >> 4 != 4 {
             return;
         }
         let ihl = (bytes[0] & 0x0f) as usize * 4;
         if ihl < IPV4_MIN {
+            return;
+        }
+        let total = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        if total != 0 && total < ihl {
+            if bytes.len() > ihl {
+                self.count("icmp");
+            }
             return;
         }
         self.values
@@ -407,14 +427,22 @@ impl Walk<'_> {
         }
     }
 
-    fn udp(&mut self, bytes: &[u8]) {
+    fn udp(&mut self, bytes: &[u8], over_ipv6: bool) {
         let Some((src, dst)) = udp_ports(bytes) else {
             return;
         };
-        let payload = if bytes.len() > UDP_HEADER {
+        let ulen = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        let rest = if bytes.len() > UDP_HEADER {
             &bytes[UDP_HEADER..]
         } else {
             &[]
+        };
+        let payload = if ulen == 0 && over_ipv6 {
+            rest
+        } else if ulen < UDP_HEADER {
+            return;
+        } else {
+            take_len(rest, ulen - UDP_HEADER)
         };
         if payload.is_empty() {
             return;

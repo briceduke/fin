@@ -125,8 +125,8 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
     let icmp = icmp_error(&icmp_inner);
     let icmp_first = icmp[..24].to_vec();
     let icmp_rest = icmp[24..].to_vec();
-    let icmpv6_inner = ipv6(4, &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)));
-    let icmpv6 = icmpv6_error(&icmpv6_inner);
+    let v6_then_v4 = ipv6(4, &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)));
+    let icmpv6 = icmpv6_error(&v6_then_v4);
     let icmpv6_first = icmpv6[..32].to_vec();
     let icmpv6_rest = icmpv6[32..].to_vec();
     vec![
@@ -531,6 +531,205 @@ fn fixed() -> Vec<(&'static str, Vec<u8>)> {
                         4,
                         0,
                         &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "udp-len-8-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        17,
+                        &udp_len(50000, 4789, 8, &vxlan(&inner_eth)),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "udp-len-0-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        17,
+                        &udp_len(50000, 4789, 0, &vxlan(&inner_eth)),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "udp-len-16-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        17,
+                        &udp_len(50000, 4789, 16, &vxlan(&inner_eth)),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "ipv6-udp-len-8-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6(17, &udp_len(50000, 4789, 8, &vxlan(&inner_eth))),
+                )],
+            ),
+        ),
+        (
+            "ipv6-udp-len-0-vxlan",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x86dd,
+                    &ipv6(17, &udp_len(50000, 4789, 0, &vxlan(&inner_eth))),
+                )],
+            ),
+        ),
+        (
+            "ethertype-ip-as-ipv6",
+            pcap(LINK_ETHERNET, &[eth(0x0800, &v6_then_v4)]),
+        ),
+        (
+            "ipip-ipv6-as-v4",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(0x0800, &ipv4(OUTER, [10, 255, 255, 1], 4, &v6_then_v4))],
+            ),
+        ),
+        (
+            "ipv6-next4-ipv6-ipv4",
+            pcap(LINK_ETHERNET, &[eth(0x86dd, &ipv6(4, &v6_then_v4))]),
+        ),
+        (
+            "vxlan-inner-ip-as-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_udp(
+                    OUTER,
+                    50000,
+                    4789,
+                    &vxlan(&eth(0x0800, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-3-embed-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(OUTER, [10, 255, 255, 1], 1, &icmp_type(3, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-4-embed-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(OUTER, [10, 255, 255, 1], 1, &icmp_type(4, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-11-embed-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(OUTER, [10, 255, 255, 1], 1, &icmp_type(11, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-12-embed-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(OUTER, [10, 255, 255, 1], 1, &icmp_type(12, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-5-embed-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(OUTER, [10, 255, 255, 1], 1, &icmp_type(5, &v6_then_v4)),
+                )],
+            ),
+        ),
+        (
+            "icmp-embed-short-totlen",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        1,
+                        &icmp_type(3, &ipv4_len(EMBED, [10, 255, 255, 1], 17, 10, b"")),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "icmp-embed-short-totlen-ipip",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        1,
+                        &icmp_type(
+                            3,
+                            &ipv4_len(
+                                INNER,
+                                [10, 255, 255, 1],
+                                4,
+                                10,
+                                &ipv4(INNER, [10, 255, 255, 1], 17, &udp(9, 9, PAYLOAD)),
+                            ),
+                        ),
+                    ),
+                )],
+            ),
+        ),
+        (
+            "icmp-embed-zero-totlen",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(
+                    0x0800,
+                    &ipv4(
+                        OUTER,
+                        [10, 255, 255, 1],
+                        1,
+                        &icmp_type(
+                            3,
+                            &ipv4_len(EMBED, [10, 255, 255, 1], 17, 0, &udp(1, 2, PAYLOAD)),
+                        ),
                     ),
                 )],
             ),
