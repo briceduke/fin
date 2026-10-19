@@ -126,12 +126,7 @@ fn captured_length_steps_past_snaplen_and_original_length() {
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 2);
-    assert_frame(
-        &capture.frames[0],
-        &bytes,
-        1,
-        &[0x09, 0x08, 0x07, 0x06],
-    );
+    assert_frame(&capture.frames[0], &bytes, 1, &[0x09, 0x08, 0x07, 0x06]);
     assert_frame(&capture.frames[1], &bytes, 1, &[0xab]);
 }
 
