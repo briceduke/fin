@@ -185,6 +185,37 @@ pub fn two_interface_pcapng() -> Vec<u8> {
     ])
 }
 
+/// LE section, then a BE section whose first EPB is 65536 bytes so
+/// `00 01 00 00` is also a valid LE length 256. Seven 12-byte LE dummy
+/// blocks sit at byte 256 of that EPB so an opening-endian 8-chain
+/// succeeds at the true next offset. File length 131144, so 2/4/8-thread
+/// even splits cut at the crafted EPB.
+pub fn mixed_endian_later_section() -> Vec<u8> {
+    let first = vec![0xAAu8; 65444];
+    let mut file = concat(&[
+        &section_header(Endian::Little),
+        &interface_block(Endian::Little, 1),
+        &enhanced_packet(Endian::Little, 0, &first),
+        &section_header(Endian::Big),
+        &interface_block(Endian::Big, 1),
+    ]);
+    let mut epb = vec![0u8; 65536];
+    epb[0..4].copy_from_slice(&6u32.to_be_bytes());
+    epb[4..8].copy_from_slice(&65536u32.to_be_bytes());
+    epb[20..24].copy_from_slice(&65504u32.to_be_bytes());
+    epb[24..28].copy_from_slice(&65504u32.to_be_bytes());
+    epb[252..256].copy_from_slice(&256u32.to_le_bytes());
+    let dummy = block(Endian::Little, 7, &[]);
+    for i in 0..7 {
+        let at = 256 + i * 12;
+        epb[at..at + 12].copy_from_slice(&dummy);
+    }
+    epb[65532..65536].copy_from_slice(&65536u32.to_be_bytes());
+    file.extend_from_slice(&epb);
+    file.extend_from_slice(&enhanced_packet(Endian::Big, 0, &[0x01]));
+    file
+}
+
 fn u16_bytes(value: u16, big: bool) -> [u8; 2] {
     if big {
         value.to_be_bytes()

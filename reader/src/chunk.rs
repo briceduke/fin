@@ -251,6 +251,8 @@ struct NgPiece {
     from: usize,
     start: Option<usize>,
     stop: usize,
+    /// Endian used to hop from `start` before any SHB switch.
+    start_endian: bool,
     hops: Vec<(usize, Hop)>,
     fault: Option<Fault>,
     after_packet: bool,
@@ -291,6 +293,7 @@ fn ng_piece(
                     from,
                     start: None,
                     stop: from,
+                    start_endian: file_endian,
                     hops: Vec::new(),
                     fault: None,
                     after_packet: false,
@@ -298,6 +301,7 @@ fn ng_piece(
             }
         }
     };
+    let endian_at_start = endian;
     let mut hops = Vec::new();
     let mut offset = start;
     if start == 0 {
@@ -332,6 +336,7 @@ fn ng_piece(
         from,
         start: Some(start),
         stop: offset,
+        start_endian: endian_at_start,
         hops,
         fault,
         after_packet,
@@ -384,6 +389,7 @@ fn merge_pcapng(bytes: &[u8], pieces: Vec<NgPiece>, endian: bool) -> Chunked<'_>
     let chunks = pieces.len();
     let seams = chunks.saturating_sub(1);
     let mut pos = 0;
+    let mut endian_at_pos = endian;
     let mut hops = Vec::new();
     let mut proved = 0;
     let mut hop_fault = None;
@@ -399,8 +405,21 @@ fn merge_pcapng(bytes: &[u8], pieces: Vec<NgPiece>, endian: bool) -> Chunked<'_>
                 if start != pos {
                     return fallback(bytes, chunks, seams, proved);
                 }
+                // Offset abutment is not enough: `00 01 00 00` is 65536 BE and
+                // 256 LE. A later section that switched endian can still hop
+                // from the true next byte with the opening endian.
+                let starts_with_shb = piece
+                    .hops
+                    .first()
+                    .is_some_and(|(_, hop)| hop.block_type == pcapng::SHB_TYPE);
+                if index > 0 && !starts_with_shb && piece.start_endian != endian_at_pos {
+                    return fallback(bytes, chunks, seams, proved);
+                }
                 if index > 0 {
                     proved += 1;
+                }
+                if let Some((_, last)) = piece.hops.last() {
+                    endian_at_pos = last.endian;
                 }
                 hops.extend(piece.hops);
                 pos = piece.stop;

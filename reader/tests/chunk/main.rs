@@ -90,6 +90,7 @@ fn corpus() -> Vec<(String, Vec<u8>)> {
     files.push(("pcapng-be-8".into(), many_pcapng(Endian::Big, 8)));
     files.push(("pcapng-two-section".into(), two_section_pcapng()));
     files.push(("pcapng-two-iface".into(), two_interface_pcapng()));
+    files.push(("pcapng-mixed-endian".into(), mixed_endian_later_section()));
     files.push((
         "pcapng-mixed-blocks".into(),
         concat(&[
@@ -345,6 +346,36 @@ fn pcapng_faults_match_sequential() {
     ];
     for (name, bytes) in files {
         assert_chunked_matches(&bytes, name);
+    }
+}
+
+#[test]
+fn later_section_endian_switch_does_not_emit_different_frames() {
+    let bytes = mixed_endian_later_section();
+    assert_eq!(bytes.len(), 131_144);
+    let sequential = read_capture(&bytes);
+    assert_eq!(sequential.fault, None);
+    assert_eq!(sequential.frames.len(), 3);
+    assert_eq!(sequential.frames[0].captured.len(), 65444);
+    assert_eq!(sequential.frames[1].captured.len(), 65504);
+    assert_eq!(sequential.frames[2].captured, &[0x01]);
+    for &threads in &[2usize, 4, 8] {
+        let chunked = read_capture_seams(
+            &bytes,
+            &(1..threads)
+                .map(|i| i * bytes.len() / threads)
+                .collect::<Vec<_>>(),
+        );
+        assert_same(
+            &bytes,
+            &sequential,
+            &chunked.capture,
+            &format!("mixed-endian threads={threads}"),
+        );
+        let (seq_rows, seq_counted) = ip_src_view(&sequential.frames);
+        let (chunk_rows, chunk_counted) = ip_src_view(&chunked.capture.frames);
+        assert_eq!(seq_rows, chunk_rows);
+        assert_eq!(seq_counted, chunk_counted);
     }
 }
 
