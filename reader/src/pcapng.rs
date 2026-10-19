@@ -2,7 +2,7 @@ use crate::options;
 use crate::{BlockKind, Capture, CaptureKind, Fault, Frame, MAX_BLOCK_SIZE, MAX_CAPTURED_LENGTH};
 
 const SHB_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
-const SHB_TYPE: u32 = 0x0A0D0D0A;
+pub(crate) const SHB_TYPE: u32 = 0x0A0D0D0A;
 const SHB_MIN: u32 = 28;
 const BLOCK_MIN: u32 = 12;
 const IDB_TYPE: u32 = 1;
@@ -36,9 +36,26 @@ const BLOCKS: &[(u32, bool)] = &[
     (CB_NO_COPY, true),
 ];
 
-struct Interface {
-    link_type: u32,
-    snaplen: u32,
+#[derive(Clone)]
+pub(crate) struct Interface {
+    pub link_type: u32,
+    pub snaplen: u32,
+}
+
+/// One pcapng block header: type, padded total, and the endian used to read it.
+#[derive(Clone, Copy)]
+pub(crate) struct Hop {
+    pub block_type: u32,
+    pub total: usize,
+    pub endian: bool,
+}
+
+/// Section endian and interfaces, cloned at each proved chunk start.
+#[derive(Clone)]
+pub(crate) struct NgState {
+    pub endian: bool,
+    pub interfaces: Vec<Interface>,
+    pub after_packet: bool,
 }
 
 struct Packet {
@@ -54,7 +71,7 @@ pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
     }
 }
 
-fn open_section(bytes: &[u8]) -> Result<(bool, usize), Fault> {
+pub(crate) fn open_section(bytes: &[u8]) -> Result<(bool, usize), Fault> {
     if bytes.len() < SHB_MIN as usize || bytes[..4] != SHB_MAGIC {
         return Err(Fault::NotACaptureFile);
     }
@@ -112,14 +129,24 @@ fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Captu
     Capture::ok(frames)
 }
 
-fn is_packet(block_type: u32) -> bool {
+pub(crate) fn is_packet(block_type: u32) -> bool {
     BLOCKS
         .iter()
         .any(|&(id, packet)| id == block_type && packet)
 }
 
-fn packet_type_at(bytes: &[u8], offset: usize, big_endian: bool) -> bool {
+pub(crate) fn packet_type_at(bytes: &[u8], offset: usize, big_endian: bool) -> bool {
     bytes.len() - offset >= 8 && is_packet(u32_at(bytes, offset, big_endian))
+}
+
+/// Hop one block at `offset` using `big_endian`, switching endian on an SHB.
+pub(crate) fn hop(bytes: &[u8], offset: usize, big_endian: bool) -> Result<Hop, Fault> {
+    let (block_type, total, endian) = block_at(bytes, offset, big_endian)?;
+    Ok(Hop {
+        block_type,
+        total,
+        endian,
+    })
 }
 
 fn block_at(bytes: &[u8], offset: usize, big_endian: bool) -> Result<(u32, usize, bool), Fault> {
@@ -179,7 +206,7 @@ fn block_total(
     Ok(total)
 }
 
-fn consume<'a>(
+pub(crate) fn consume<'a>(
     bytes: &'a [u8],
     offset: usize,
     total: usize,
@@ -534,5 +561,38 @@ fn u32_at(bytes: &[u8], offset: usize, big_endian: bool) -> u32 {
         u32::from_be_bytes(raw)
     } else {
         u32::from_le_bytes(raw)
+    }
+}
+
+impl NgState {
+    pub(crate) fn new(endian: bool) -> Self {
+        Self {
+            endian,
+            interfaces: Vec::new(),
+            after_packet: false,
+        }
+    }
+
+    /// Apply one hopped block. Packet-like types set `after_packet` before consume.
+    pub(crate) fn apply<'a>(
+        &mut self,
+        bytes: &'a [u8],
+        offset: usize,
+        hop: Hop,
+        frames: &mut Vec<Frame<'a>>,
+    ) -> Result<(), Fault> {
+        self.endian = hop.endian;
+        if is_packet(hop.block_type) {
+            self.after_packet = true;
+        }
+        consume(
+            bytes,
+            offset,
+            hop.total,
+            hop.block_type,
+            hop.endian,
+            &mut self.interfaces,
+            frames,
+        )
     }
 }
