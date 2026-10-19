@@ -63,6 +63,36 @@ fn unknown_field_is_an_error() {
 }
 
 #[test]
+fn stdin_matches_the_file_path() {
+    let fin = fin_bin();
+    let path = work_dir().join("stdin-vs-file.pcap");
+    let mut packets = Vec::new();
+    for i in 0..16 {
+        packets.push(eth_ipv4_udp(
+            OUTER,
+            12345,
+            9,
+            &[i, b'f', b'i', b'n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ));
+    }
+    fs::write(&path, pcap(LINK_ETHERNET, &packets)).unwrap();
+    let file = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .output()
+        .expect("fin file");
+    let stdin = Command::new(&fin)
+        .args(["-r", "-", "-n", "-T", "fields", "-e", "ip.src"])
+        .stdin(fs::File::open(&path).unwrap())
+        .output()
+        .expect("fin stdin");
+    assert_eq!(file.stdout, stdin.stdout, "stdout");
+    assert_eq!(file.stderr, stdin.stderr, "stderr");
+    assert_eq!(file.status.code(), stdin.status.code());
+}
+
+#[test]
 fn claimed_preference_is_accepted() {
     let fin = fin_bin();
     let path = work_dir().join("claimed-o.pcap");

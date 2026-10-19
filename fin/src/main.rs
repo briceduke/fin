@@ -2,11 +2,14 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::thread;
 
-use reader::{read_capture, IpSrc};
+use memmap2::Mmap;
+use reader::{read_capture, read_capture_chunked, IpSrc};
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
@@ -21,8 +24,25 @@ fn main() -> ExitCode {
 fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
     let args = parse(args)?;
     let path = args.file.ok_or_else(|| "missing -r".to_string())?;
-    let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let capture = read_capture(&bytes);
+    if path.as_os_str() == "-" {
+        let mut bytes = Vec::new();
+        io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("stdin: {error}"))?;
+        return emit("stdin", read_capture(&bytes));
+    }
+    let file = File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    // Capture files are not written while fin reads them.
+    let mapped =
+        unsafe { Mmap::map(&file) }.map_err(|error| format!("{}: {error}", path.display()))?;
+    let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    emit(
+        &path.display().to_string(),
+        read_capture_chunked(&mapped, threads),
+    )
+}
+
+fn emit(name: &str, capture: reader::Capture<'_>) -> Result<i32, String> {
     let mut ip_src = IpSrc::new();
     let mut counted = Vec::new();
     for (index, frame) in capture.frames.iter().enumerate() {
@@ -37,7 +57,7 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
     }
     eprintln!("total {}", counted.len());
     if let Some(fault) = capture.fault {
-        eprintln!("fin: {}: {}", path.display(), fault.phrase());
+        eprintln!("fin: {name}: {}", fault.phrase());
         return Ok(capture.exit_code());
     }
     if counted.is_empty() {
