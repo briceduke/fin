@@ -33,12 +33,28 @@ pub fn concat(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-pub fn pad4(bytes: &[u8]) -> Vec<u8> {
+fn pad4(bytes: &[u8]) -> Vec<u8> {
     let mut padded = bytes.to_vec();
     while padded.len() % 4 != 0 {
         padded.push(0);
     }
     padded
+}
+
+fn u16_bytes(value: u16, big: bool) -> [u8; 2] {
+    if big {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    }
+}
+
+fn u32_bytes(value: u32, big: bool) -> [u8; 4] {
+    if big {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    }
 }
 
 pub fn pcap_header(magic: [u8; 4], link_type: u32) -> Vec<u8> {
@@ -52,7 +68,7 @@ pub fn pcap_header(magic: [u8; 4], link_type: u32) -> Vec<u8> {
     file
 }
 
-pub fn push_pcap_packet(file: &mut Vec<u8>, body: &[u8]) {
+fn push_pcap_packet(file: &mut Vec<u8>, body: &[u8]) {
     let big = file[0] == 0xa1;
     file.extend_from_slice(&u32_bytes(1, big));
     file.extend_from_slice(&u32_bytes(0, big));
@@ -82,11 +98,15 @@ pub fn eth_ipv4_udp(src: [u8; 4], n: u8) -> Vec<u8> {
 }
 
 pub fn many_pcap(count: usize) -> Vec<u8> {
+    many_pcap_with(LE_USEC, count)
+}
+
+pub fn many_pcap_with(magic: [u8; 4], count: usize) -> Vec<u8> {
     let packets: Vec<Vec<u8>> = (0..count)
         .map(|i| eth_ipv4_udp([10, 0, 0, 1], i as u8))
         .collect();
     let refs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
-    pcap_file(LE_USEC, &refs)
+    pcap_file(magic, &refs)
 }
 
 pub fn section_header(endian: Endian) -> Vec<u8> {
@@ -102,15 +122,10 @@ pub fn section_header(endian: Endian) -> Vec<u8> {
     ])
 }
 
-pub fn block(endian: Endian, block_type: u32, body: &[u8]) -> Vec<u8> {
+fn block(endian: Endian, block_type: u32, body: &[u8]) -> Vec<u8> {
     let padded = pad4(body);
     let total = pack_u32((12 + padded.len()) as u32, endian);
-    concat(&[
-        &pack_u32(block_type, endian),
-        &total,
-        &padded,
-        &total,
-    ])
+    concat(&[&pack_u32(block_type, endian), &total, &padded, &total])
 }
 
 pub fn interface_block(endian: Endian, link_type: u16) -> Vec<u8> {
@@ -134,24 +149,6 @@ pub fn enhanced_packet(endian: Endian, interface_id: u32, packet: &[u8]) -> Vec<
     block(endian, 6, &body)
 }
 
-pub fn simple_packet(endian: Endian, packet: &[u8]) -> Vec<u8> {
-    let body = concat(&[&pack_u32(packet.len() as u32, endian), &pad4(packet)]);
-    block(endian, 3, &body)
-}
-
-pub fn obsolete_packet(endian: Endian, packet: &[u8]) -> Vec<u8> {
-    let body = concat(&[
-        &pack_u16(0, endian),
-        &pack_u16(0, endian),
-        &pack_u32(0, endian),
-        &pack_u32(0, endian),
-        &pack_u32(packet.len() as u32, endian),
-        &pack_u32(packet.len() as u32, endian),
-        &pad4(packet),
-    ]);
-    block(endian, 2, &body)
-}
-
 pub fn many_pcapng(endian: Endian, count: usize) -> Vec<u8> {
     let mut parts = vec![section_header(endian), interface_block(endian, 1)];
     let packets: Vec<Vec<u8>> = (0..count)
@@ -162,72 +159,4 @@ pub fn many_pcapng(endian: Endian, count: usize) -> Vec<u8> {
     }
     let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
     concat(&refs)
-}
-
-pub fn two_section_pcapng() -> Vec<u8> {
-    concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1),
-        &enhanced_packet(Endian::Little, 0, &[0x01]),
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 276),
-        &enhanced_packet(Endian::Little, 0, &[0x02, 0x03]),
-    ])
-}
-
-pub fn two_interface_pcapng() -> Vec<u8> {
-    concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1),
-        &interface_block(Endian::Little, 113),
-        &enhanced_packet(Endian::Little, 0, &[0xaa]),
-        &enhanced_packet(Endian::Little, 1, &[0xbb, 0xcc]),
-    ])
-}
-
-/// LE section, then a BE section whose first EPB is 65536 bytes so
-/// `00 01 00 00` is also a valid LE length 256. Seven 12-byte LE dummy
-/// blocks sit at byte 256 of that EPB so an opening-endian 8-chain
-/// succeeds at the true next offset. File length 131144, so 2/4/8-thread
-/// even splits cut at the crafted EPB.
-pub fn mixed_endian_later_section() -> Vec<u8> {
-    let first = vec![0xAAu8; 65444];
-    let mut file = concat(&[
-        &section_header(Endian::Little),
-        &interface_block(Endian::Little, 1),
-        &enhanced_packet(Endian::Little, 0, &first),
-        &section_header(Endian::Big),
-        &interface_block(Endian::Big, 1),
-    ]);
-    let mut epb = vec![0u8; 65536];
-    epb[0..4].copy_from_slice(&6u32.to_be_bytes());
-    epb[4..8].copy_from_slice(&65536u32.to_be_bytes());
-    epb[20..24].copy_from_slice(&65504u32.to_be_bytes());
-    epb[24..28].copy_from_slice(&65504u32.to_be_bytes());
-    epb[252..256].copy_from_slice(&256u32.to_le_bytes());
-    let dummy = block(Endian::Little, 7, &[]);
-    for i in 0..7 {
-        let at = 256 + i * 12;
-        epb[at..at + 12].copy_from_slice(&dummy);
-    }
-    epb[65532..65536].copy_from_slice(&65536u32.to_be_bytes());
-    file.extend_from_slice(&epb);
-    file.extend_from_slice(&enhanced_packet(Endian::Big, 0, &[0x01]));
-    file
-}
-
-fn u16_bytes(value: u16, big: bool) -> [u8; 2] {
-    if big {
-        value.to_be_bytes()
-    } else {
-        value.to_le_bytes()
-    }
-}
-
-fn u32_bytes(value: u32, big: bool) -> [u8; 4] {
-    if big {
-        value.to_be_bytes()
-    } else {
-        value.to_le_bytes()
-    }
 }

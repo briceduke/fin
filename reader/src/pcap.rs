@@ -4,7 +4,7 @@ pub(crate) const HEADER_LEN: usize = 24;
 const RECORD_LEN: usize = 16;
 
 #[derive(Clone, Copy)]
-pub(crate) enum Lengths {
+enum Lengths {
     NotSwapped,
     Swapped,
     MaybeSwapped,
@@ -12,9 +12,9 @@ pub(crate) enum Lengths {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Layout {
-    pub big_endian: bool,
-    pub link_type: u32,
-    pub lengths: Lengths,
+    big_endian: bool,
+    link_type: u32,
+    lengths: Lengths,
 }
 
 pub(crate) fn read(bytes: &[u8]) -> Capture<'_> {

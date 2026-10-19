@@ -1,87 +1,43 @@
-//! Split a mapped capture across cores.
+//! Split a mapped classic pcap across cores.
 //!
-//! Each core nominates a start with an 8-record (pcap) or 8-block (pcapng)
-//! chain. A start is proved only when it is the byte where the previous
-//! chunk stopped. A seam that does not prove is reread by [`read_capture`].
+//! Each core nominates a start with an 8-record chain. A start is proved only
+//! when it is the byte where the previous chunk stopped. A seam that does not
+//! prove is reread by [`read_capture`]. pcapng uses [`read_capture`].
 
 use std::thread;
 
 use crate::pcap::{self, Layout};
-use crate::pcapng::{self, Hop, NgState};
-use crate::{read_capture, Capture, Fault, Frame, PCAPNG_MAGIC, PCAP_MAGICS};
+use crate::{read_capture, Capture, Fault, Frame, PCAP_MAGICS};
 
-/// Consecutive records or blocks a nominated start must hop.
-pub const CHAIN: usize = 8;
-
-/// How the split went. `fallback` means [`read_capture`] produced the frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkReport {
-    pub chunks: usize,
-    pub seams: usize,
-    pub proved: usize,
-    pub fallback: bool,
-}
-
-/// Frames plus whether every seam proved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunked<'a> {
-    pub capture: Capture<'a>,
-    pub report: ChunkReport,
-}
+const CHAIN: usize = 8;
 
 /// Split `bytes` into `threads` ranges and read them in parallel.
 pub fn read_capture_chunked(bytes: &[u8], threads: usize) -> Capture<'_> {
-    read_chunks(bytes, &ranges(bytes.len(), threads.max(1))).capture
+    read_chunks(bytes, &ranges(bytes.len(), threads.max(1))).0
 }
 
 /// Split at explicit interior byte offsets. Used to force awkward seams.
-pub fn read_capture_seams<'a>(bytes: &'a [u8], seams: &[usize]) -> Chunked<'a> {
+/// The bool is whether [`read_capture`] produced the frames.
+pub fn read_capture_seams<'a>(bytes: &'a [u8], seams: &[usize]) -> (Capture<'a>, bool) {
     read_chunks(bytes, &ranges_from_seams(bytes.len(), seams))
 }
 
-pub(crate) fn read_chunks<'a>(bytes: &'a [u8], ranges: &[(usize, usize)]) -> Chunked<'a> {
-    let ranges = if ranges.is_empty() {
-        vec![(0, bytes.len())]
-    } else {
-        ranges.to_vec()
-    };
-    if bytes.len() >= 4 && bytes[..4] == PCAPNG_MAGIC {
-        return match pcapng::open_section(bytes) {
-            Ok((endian, first_end)) => pcapng_chunks(bytes, &ranges, endian, first_end),
-            Err(_) => sequential(bytes, 1, 0),
-        };
+fn read_chunks<'a>(bytes: &'a [u8], ranges: &[(usize, usize)]) -> (Capture<'a>, bool) {
+    if ranges.len() <= 1 || !is_pcap(bytes) {
+        return (read_capture(bytes), false);
     }
-    if bytes.len() >= 4 && PCAP_MAGICS.iter().any(|magic| bytes.starts_with(magic)) {
-        return match pcap::open(bytes) {
-            Ok(layout) => pcap_chunks(bytes, &ranges, layout),
-            Err(_) => sequential(bytes, 1, 0),
-        };
-    }
-    sequential(bytes, 1, 0)
-}
-
-fn sequential(bytes: &[u8], chunks: usize, seams: usize) -> Chunked<'_> {
-    Chunked {
-        capture: read_capture(bytes),
-        report: ChunkReport {
-            chunks,
-            seams,
-            proved: 0,
-            fallback: false,
-        },
+    match pcap::open(bytes) {
+        Ok(layout) => pcap_chunks(bytes, ranges, layout),
+        Err(_) => (read_capture(bytes), false),
     }
 }
 
-fn fallback(bytes: &[u8], chunks: usize, seams: usize, proved: usize) -> Chunked<'_> {
-    Chunked {
-        capture: read_capture(bytes),
-        report: ChunkReport {
-            chunks,
-            seams,
-            proved,
-            fallback: true,
-        },
-    }
+fn is_pcap(bytes: &[u8]) -> bool {
+    PCAP_MAGICS.iter().any(|magic| bytes.starts_with(magic))
+}
+
+fn fallback(bytes: &[u8]) -> (Capture<'_>, bool) {
+    (read_capture(bytes), true)
 }
 
 fn ranges(len: usize, threads: usize) -> Vec<(usize, usize)> {
@@ -111,7 +67,7 @@ fn ranges_from_seams(len: usize, seams: &[usize]) -> Vec<(usize, usize)> {
     points.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
-struct PcapPiece<'a> {
+struct Piece<'a> {
     from: usize,
     start: Option<usize>,
     stop: usize,
@@ -119,29 +75,33 @@ struct PcapPiece<'a> {
     fault: Option<Fault>,
 }
 
-fn pcap_chunks<'a>(bytes: &'a [u8], ranges: &[(usize, usize)], layout: Layout) -> Chunked<'a> {
-    let pieces: Vec<PcapPiece<'a>> = thread::scope(|scope| {
+fn pcap_chunks<'a>(
+    bytes: &'a [u8],
+    ranges: &[(usize, usize)],
+    layout: Layout,
+) -> (Capture<'a>, bool) {
+    let pieces: Vec<Piece<'a>> = thread::scope(|scope| {
         let handles: Vec<_> = ranges
             .iter()
-            .map(|&(from, end)| scope.spawn(move || pcap_piece(bytes, from, end, layout)))
+            .map(|&(from, end)| scope.spawn(move || piece(bytes, from, end, layout)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    merge_pcap(bytes, pieces)
+    merge(bytes, pieces)
 }
 
-fn pcap_piece(bytes: &[u8], from: usize, end: usize, layout: Layout) -> PcapPiece<'_> {
+fn piece(bytes: &[u8], from: usize, end: usize, layout: Layout) -> Piece<'_> {
     let body = pcap::HEADER_LEN;
     let start = if from <= body && end > body && bytes.len() > body {
         body
     } else {
-        match scan_pcap(bytes, from.max(body), end, layout) {
+        match scan(bytes, from.max(body), end, layout) {
             Some(start) if start < end => start,
             _ => {
-                return PcapPiece {
+                return Piece {
                     from,
                     start: None,
-                    stop: from.max(body),
+                    stop: 0,
                     frames: Vec::new(),
                     fault: None,
                 }
@@ -163,7 +123,7 @@ fn pcap_piece(bytes: &[u8], from: usize, end: usize, layout: Layout) -> PcapPiec
             }
         }
     }
-    PcapPiece {
+    Piece {
         from,
         start: Some(start),
         stop: offset,
@@ -172,10 +132,10 @@ fn pcap_piece(bytes: &[u8], from: usize, end: usize, layout: Layout) -> PcapPiec
     }
 }
 
-fn scan_pcap(bytes: &[u8], from: usize, end: usize, layout: Layout) -> Option<usize> {
+fn scan(bytes: &[u8], from: usize, end: usize, layout: Layout) -> Option<usize> {
     let mut offset = from;
     while offset < end && offset < bytes.len() {
-        if pcap_chain(bytes, offset, layout) {
+        if chain(bytes, offset, layout) {
             return Some(offset);
         }
         offset += 1;
@@ -183,7 +143,7 @@ fn scan_pcap(bytes: &[u8], from: usize, end: usize, layout: Layout) -> Option<us
     None
 }
 
-fn pcap_chain(bytes: &[u8], mut offset: usize, layout: Layout) -> bool {
+fn chain(bytes: &[u8], mut offset: usize, layout: Layout) -> bool {
     let mut count = 0;
     while count < CHAIN && offset < bytes.len() {
         match pcap::record_at(bytes, offset, layout) {
@@ -197,32 +157,24 @@ fn pcap_chain(bytes: &[u8], mut offset: usize, layout: Layout) -> bool {
     count > 0 && (count == CHAIN || offset == bytes.len())
 }
 
-fn merge_pcap<'a>(bytes: &'a [u8], pieces: Vec<PcapPiece<'a>>) -> Chunked<'a> {
-    let chunks = pieces.len();
-    let seams = chunks.saturating_sub(1);
+fn merge<'a>(bytes: &'a [u8], pieces: Vec<Piece<'a>>) -> (Capture<'a>, bool) {
     let mut pos = pcap::HEADER_LEN;
     let mut frames = Vec::new();
-    let mut proved = 0;
     let mut fault = None;
-    let mut after_packet = false;
-    for (index, mut piece) in pieces.into_iter().enumerate() {
+    for mut piece in pieces {
         match piece.start {
             None => {
-                if pos < piece.from && piece.from < bytes.len() && piece.from > pcap::HEADER_LEN {
-                    return fallback(bytes, chunks, seams, proved);
+                if pos < piece.from {
+                    return fallback(bytes);
                 }
             }
             Some(start) => {
                 if start != pos {
-                    return fallback(bytes, chunks, seams, proved);
-                }
-                if index > 0 {
-                    proved += 1;
+                    return fallback(bytes);
                 }
                 frames.append(&mut piece.frames);
                 pos = piece.stop;
                 if piece.fault.is_some() {
-                    after_packet = true;
                     fault = piece.fault;
                     break;
                 }
@@ -230,238 +182,11 @@ fn merge_pcap<'a>(bytes: &'a [u8], pieces: Vec<PcapPiece<'a>>) -> Chunked<'a> {
         }
     }
     if fault.is_none() && pos != bytes.len() {
-        return fallback(bytes, chunks, seams, proved);
+        return fallback(bytes);
     }
     let capture = match fault {
         None => Capture::ok(frames),
-        Some(err) => Capture::halt(frames, err, after_packet),
+        Some(err) => Capture::halt(frames, err, true),
     };
-    Chunked {
-        capture,
-        report: ChunkReport {
-            chunks,
-            seams,
-            proved,
-            fallback: false,
-        },
-    }
-}
-
-struct NgPiece {
-    from: usize,
-    start: Option<usize>,
-    stop: usize,
-    /// Endian used to hop from `start` before any SHB switch.
-    start_endian: bool,
-    hops: Vec<(usize, Hop)>,
-    fault: Option<Fault>,
-    after_packet: bool,
-}
-
-fn pcapng_chunks<'a>(
-    bytes: &'a [u8],
-    ranges: &[(usize, usize)],
-    endian: bool,
-    first_end: usize,
-) -> Chunked<'a> {
-    let pieces: Vec<NgPiece> = thread::scope(|scope| {
-        let handles: Vec<_> = ranges
-            .iter()
-            .map(|&(from, end)| {
-                scope.spawn(move || ng_piece(bytes, from, end, endian, first_end))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    merge_pcapng(bytes, pieces, endian)
-}
-
-fn ng_piece(
-    bytes: &[u8],
-    from: usize,
-    end: usize,
-    file_endian: bool,
-    first_end: usize,
-) -> NgPiece {
-    let (start, mut endian) = if from == 0 {
-        (0, file_endian)
-    } else {
-        match scan_pcapng(bytes, from, end, file_endian) {
-            Some((start, endian)) if start < end => (start, endian),
-            _ => {
-                return NgPiece {
-                    from,
-                    start: None,
-                    stop: from,
-                    start_endian: file_endian,
-                    hops: Vec::new(),
-                    fault: None,
-                    after_packet: false,
-                }
-            }
-        }
-    };
-    let endian_at_start = endian;
-    let mut hops = Vec::new();
-    let mut offset = start;
-    if start == 0 {
-        hops.push((
-            0,
-            Hop {
-                block_type: pcapng::SHB_TYPE,
-                total: first_end,
-                endian: file_endian,
-            },
-        ));
-        offset = first_end;
-        endian = file_endian;
-    }
-    let mut fault = None;
-    let mut after_packet = false;
-    while offset < end && offset < bytes.len() {
-        match pcapng::hop(bytes, offset, endian) {
-            Ok(hop) => {
-                endian = hop.endian;
-                offset += hop.total;
-                hops.push((offset - hop.total, hop));
-            }
-            Err(err) => {
-                after_packet = pcapng::packet_type_at(bytes, offset, endian);
-                fault = Some(err);
-                break;
-            }
-        }
-    }
-    NgPiece {
-        from,
-        start: Some(start),
-        stop: offset,
-        start_endian: endian_at_start,
-        hops,
-        fault,
-        after_packet,
-    }
-}
-
-fn scan_pcapng(bytes: &[u8], from: usize, end: usize, file_endian: bool) -> Option<(usize, bool)> {
-    let mut offset = from;
-    if offset % 4 != 0 {
-        if let Some(endian) = ng_chain_endian(bytes, offset, file_endian) {
-            return Some((offset, endian));
-        }
-        offset = offset.next_multiple_of(4);
-    }
-    while offset < end && offset < bytes.len() {
-        if let Some(endian) = ng_chain_endian(bytes, offset, file_endian) {
-            return Some((offset, endian));
-        }
-        offset += 4;
-    }
-    None
-}
-
-fn ng_chain_endian(bytes: &[u8], offset: usize, file_endian: bool) -> Option<bool> {
-    if ng_chain(bytes, offset, file_endian) {
-        Some(file_endian)
-    } else if ng_chain(bytes, offset, !file_endian) {
-        Some(!file_endian)
-    } else {
-        None
-    }
-}
-
-fn ng_chain(bytes: &[u8], mut offset: usize, mut endian: bool) -> bool {
-    let mut count = 0;
-    while count < CHAIN && offset < bytes.len() {
-        match pcapng::hop(bytes, offset, endian) {
-            Ok(hop) if hop.total > 0 => {
-                endian = hop.endian;
-                offset += hop.total;
-                count += 1;
-            }
-            _ => return false,
-        }
-    }
-    count > 0 && (count == CHAIN || offset == bytes.len())
-}
-
-fn merge_pcapng(bytes: &[u8], pieces: Vec<NgPiece>, endian: bool) -> Chunked<'_> {
-    let chunks = pieces.len();
-    let seams = chunks.saturating_sub(1);
-    let mut pos = 0;
-    let mut endian_at_pos = endian;
-    let mut hops = Vec::new();
-    let mut proved = 0;
-    let mut hop_fault = None;
-    let mut hop_after = false;
-    for (index, piece) in pieces.into_iter().enumerate() {
-        match piece.start {
-            None => {
-                if pos < piece.from && piece.from < bytes.len() {
-                    return fallback(bytes, chunks, seams, proved);
-                }
-            }
-            Some(start) => {
-                if start != pos {
-                    return fallback(bytes, chunks, seams, proved);
-                }
-                // Offset abutment is not enough: `00 01 00 00` is 65536 BE and
-                // 256 LE. A later section that switched endian can still hop
-                // from the true next byte with the opening endian.
-                let starts_with_shb = piece
-                    .hops
-                    .first()
-                    .is_some_and(|(_, hop)| hop.block_type == pcapng::SHB_TYPE);
-                if index > 0 && !starts_with_shb && piece.start_endian != endian_at_pos {
-                    return fallback(bytes, chunks, seams, proved);
-                }
-                if index > 0 {
-                    proved += 1;
-                }
-                if let Some((_, last)) = piece.hops.last() {
-                    endian_at_pos = last.endian;
-                }
-                hops.extend(piece.hops);
-                pos = piece.stop;
-                if let Some(err) = piece.fault {
-                    hop_fault = Some(err);
-                    hop_after = piece.after_packet;
-                    break;
-                }
-            }
-        }
-    }
-    if hop_fault.is_none() && pos != bytes.len() {
-        return fallback(bytes, chunks, seams, proved);
-    }
-    let capture = peel_pcapng(bytes, &hops, endian, hop_fault, hop_after);
-    Chunked {
-        capture,
-        report: ChunkReport {
-            chunks,
-            seams,
-            proved,
-            fallback: false,
-        },
-    }
-}
-
-fn peel_pcapng<'a>(
-    bytes: &'a [u8],
-    hops: &[(usize, Hop)],
-    endian: bool,
-    hop_fault: Option<Fault>,
-    hop_after: bool,
-) -> Capture<'a> {
-    let mut state = NgState::new(endian);
-    let mut frames = Vec::new();
-    for &(offset, hop) in hops {
-        if let Err(fault) = state.apply(bytes, offset, hop, &mut frames) {
-            return Capture::halt(frames, fault, state.after_packet);
-        }
-    }
-    match hop_fault {
-        None => Capture::ok(frames),
-        Some(fault) => Capture::halt(frames, fault, state.after_packet || hop_after),
-    }
+    (capture, false)
 }
