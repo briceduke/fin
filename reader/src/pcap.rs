@@ -4,7 +4,7 @@ pub(crate) const HEADER_LEN: usize = 24;
 const RECORD_LEN: usize = 16;
 
 #[derive(Clone, Copy)]
-pub(crate) enum Lengths {
+enum Lengths {
     NotSwapped,
     Swapped,
     MaybeSwapped,
@@ -12,9 +12,9 @@ pub(crate) enum Lengths {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Layout {
-    pub big_endian: bool,
-    pub link_type: u32,
-    pub lengths: Lengths,
+    big_endian: bool,
+    link_type: u32,
+    lengths: Lengths,
 }
 
 pub(crate) fn read(bytes: &[u8]) -> Capture<'_> {
@@ -87,6 +87,17 @@ pub(crate) fn record_at(
         },
         end,
     ))
+}
+
+/// Captured and original length are both nonzero after pcap length-order.
+pub(crate) fn nonzero_lengths(bytes: &[u8], offset: usize, layout: Layout) -> bool {
+    if bytes.len() - offset < RECORD_LEN {
+        return false;
+    }
+    let included = u32_at(bytes, offset + 8, layout.big_endian);
+    let original = u32_at(bytes, offset + 12, layout.big_endian);
+    let (included, original) = order(included, original, layout.lengths);
+    included > 0 && original > 0
 }
 
 fn layout(bytes: &[u8]) -> bool {
