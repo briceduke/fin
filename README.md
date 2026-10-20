@@ -122,10 +122,10 @@ Linux VM, 4 cores. One warmup, then the median of three, warm cache. The walk is
 
 | Walk | Capture | Time |
 | --- | --- | ---: |
-| sequential `read_capture` | 1,000,000 Ethernet + IPv4 + UDP, 74 MB | 0.016 s |
-| chunked, 4 threads | same | 0.007 s |
+| sequential `read_capture` | 1,000,000 Ethernet + IPv4 + UDP, 74 MB | 0.0085 s |
+| chunked, 4 threads | same | 0.0044 s |
 
-`fin -e ip.src` on that file, stdout discarded, was 0.343 s. Rows still merge and the ip.src walk stays sequential.
+`fin -e ip.src` on that file, stdout discarded, was 0.311 s. Rows still merge and the ip.src walk stays sequential.
 
 ## License
 
