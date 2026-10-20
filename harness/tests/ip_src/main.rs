@@ -63,6 +63,85 @@ fn unknown_field_is_an_error() {
 }
 
 #[test]
+fn stdin_matches_the_file_path() {
+    let fin = fin_bin();
+    let path = work_dir().join("stdin-vs-file.pcap");
+    let mut packets = Vec::new();
+    for i in 0..16 {
+        packets.push(eth_ipv4_udp(
+            OUTER,
+            12345,
+            9,
+            &[i, b'f', b'i', b'n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ));
+    }
+    fs::write(&path, pcap(LINK_ETHERNET, &packets)).unwrap();
+    let file = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .output()
+        .expect("fin file");
+    let stdin = Command::new(&fin)
+        .args(["-r", "-", "-n", "-T", "fields", "-e", "ip.src"])
+        .stdin(fs::File::open(&path).unwrap())
+        .output()
+        .expect("fin stdin");
+    assert_eq!(file.stdout, stdin.stdout, "stdout");
+    assert_eq!(file.stderr, stdin.stderr, "stderr");
+    assert_eq!(file.status.code(), stdin.status.code());
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_matches_the_file_path() {
+    let fin = fin_bin();
+    let path = work_dir().join("fifo-vs-file.pcap");
+    let fifo = work_dir().join("fifo-vs-file.fifo");
+    let mut packets = Vec::new();
+    for i in 0..16 {
+        packets.push(eth_ipv4_udp(
+            OUTER,
+            12345,
+            9,
+            &[i, b'f', b'i', b'n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ));
+    }
+    let bytes = pcap(LINK_ETHERNET, &packets);
+    fs::write(&path, &bytes).unwrap();
+    let _ = fs::remove_file(&fifo);
+    let status = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+    assert!(status.success(), "mkfifo failed");
+    let writer_fifo = fifo.clone();
+    let writer_bytes = bytes.clone();
+    let writer = std::thread::spawn(move || {
+        fs::write(&writer_fifo, writer_bytes).expect("write fifo");
+    });
+    let fifo_out = Command::new(&fin)
+        .arg("-r")
+        .arg(&fifo)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .output()
+        .expect("fin fifo");
+    writer.join().expect("fifo writer");
+    let file = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .output()
+        .expect("fin file");
+    let stderr = String::from_utf8_lossy(&fifo_out.stderr);
+    assert!(
+        fifo_out.status.code() == file.status.code(),
+        "fifo status {:?} file {:?} {stderr}",
+        fifo_out.status.code(),
+        file.status.code()
+    );
+    assert_eq!(file.stdout, fifo_out.stdout, "stdout {stderr}");
+    assert_eq!(file.stderr, fifo_out.stderr, "stderr");
+}
+
+#[test]
 fn claimed_preference_is_accepted() {
     let fin = fin_bin();
     let path = work_dir().join("claimed-o.pcap");

@@ -2,7 +2,7 @@
 
 > TLS server names on a 368 MB capture: 0.226 seconds, against 7.87 seconds for tshark 4.6.9. Same 1,252 names. Preliminary, from a prototype that has since been removed.
 
-**Status:** `fin -r <file> [-n] -T fields -e ip.src` walks frames and prints IPv4 sources. Next is the chunk split.
+**Status:** `fin -r <file> [-n] -T fields -e ip.src` maps the file, splits a classic pcap across cores, and prints IPv4 sources. pcapng and stdin use the sequential reader. Next is TLS server names.
 
 fin is an open-source packet analyzer.
 
@@ -32,7 +32,7 @@ flowchart LR
   rows --> app[App]
 ```
 
-A capture file becomes frames: link type and the captured bytes. The file is mapped and split across cores. Each core proves that its chunk starts where the previous one stopped. A seam that does not prove is reread by the sequential reader, front to back on one core. Stdin and live capture use that reader too, because they cannot be split.
+A capture file becomes frames: link type and the captured bytes. A classic pcap is mapped and split across cores. Each core proves that its chunk starts where the previous one stopped. A seam that does not prove is reread by the sequential reader, front to back on one core. pcapng, stdin, and live capture use that reader too.
 
 Header fields are read from the packet in hand. A field that spans packets, such as a TLS server name, is reassembled on the connection and written on the packet that completes it. Rows from every core merge back into file order.
 
@@ -67,7 +67,7 @@ Each step is checked against the one before it.
 1. The checker and a corpus of test captures. Done.
 2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type and the captured bytes. Tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises, including ISB, NRB, DSB, custom blocks, and systemd journal export.
 3. `ip.src`. Done. The walker covers Ethernet, classic SLL, SLL2, VLAN, QinQ, IPv4, IPv6 extension headers, ICMP errors, IP-in-IP, and VXLAN. UDP/TCP use the snapshotted tshark 4.6.9 port table. Any path it cannot prove is counted on stderr. HTTP is not in this step.
-4. The chunk split, checked against the sequential reader.
+4. The chunk split. Done. A mapped classic pcap is split across cores. Each core proves its start is the byte where the previous chunk stopped. A seam that does not prove is reread by `read_capture`. pcapng stays sequential: hopping blocks in parallel still peels frames in file order, and the measured win is on pcap. Tests diff chunked frames against the sequential reader, including adversarial pcap payloads and the file faults tshark 4.6.9 raises.
 5. TLS server names.
 6. HTTP.
 
@@ -115,6 +115,17 @@ Same machine and method as the table above. The file is the million-packet Ether
 | fin in-memory walk | 0.019 s |
 
 The process time is 136× the tshark floor. The 0.038s between process start and the in-memory walk is the next cut.
+
+## Chunk split, 19 Oct 2026
+
+Linux VM, 4 cores. One warmup, then the median of three, warm cache. The walk is frames only, no `ip.src`.
+
+| Walk | Capture | Time |
+| --- | --- | ---: |
+| sequential `read_capture` | 1,000,000 Ethernet + IPv4 + UDP, 74 MB | 0.0085 s |
+| chunked, 4 threads | same | 0.0044 s |
+
+`fin -e ip.src` on that file, stdout discarded, was 0.311 s. Rows still merge and the ip.src walk stays sequential.
 
 ## License
 

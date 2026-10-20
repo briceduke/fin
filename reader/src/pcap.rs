@@ -1,6 +1,6 @@
 use crate::{Capture, CaptureKind, Fault, Frame, MAX_CAPTURED_LENGTH};
 
-const HEADER_LEN: usize = 24;
+pub(crate) const HEADER_LEN: usize = 24;
 const RECORD_LEN: usize = 16;
 
 #[derive(Clone, Copy)]
@@ -10,21 +10,94 @@ enum Lengths {
     MaybeSwapped,
 }
 
-pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
+#[derive(Clone, Copy)]
+pub(crate) struct Layout {
+    big_endian: bool,
+    link_type: u32,
+    lengths: Lengths,
+}
+
+pub(crate) fn read(bytes: &[u8]) -> Capture<'_> {
+    let layout = match open(bytes) {
+        Ok(layout) => layout,
+        Err(fault) => return Capture::halt(Vec::new(), fault, false),
+    };
+    let mut frames = Vec::new();
+    let mut offset = HEADER_LEN;
+    while offset < bytes.len() {
+        match record_at(bytes, offset, layout) {
+            Ok((frame, next)) => {
+                frames.push(frame);
+                offset = next;
+            }
+            Err(fault) => return Capture::halt(frames, fault, true),
+        }
+    }
+    Capture::ok(frames)
+}
+
+pub(crate) fn open(bytes: &[u8]) -> Result<Layout, Fault> {
     if bytes.len() < HEADER_LEN {
-        return Capture::halt(Vec::new(), Fault::TruncatedHeader, false);
+        return Err(Fault::TruncatedHeader);
     }
     let big_endian = layout(bytes);
     let major = u16_at(bytes, 4, big_endian);
     if major < 2 {
-        return Capture::halt(Vec::new(), Fault::UnsupportedPcapVersion { major }, false);
+        return Err(Fault::UnsupportedPcapVersion { major });
     }
     let minor = u16_at(bytes, 6, big_endian);
     let link_type = u32_at(bytes, 20, big_endian);
     if !matches!(link_type, 1 | 113 | 276) {
-        return Capture::halt(Vec::new(), Fault::UnsupportedLinkType { link_type }, false);
+        return Err(Fault::UnsupportedLinkType { link_type });
     }
-    records(bytes, big_endian, link_type, lengths(major, minor))
+    Ok(Layout {
+        big_endian,
+        link_type,
+        lengths: lengths(major, minor),
+    })
+}
+
+/// One complete record at `offset`, and the start of the next.
+pub(crate) fn record_at(
+    bytes: &[u8],
+    offset: usize,
+    layout: Layout,
+) -> Result<(Frame<'_>, usize), Fault> {
+    if bytes.len() - offset < RECORD_LEN {
+        return Err(Fault::CutShort);
+    }
+    let included = u32_at(bytes, offset + 8, layout.big_endian);
+    let original = u32_at(bytes, offset + 12, layout.big_endian);
+    let (included, _) = order(included, original, layout.lengths);
+    if included > MAX_CAPTURED_LENGTH {
+        return Err(Fault::CapturedLengthTooBig {
+            length: included,
+            kind: CaptureKind::Pcap,
+        });
+    }
+    let start = offset + RECORD_LEN;
+    if bytes.len() - start < included as usize {
+        return Err(Fault::CutShort);
+    }
+    let end = start + included as usize;
+    Ok((
+        Frame {
+            link_type: layout.link_type,
+            captured: &bytes[start..end],
+        },
+        end,
+    ))
+}
+
+/// Captured and original length are both nonzero after pcap length-order.
+pub(crate) fn nonzero_lengths(bytes: &[u8], offset: usize, layout: Layout) -> bool {
+    if bytes.len() - offset < RECORD_LEN {
+        return false;
+    }
+    let included = u32_at(bytes, offset + 8, layout.big_endian);
+    let original = u32_at(bytes, offset + 12, layout.big_endian);
+    let (included, original) = order(included, original, layout.lengths);
+    included > 0 && original > 0
 }
 
 fn layout(bytes: &[u8]) -> bool {
@@ -50,40 +123,6 @@ fn order(included: u32, original: u32, lengths: Lengths) -> (u32, u32) {
         Lengths::MaybeSwapped if included <= original => (included, original),
         Lengths::MaybeSwapped => (original, included),
     }
-}
-
-fn records<'a>(bytes: &'a [u8], big_endian: bool, link_type: u32, lengths: Lengths) -> Capture<'a> {
-    let mut frames = Vec::new();
-    let mut offset = HEADER_LEN;
-    while offset < bytes.len() {
-        if bytes.len() - offset < RECORD_LEN {
-            return Capture::halt(frames, Fault::CutShort, true);
-        }
-        let included = u32_at(bytes, offset + 8, big_endian);
-        let original = u32_at(bytes, offset + 12, big_endian);
-        let (included, _) = order(included, original, lengths);
-        if included > MAX_CAPTURED_LENGTH {
-            return Capture::halt(
-                frames,
-                Fault::CapturedLengthTooBig {
-                    length: included,
-                    kind: CaptureKind::Pcap,
-                },
-                true,
-            );
-        }
-        let start = offset + RECORD_LEN;
-        if bytes.len() - start < included as usize {
-            return Capture::halt(frames, Fault::CutShort, true);
-        }
-        let end = start + included as usize;
-        frames.push(Frame {
-            link_type,
-            captured: &bytes[start..end],
-        });
-        offset = end;
-    }
-    Capture::ok(frames)
 }
 
 fn u16_at(bytes: &[u8], offset: usize, big_endian: bool) -> u16 {

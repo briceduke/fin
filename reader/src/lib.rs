@@ -1,14 +1,19 @@
-//! Sequential capture reader.
+//! Capture reader.
 //!
-//! One core, front to back. Classic pcap and pcapng become frames. A later
-//! chunked reader falls back to this when a seam does not prove.
+//! [`read_capture`] walks a file front to back on one core. [`read_capture_chunked`]
+//! splits a classic pcap across cores and falls back to [`read_capture`] when a
+//! seam does not prove. pcapng uses [`read_capture`].
 
+mod chunk;
 mod ip_src;
 mod options;
 mod pcap;
 mod pcapng;
 pub mod ports;
 
+pub use chunk::read_capture_chunked;
+#[doc(hidden)]
+pub use chunk::read_capture_seams;
 pub use ip_src::{walk_ip_src, Cell, IpSrc};
 
 /// Largest captured length tshark 4.6.9 will read.
