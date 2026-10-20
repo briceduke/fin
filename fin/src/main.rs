@@ -32,10 +32,23 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
         return emit("stdin", read_capture(&bytes));
     }
     let file = File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    // Capture files are not written while fin reads them.
+    let is_file = file.metadata().map(|m| m.is_file()).unwrap_or(false);
+    if !is_file {
+        // Pipes, FIFOs, and devices cannot be mapped. Read the already-open
+        // handle so a FIFO is not opened twice.
+        let mut file = file;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        return emit(&path.display().to_string(), read_capture(&bytes));
+    }
+    // Regular files are mapped. They are not written while fin reads them; on
+    // Linux a concurrent truncation can SIGBUS instead of reporting a fault.
     let mapped =
         unsafe { Mmap::map(&file) }.map_err(|error| format!("{}: {error}", path.display()))?;
-    let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     emit(
         &path.display().to_string(),
         read_capture_chunked(&mapped, threads),
