@@ -195,6 +195,28 @@ fn pcap_faults_match_sequential() {
 }
 
 #[test]
+fn zero_payload_even_seams_do_not_fall_back() {
+    let payload = vec![0u8; 1200];
+    let packets: Vec<&[u8]> = (0..2000).map(|_| payload.as_slice()).collect();
+    let bytes = pcap_file(LE_USEC, &packets);
+    let sequential = read_capture(&bytes);
+    for threads in 2..=16 {
+        let seams: Vec<usize> = (1..threads).map(|i| i * bytes.len() / threads).collect();
+        let (chunked, fallback) = read_capture_seams(&bytes, &seams);
+        assert!(
+            !fallback,
+            "threads={threads} must not fall back on zero-filled payloads"
+        );
+        assert_same(
+            &bytes,
+            &sequential,
+            &chunked,
+            &format!("zero payload threads={threads}"),
+        );
+    }
+}
+
+#[test]
 fn record_boundary_seam_proves() {
     let bytes = many_pcap(32);
     let sequential = read_capture(&bytes);

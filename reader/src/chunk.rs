@@ -10,16 +10,32 @@ use crate::pcap::{self, Layout};
 use crate::{read_capture, Capture, Fault, Frame, PCAP_MAGICS};
 
 const CHAIN: usize = 8;
+const MIN_CHUNK: usize = 1024 * 1024;
 
 /// Split `bytes` into `threads` ranges and read them in parallel.
 pub fn read_capture_chunked(bytes: &[u8], threads: usize) -> Capture<'_> {
-    read_chunks(bytes, &ranges(bytes.len(), threads.max(1))).0
+    if bytes.len() < MIN_CHUNK {
+        return read_capture(bytes);
+    }
+    read_chunks(
+        bytes,
+        &ranges(bytes.len(), chunk_count(bytes.len(), threads)),
+    )
+    .0
 }
 
 /// Split at explicit interior byte offsets. Used to force awkward seams.
 /// The bool is whether [`read_capture`] produced the frames.
+#[doc(hidden)]
 pub fn read_capture_seams<'a>(bytes: &'a [u8], seams: &[usize]) -> (Capture<'a>, bool) {
     read_chunks(bytes, &ranges_from_seams(bytes.len(), seams))
+}
+
+fn chunk_count(len: usize, threads: usize) -> usize {
+    match len / MIN_CHUNK {
+        0 => 1,
+        cap => threads.max(1).min(cap),
+    }
 }
 
 fn read_chunks<'a>(bytes: &'a [u8], ranges: &[(usize, usize)]) -> (Capture<'a>, bool) {
@@ -41,9 +57,8 @@ fn fallback(bytes: &[u8]) -> (Capture<'_>, bool) {
 }
 
 fn ranges(len: usize, threads: usize) -> Vec<(usize, usize)> {
-    let n = threads.max(1);
-    let mut out: Vec<(usize, usize)> = (0..n)
-        .map(|i| (i * len / n, (i + 1) * len / n))
+    let mut out: Vec<(usize, usize)> = (0..threads)
+        .map(|i| (i * len / threads, (i + 1) * len / threads))
         .filter(|(start, end)| start < end)
         .collect();
     if out.is_empty() {
@@ -92,7 +107,8 @@ fn pcap_chunks<'a>(
 
 fn piece(bytes: &[u8], from: usize, end: usize, layout: Layout) -> Piece<'_> {
     let body = pcap::HEADER_LEN;
-    let start = if from <= body && end > body && bytes.len() > body {
+    let start = if from <= body && end > body {
+        debug_assert!(bytes.len() > body);
         body
     } else {
         match scan(bytes, from.max(body), end, layout) {
@@ -145,9 +161,10 @@ fn scan(bytes: &[u8], from: usize, end: usize, layout: Layout) -> Option<usize> 
 
 fn chain(bytes: &[u8], mut offset: usize, layout: Layout) -> bool {
     let mut count = 0;
+    // Empty records (caplen or origlen 0) chain on zero padding; abutment still decides.
     while count < CHAIN && offset < bytes.len() {
         match pcap::record_at(bytes, offset, layout) {
-            Ok((_, next)) if next > offset => {
+            Ok((_, next)) if next > offset && pcap::nonzero_lengths(bytes, offset, layout) => {
                 offset = next;
                 count += 1;
             }
@@ -189,4 +206,21 @@ fn merge<'a>(bytes: &'a [u8], pieces: Vec<Piece<'a>>) -> (Capture<'a>, bool) {
         Some(err) => Capture::halt(frames, err, true),
     };
     (capture, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_file_uses_sequential_path() {
+        assert_eq!(chunk_count(0, 16), 1);
+        assert_eq!(chunk_count(MIN_CHUNK - 1, 16), 1);
+        assert_eq!(chunk_count(MIN_CHUNK, 16), 1);
+        assert_eq!(chunk_count(MIN_CHUNK * 2, 16), 2);
+        assert_eq!(chunk_count(MIN_CHUNK * 8, 4), 4);
+        assert_eq!(chunk_count(MIN_CHUNK * 8, 0), 1);
+        let bytes = [0u8; 64];
+        assert_eq!(read_capture_chunked(&bytes, 16), read_capture(&bytes));
+    }
 }

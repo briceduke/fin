@@ -11,7 +11,9 @@ mod pcap;
 mod pcapng;
 pub mod ports;
 
-pub use chunk::{read_capture_chunked, read_capture_seams};
+pub use chunk::read_capture_chunked;
+#[doc(hidden)]
+pub use chunk::read_capture_seams;
 pub use ip_src::{walk_ip_src, Cell, IpSrc};
 
 /// Largest captured length tshark 4.6.9 will read.

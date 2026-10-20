@@ -89,6 +89,17 @@ pub(crate) fn record_at(
     ))
 }
 
+/// Captured and original length are both nonzero after pcap length-order.
+pub(crate) fn nonzero_lengths(bytes: &[u8], offset: usize, layout: Layout) -> bool {
+    if bytes.len() - offset < RECORD_LEN {
+        return false;
+    }
+    let included = u32_at(bytes, offset + 8, layout.big_endian);
+    let original = u32_at(bytes, offset + 12, layout.big_endian);
+    let (included, original) = order(included, original, layout.lengths);
+    included > 0 && original > 0
+}
+
 fn layout(bytes: &[u8]) -> bool {
     matches!(
         [bytes[0], bytes[1], bytes[2], bytes[3]],
