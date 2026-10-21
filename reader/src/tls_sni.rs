@@ -278,7 +278,12 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
     length != 0 && length < TLS_MAX_RECORD
 }
 
-/// Bytes still needed to finish a handshake record that starts in `payload`.
+/// Bytes still needed to finish a handshake that starts in `payload`.
+///
+/// tshark 4.6.9 `dissect_tls_handshake` desegments when the record is complete
+/// but the handshake is shorter than 4 bytes, or the u24 length overruns the
+/// record. The next in-order payload on that flow is continuation, not a new
+/// ClientHello.
 pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
     truncated_handshake_need_known(payload, false)
 }
@@ -303,7 +308,29 @@ pub fn truncated_handshake_need_known(payload: &[u8], known: bool) -> Option<usi
         return None;
     }
     let need = RECORD_HEADER + length;
-    (need > payload.len()).then(|| need - payload.len())
+    if need > payload.len() {
+        return Some(need - payload.len());
+    }
+    handshake_need(&payload[RECORD_HEADER..need])
+}
+
+/// Missing handshake bytes inside a complete record. A 4-byte header whose
+/// u24 length fits is done; tshark does not desegment that message.
+fn handshake_need(body: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while offset < body.len() {
+        let left = body.len() - offset;
+        if left < 4 {
+            return Some(4 - left);
+        }
+        let msg_len = u24(&body[offset + 1..offset + 4]);
+        let end = (offset + 4).saturating_add(msg_len);
+        if end > body.len() {
+            return Some(end - body.len());
+        }
+        offset = end;
+    }
+    None
 }
 
 fn parse_handshake_messages(body: &[u8]) -> Hello {
@@ -672,6 +699,26 @@ mod tests {
                 "cut {header_cut}"
             );
         }
+    }
+
+    #[test]
+    fn truncated_handshake_need_covers_a_short_or_overrun_handshake() {
+        for body in [vec![0x02], vec![0x02, 0x00], vec![0x02, 0x00, 0x00]] {
+            let rec = record(CONTENT_HANDSHAKE, 0x0303, &body);
+            assert_eq!(
+                truncated_handshake_need(&rec),
+                Some(4 - body.len()),
+                "body {}",
+                body.len()
+            );
+        }
+        let overrun = record(CONTENT_HANDSHAKE, 0x0303, &[0x02, 0x00, 0x00, 0x14]);
+        assert_eq!(truncated_handshake_need(&overrun), Some(20));
+        let empty = handshake_type_record(2);
+        assert_eq!(truncated_handshake_need(&empty), None);
+        let mut payload = empty;
+        payload.extend_from_slice(&grease_hello());
+        assert_eq!(truncated_handshake_need(&payload), None);
     }
 
     #[test]

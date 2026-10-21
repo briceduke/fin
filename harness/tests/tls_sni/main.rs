@@ -482,7 +482,38 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             "peer-serverhello-unnamed",
             peer_then_grease(40002, 40001, &handshake_type_record(2, 0x0303)),
         ),
+        ("hs1-then-grease", short_handshake_then_grease(&[0x02])),
+        (
+            "hs2-then-grease",
+            short_handshake_then_grease(&[0x02, 0x00]),
+        ),
+        (
+            "hs3-then-grease",
+            short_handshake_then_grease(&[0x02, 0x00, 0x00]),
+        ),
+        (
+            "hs-overrun-then-grease",
+            short_handshake_then_grease(&[0x02, 0x00, 0x00, 0x14]),
+        ),
+        (
+            "peer-hs1-then-grease",
+            peer_then_grease(443, 50000, &[0x16, 0x03, 0x03, 0x00, 0x01, 0x02]),
+        ),
     ]
+}
+
+fn short_handshake_then_grease(body: &[u8]) -> Vec<u8> {
+    let mut rec = vec![0x16, 0x03, 0x03];
+    rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    rec.extend_from_slice(body);
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &rec),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + rec.len() as u32, &grease),
+        ],
+    )
 }
 
 fn peer_then_grease(server_port: u16, client_port: u16, first: &[u8]) -> Vec<u8> {

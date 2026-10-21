@@ -2031,6 +2031,51 @@ mod tests {
         }
     }
 
+    fn handshake_record_body(body: &[u8]) -> Vec<u8> {
+        let mut rec = vec![0x16, 0x03, 0x03];
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    fn next_seq_frames(first: &[u8], second: &[u8]) -> Vec<Cell> {
+        let start = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, first);
+        let rest = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1 + first.len() as u32, second);
+        walk_tls_frames(&[&start, &rest])
+    }
+
+    #[test]
+    fn short_or_overrun_handshake_then_grease_does_not_print_sni() {
+        let grease = grease_hello();
+        for body in [
+            vec![0x02],
+            vec![0x02, 0x00],
+            vec![0x02, 0x00, 0x00],
+            vec![0x02, 0x00, 0x00, 0x14],
+        ] {
+            let first = handshake_record_body(&body);
+            let cells = next_seq_frames(&first, &grease);
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "body {}", body.len());
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-handshake"),
+                "body {}",
+                body.len()
+            );
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "body {}", body.len());
+        }
+    }
+
+    #[test]
+    fn peer_truncated_server_hello_then_grease_prints_sni() {
+        let first = handshake_record_body(&[0x02]);
+        let cells = server_then_client(443, 50000, &first, &grease_hello());
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("tls-handshake"));
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
     #[test]
     fn server_hello_then_grease_hello_on_next_frame_prints_sni() {
         let first_payload = handshake_type(2);
