@@ -212,8 +212,24 @@ pub fn handshake_type_record(msg_type: u8, version: u16) -> Vec<u8> {
 }
 
 pub fn handshake_body_record(msg_type: u8, version: u16, body: &[u8]) -> Vec<u8> {
-    let mut rec = handshake_record(&handshake(msg_type, body));
+    handshake_messages_record(version, &[(msg_type, body)])
+}
+
+pub fn handshake_messages_record(version: u16, messages: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for &(msg_type, msg_body) in messages {
+        body.extend_from_slice(&handshake(msg_type, msg_body));
+    }
+    let mut rec = handshake_record(&body);
     rec[1..3].copy_from_slice(&version.to_be_bytes());
+    rec
+}
+
+pub fn tls_record(content: u8, version: u16, body: &[u8]) -> Vec<u8> {
+    let mut rec = vec![content];
+    rec.extend_from_slice(&version.to_be_bytes());
+    rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    rec.extend_from_slice(body);
     rec
 }
 

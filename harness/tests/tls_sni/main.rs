@@ -989,7 +989,112 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     ]
     .into_iter()
     .chain(tls13_session_cases())
+    .chain(throwing_leftover_cases())
     .collect()
+}
+
+fn throwing_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let mut cases = Vec::new();
+    let throwing = [
+        ("empty-sh", handshake_type_record(2, 0x0303)),
+        ("empty-nst", handshake_type_record(4, 0x0303)),
+        ("empty-hrr", handshake_type_record(6, 0x0303)),
+        ("empty-cv", handshake_type_record(15, 0x0303)),
+        ("empty-cert-url", handshake_type_record(21, 0x0303)),
+        ("empty-comp-cert", handshake_type_record(25, 0x0303)),
+        ("empty-ee67", handshake_type_record(67, 0x0303)),
+    ];
+    let keep = [
+        ("empty-hs0", handshake_type_record(0, 0x0303)),
+        ("empty-cert", handshake_type_record(11, 0x0303)),
+        ("empty-shd", handshake_type_record(14, 0x0303)),
+        ("empty-finished", handshake_type_record(20, 0x0303)),
+        ("valid-sh", server_hello()),
+    ];
+    for leftover_n in 1..=4usize {
+        let leftover = vec![0u8; leftover_n];
+        for (name, rec) in &throwing {
+            if leftover_n > 1 {
+                cases.push((
+                    leak(format!("{name}-left{leftover_n}-grease")),
+                    leftover_then_hello(rec, &leftover, 0x0a0a),
+                ));
+            }
+            cases.push((
+                leak(format!("{name}-left{leftover_n}-0301")),
+                leftover_then_hello(rec, &leftover, 0x0301),
+            ));
+        }
+        if leftover_n > 1 {
+            for (name, rec) in &keep {
+                cases.push((
+                    leak(format!("{name}-left{leftover_n}-grease")),
+                    leftover_then_hello(rec, &leftover, 0x0a0a),
+                ));
+            }
+        }
+    }
+    for n in [1usize, 16, 33, 34, 35, 36] {
+        let mut body = vec![0x03, 0x03];
+        body.resize(n, 0);
+        let rec = handshake_body_record(2, 0x0303, &body);
+        cases.push((
+            leak(format!("sh-body{n}-left1-grease")),
+            leftover_then_hello(&rec, &[0x00], 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("sh-body{n}-left1-0301")),
+            leftover_then_hello(&rec, &[0x00], 0x0301),
+        ));
+    }
+    let hs0_sh = handshake_messages_record(0x0303, &[(0, &[]), (2, &[])]);
+    cases.push((
+        "hs0-then-empty-sh-left1-grease",
+        leftover_then_hello(&hs0_sh, &[0x00], 0x0a0a),
+    ));
+    cases.push((
+        "hs0-then-empty-sh-left1-0301",
+        leftover_then_hello(&hs0_sh, &[0x00], 0x0301),
+    ));
+    for (len, body) in [(1usize, &[0x01u8][..]), (2, &[0x01, 0x00][..])] {
+        let rec = tls_record(0x18, 0x0303, body);
+        for leftover_n in 1..=4usize {
+            let leftover = vec![0u8; leftover_n];
+            cases.push((
+                leak(format!("hb-len{len}-left{leftover_n}-grease")),
+                leftover_then_hello(&rec, &leftover, 0x0a0a),
+            ));
+            cases.push((
+                leak(format!("hb-len{len}-left{leftover_n}-0301")),
+                leftover_then_hello(&rec, &leftover, 0x0301),
+            ));
+        }
+    }
+    cases.push((
+        "empty-hb-left1-grease",
+        leftover_then_hello(&empty_record(0x18), &[0x00], 0x0a0a),
+    ));
+    cases.push((
+        "empty-hb-left1-0301",
+        leftover_then_hello(&empty_record(0x18), &[0x00], 0x0301),
+    ));
+    cases.push((
+        "empty-hb-left3-type1-grease",
+        leftover_then_hello(&empty_record(0x18), &[0x01, 0x00, 0x00], 0x0a0a),
+    ));
+    cases.push((
+        "empty-hb-left3-type1-0301",
+        leftover_then_hello(&empty_record(0x18), &[0x01, 0x00, 0x00], 0x0301),
+    ));
+    cases.push((
+        "tls13-empty-hb-left1-0301",
+        leftover_after_prefix(&tls13_server_hello(), &empty_record(0x18), &[0x00], 0x0301),
+    ));
+    cases
+}
+
+fn leak(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
 }
 
 fn tls13_session_cases() -> Vec<(&'static str, Vec<u8>)> {

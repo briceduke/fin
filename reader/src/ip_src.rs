@@ -2567,6 +2567,29 @@ mod tests {
         let cells = next_seq_frames(&hb, &grease);
         assert_eq!(cells[1].tls_sni, ["www.example.com"]);
         assert_eq!(cells[1].counted, None);
+        for body in [vec![0x01u8], vec![0x01, 0x00]] {
+            for n in 1..=4 {
+                let mut first = vec![0x18, 0x03, 0x03];
+                first.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                first.extend_from_slice(&body);
+                first.extend_from_slice(&vec![0u8; n]);
+                let cells = next_seq_frames(&first, &grease);
+                assert_eq!(
+                    cells[1].tls_sni,
+                    ["www.example.com"],
+                    "hb {} leftover {n} grease",
+                    body.len()
+                );
+                assert_eq!(cells[1].counted, None, "hb {} leftover {n}", body.len());
+                let named = next_seq_frames(&first, &hello);
+                assert_eq!(
+                    named[1].tls_sni,
+                    ["www.example.com"],
+                    "hb {} leftover {n} 0x0301",
+                    body.len()
+                );
+            }
+        }
     }
 
     #[test]

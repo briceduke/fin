@@ -559,9 +559,9 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
         }
         if length == 0 {
             apply_session_version(&mut session, content, version, None);
-            // dissect_ssl3_heartbeat reads type + payload_length (3 bytes) even
-            // when record_length is 0. That throw leaves leftover unprocessed.
-            if content == 0x18 && rest.len() < RECORD_HEADER + 3 {
+            if content == 0x18
+                && heartbeat_throws(&[], &rest[RECORD_HEADER..], session.tls_version())
+            {
                 return None;
             }
             offset += RECORD_HEADER;
@@ -594,6 +594,9 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
         {
             // tshark 4.6.9 THROW(ReportedBoundsError) aborts dissect_ssl.
             // Leftover is not desegmented; the next TCP payload is a new record.
+            return None;
+        }
+        if content == 0x18 && heartbeat_throws(body, &rest[need..], session.tls_version()) {
             return None;
         }
         offset += need;
@@ -757,6 +760,23 @@ fn npn_encrypted_exts_throws(parent: &[u8], leftover: &[u8]) -> bool {
     }
     let pad_len = parent_byte(parent, leftover, 1 + proto_len).unwrap_or(0) as usize;
     avail < 1 + proto_len + 1 + pad_len
+}
+
+/// tshark 4.6.9 `dissect_ssl3_heartbeat`. TLS 1.3 skips it. Otherwise it always
+/// reads type + payload_length (3 bytes). A Request/Response on a record
+/// shorter than 3 bytes then adds a payload of `record_length - 3`, which
+/// throws. Leftover after a throw is not desegmented.
+fn heartbeat_throws(body: &[u8], leftover: &[u8], version: u16) -> bool {
+    if version == 0x0304 {
+        return false;
+    }
+    if parent_avail(body, leftover) < 3 {
+        return true;
+    }
+    if body.len() >= 3 {
+        return false;
+    }
+    matches!(parent_byte(body, leftover, 0), Some(1 | 2))
 }
 
 /// Missing handshake bytes inside a complete record. A 4-byte header whose
@@ -1718,6 +1738,131 @@ mod tests {
         cv12.push(0x00);
         let tls12 = parse_tls(&ccs(), TlsSession::Unknown, false);
         assert_eq!(truncated_handshake_prefix(&cv12, tls12.session), None);
+        for n in 1..=4 {
+            let leftover = vec![0u8; n];
+            let mut payload = handshake_type_record(2);
+            payload.extend_from_slice(&leftover);
+            assert_eq!(
+                truncated_handshake_prefix(&payload, TlsSession::Unknown),
+                None,
+                "empty SH leftover {n}"
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &grease),
+                named,
+                "empty SH leftover {n} grease"
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &hello),
+                named,
+                "empty SH leftover {n} 0x0301"
+            );
+        }
+        for n in 1usize..=36 {
+            let mut body = vec![0x03, 0x03];
+            body.resize(n, 0);
+            let mut payload = handshake_type_record_at(2, 0x0303, &body);
+            payload.push(0x00);
+            assert_eq!(
+                truncated_handshake_prefix(&payload, TlsSession::Unknown),
+                None,
+                "SH body {n}"
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &grease),
+                named,
+                "SH body {n} grease"
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &hello),
+                named,
+                "SH body {n} 0x0301"
+            );
+        }
+        let mut hs0_then_sh_body = handshake(0, &[]);
+        hs0_then_sh_body.extend_from_slice(&handshake(2, &[]));
+        let mut hs0_then_sh = record(CONTENT_HANDSHAKE, 0x0303, &hs0_then_sh_body);
+        hs0_then_sh.push(0x00);
+        assert_eq!(
+            truncated_handshake_prefix(&hs0_then_sh, TlsSession::Unknown),
+            None
+        );
+        assert_eq!(stitch_leftover(&hs0_then_sh, &grease), named);
+        assert_eq!(stitch_leftover(&hs0_then_sh, &hello), named);
+    }
+
+    fn short_heartbeat(body: &[u8]) -> Vec<u8> {
+        record(0x18, 0x0303, body)
+    }
+
+    #[test]
+    fn leftover_after_a_throwing_heartbeat_prints_the_next_hello() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        for body in [vec![0x01u8], vec![0x01, 0x00]] {
+            for n in 1..=4 {
+                let mut first = short_heartbeat(&body);
+                first.extend_from_slice(&vec![0u8; n]);
+                assert_eq!(
+                    truncated_handshake_prefix(&first, TlsSession::Unknown),
+                    None,
+                    "hb {} leftover {n}",
+                    body.len()
+                );
+                assert_eq!(
+                    stitch_leftover(&first, &grease),
+                    named,
+                    "hb {} leftover {n} grease",
+                    body.len()
+                );
+                assert_eq!(
+                    stitch_leftover(&first, &hello),
+                    named,
+                    "hb {} leftover {n} 0x0301",
+                    body.len()
+                );
+            }
+        }
+        let mut empty_type1 = empty_record(0x18);
+        empty_type1.extend_from_slice(&[0x01, 0x00, 0x00]);
+        assert_eq!(
+            truncated_handshake_prefix(&empty_type1, TlsSession::Unknown),
+            None,
+            "empty heartbeat leftover 01 00 00 throws on payload"
+        );
+        assert_eq!(stitch_leftover(&empty_type1, &grease), named);
+        assert_eq!(stitch_leftover(&empty_type1, &hello), named);
+        let mut empty_zeros = empty_record(0x18);
+        empty_zeros.extend_from_slice(&[0x00, 0x00, 0x00]);
+        assert_eq!(
+            truncated_handshake_prefix(&empty_zeros, TlsSession::Unknown),
+            Some(&[0x00, 0x00, 0x00][..]),
+            "empty heartbeat leftover 00 00 00 is not a heartbeat type"
+        );
+        let tls13 = parse_tls(&tls13_server_hello(), TlsSession::Unknown, false);
+        assert_eq!(tls13.session, TlsSession::Tls13);
+        let mut hb = empty_record(0x18);
+        hb.push(0x00);
+        assert_eq!(
+            truncated_handshake_prefix(&hb, tls13.session),
+            Some(&[0x00][..]),
+            "TLS 1.3 skips dissect_ssl3_heartbeat, leftover desegments"
+        );
+        let mut buf = vec![0x00];
+        buf.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tls(&buf, tls13.session, false).kind,
+            TlsParse::Other,
+            "TLS 1.3 empty heartbeat leftover swallows 0x0301"
+        );
+        let mut short = short_heartbeat(&[0x01]);
+        short.push(0x00);
+        assert_eq!(
+            truncated_handshake_prefix(&short, tls13.session),
+            Some(&[0x00][..]),
+            "TLS 1.3 length-1 heartbeat leftover desegments"
+        );
     }
 
     #[test]
