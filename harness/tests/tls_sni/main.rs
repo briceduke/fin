@@ -991,7 +991,72 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(tls13_session_cases())
     .chain(throwing_leftover_cases())
     .chain(encrypted_handshake_cases())
+    .chain(empty_ccs_encrypted_cases())
     .collect()
+}
+
+fn empty_ccs_encrypted_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let empty = empty_record(0x14);
+    let hr_ch =
+        handshake_messages_record(0x0303, &[(0, &[]), (1, &hello_inner("www.example.com"))]);
+    let empty_cert_ch =
+        handshake_messages_record(0x0303, &[(11, &[]), (1, &hello_inner("www.example.com"))]);
+    let mut ver0 = client_hello(Some("www.example.com"));
+    ver0[9..11].copy_from_slice(&[0, 0]);
+    let leftovers = [
+        ("empty-ccs-nosni-then-hr-ch", client_hello(None)),
+        (
+            "empty-ccs-sni-then-hr-ch",
+            client_hello(Some("www.example.com")),
+        ),
+        ("empty-ccs-sh-then-hr-ch", server_hello()),
+        ("empty-ccs-app-then-hr-ch", app_data()),
+        ("empty-ccs-alert-then-hr-ch", alert()),
+        ("empty-ccs-hb3-then-hr-ch", heartbeat()),
+        ("empty-ccs-hr-then-hr-ch", handshake_type_record(0, 0x0303)),
+    ];
+    let mut cases = Vec::new();
+    for (name, leftover) in leftovers {
+        let mut first = empty.clone();
+        first.extend_from_slice(&leftover);
+        cases.push((name, sequential_payloads(50000, 443, &[&first, &hr_ch])));
+    }
+    let mut first = empty.clone();
+    first.extend_from_slice(&client_hello(None));
+    cases.push((
+        "empty-ccs-nosni-then-empty-cert-ch",
+        sequential_payloads(50000, 443, &[&first, &empty_cert_ch]),
+    ));
+    cases.push((
+        "empty-ccs-nosni-then-ch-ver0",
+        sequential_payloads(50000, 443, &[&first, &ver0]),
+    ));
+    let claim = client_hello(None);
+    cases.push((
+        "unnamed-claim-empty-ccs-then-hr-ch",
+        sequential_payloads(40001, 40002, &[&claim, &first, &hr_ch]),
+    ));
+    let mut same = empty.clone();
+    same.extend_from_slice(&hr_ch);
+    cases.push((
+        "empty-ccs-hr-ch-same",
+        sequential_payloads(50000, 443, &[&same]),
+    ));
+    cases.push((
+        "empty-ccs-then-hr-ch",
+        sequential_payloads(50000, 443, &[&empty, &hr_ch]),
+    ));
+    cases
+}
+
+fn sequential_payloads(sport: u16, dport: u16, payloads: &[&[u8]]) -> Vec<u8> {
+    let mut frames = Vec::new();
+    let mut seq = 1u32;
+    for payload in payloads {
+        frames.push(eth_ipv4_tcp_seq(OUTER, sport, dport, seq, payload));
+        seq += payload.len() as u32;
+    }
+    pcap(LINK_ETHERNET, &frames)
 }
 
 fn encrypted_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {

@@ -130,17 +130,20 @@ fn parse_records(payload: &[u8], session: &mut TlsSession, after_ccs: &mut bool)
                 version,
                 content,
             } => {
-                // tshark 4.6.9 ssl_try_set_version reads the first body byte.
-                // A length-0 record at the end of the payload throws (Info
-                // [Malformed Packet]), so the session stays unknown. A following
-                // byte is readable, so the session sticks; leftover that is not
-                // a content type is then desegmented (Ignored Unknown Record).
-                if next > offset + RECORD_HEADER || next < payload.len() {
+                // tshark 4.6.9 dissect_ssl3_record reads next_byte with
+                // tvb_get_uint8 before the CCS switch. A length-0 record at
+                // the end of the payload throws, so the session stays unknown
+                // and ssl_dissect_change_cipher_spec never runs. A following
+                // byte is readable, so the session sticks and a CCS still sets
+                // ccs_frame (unless the session is already TLS 1.3). Leftover
+                // that is not a content type is then desegmented.
+                let next_byte_readable = next > offset + RECORD_HEADER || next < payload.len();
+                if next_byte_readable {
                     apply_session_version(session, content, version, None);
                 }
                 let body = &payload[offset + RECORD_HEADER..next];
                 if content == CONTENT_CCS
-                    && !body.is_empty()
+                    && next_byte_readable
                     && *session != TlsSession::Tls13
                     && !armed
                 {
@@ -1656,6 +1659,7 @@ mod tests {
             let first = parse_tls(&empty_record(content), TlsSession::Unknown, false);
             assert_eq!(first.kind, TlsParse::Other, "empty {content}");
             assert_eq!(first.session, TlsSession::Unknown, "empty {content}");
+            assert!(!first.after_ccs, "empty {content} does not arm CCS");
             let after = parse_tls(&grease, first.session, false);
             assert_eq!(after.kind, TlsParse::Other, "empty {content} grease");
             let named = parse_tls(&hello, first.session, false);
@@ -2418,6 +2422,143 @@ mod tests {
             .kind,
             named.clone(),
             "CCS then ClientHello next frame still prints"
+        );
+    }
+
+    fn hello_request_then_hello(sni: &str) -> Vec<u8> {
+        handshake_record_messages(&[handshake(0, &[]), client_hello_hs(sni)])
+    }
+
+    fn empty_cert_then_hello(sni: &str) -> Vec<u8> {
+        handshake_record_messages(&[handshake(11, &[]), client_hello_hs(sni)])
+    }
+
+    fn client_hello_legacy_version(sni: Option<&str>, hello_ver: u16) -> Vec<u8> {
+        let mut hello = client_hello(sni);
+        hello[9..11].copy_from_slice(&hello_ver.to_be_bytes());
+        hello
+    }
+
+    fn stitch_frames(first: &[u8], second: &[u8], heuristic: bool) -> (TlsOutcome, TlsOutcome) {
+        let first = parse_tls_after_ccs(first, TlsSession::Unknown, heuristic, false);
+        let second = parse_tls_after_ccs(second, first.session, false, first.after_ccs);
+        (first, second)
+    }
+
+    #[test]
+    fn empty_ccs_with_leftover_arms_later_encrypted_handshake() {
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let no_sni = client_hello(None);
+        let hr_ch = hello_request_then_hello("www.example.com");
+        let empty_ccs = empty_record(CONTENT_CCS);
+        let leftovers = [
+            ("no-sni", no_sni.clone()),
+            ("sni", client_hello(Some("www.example.com"))),
+            ("server-hello", valid_server_hello()),
+            ("app-data", app_data()),
+            ("alert", alert()),
+            ("heartbeat", heartbeat()),
+            ("hello-request", handshake_type_record(0)),
+        ];
+        for (label, leftover) in leftovers {
+            let mut first = empty_ccs.clone();
+            first.extend_from_slice(&leftover);
+            let (first_out, second_out) = stitch_frames(&first, &hr_ch, false);
+            assert!(first_out.after_ccs, "empty CCS leftover {label} arms");
+            assert_ne!(first_out.session, TlsSession::Tls13, "{label}");
+            if label == "sni" {
+                assert_eq!(first_out.kind, named.clone(), "{label} same-frame name");
+            } else if label == "no-sni" {
+                assert_eq!(first_out.kind, TlsParse::ClientHello(Vec::new()), "{label}");
+            } else {
+                assert_eq!(first_out.kind, TlsParse::Other, "{label}");
+            }
+            assert_eq!(
+                second_out.kind,
+                TlsParse::Other,
+                "empty CCS leftover {label} then HR+CH"
+            );
+        }
+        let mut first = empty_ccs.clone();
+        first.extend_from_slice(&no_sni);
+        let (_, cert_out) = stitch_frames(&first, &empty_cert_then_hello("www.example.com"), false);
+        assert_eq!(cert_out.kind, TlsParse::Other, "frame 2 empty Certificate");
+        let ver0 = client_hello_legacy_version(Some("www.example.com"), 0);
+        assert_eq!(&ver0[9..11], &[0, 0], "hello version 0x0000");
+        let (_, ver0_out) = stitch_frames(&first, &ver0, false);
+        assert_eq!(ver0_out.kind, TlsParse::Other, "frame 2 hello version 0");
+
+        let claim = parse_tls(&no_sni, TlsSession::Unknown, true);
+        assert!(claim.claimed, "unnamed claiming hello");
+        assert!(!claim.after_ccs);
+        let mut unnamed_ccs = empty_ccs.clone();
+        unnamed_ccs.extend_from_slice(&no_sni);
+        let unnamed_ccs_out = parse_tls_after_ccs(&unnamed_ccs, claim.session, false, false);
+        assert!(unnamed_ccs_out.after_ccs, "unnamed empty CCS leftover arms");
+        let unnamed_hr = parse_tls_after_ccs(
+            &hr_ch,
+            unnamed_ccs_out.session,
+            false,
+            unnamed_ccs_out.after_ccs,
+        );
+        assert_eq!(
+            unnamed_hr.kind,
+            TlsParse::Other,
+            "unnamed 40001→40002 extra"
+        );
+
+        let mut same = empty_ccs.clone();
+        same.extend_from_slice(&hr_ch);
+        let same_out = parse_tls(&same, TlsSession::Unknown, false);
+        assert_eq!(same_out.kind, named.clone(), "same-payload empty CCS HR+CH");
+        assert!(
+            same_out.after_ccs,
+            "same-payload CCS still arms later frames"
+        );
+
+        let trail = parse_tls(&empty_ccs, TlsSession::Unknown, false);
+        assert!(!trail.after_ccs, "trailing empty CCS does not arm");
+        assert_eq!(trail.session, TlsSession::Unknown);
+        let grease = parse_tls(&grease_hello(), trail.session, false);
+        assert_eq!(
+            grease.kind,
+            TlsParse::Other,
+            "trailing empty CCS then GREASE"
+        );
+        let trail_hr = parse_tls_after_ccs(&hr_ch, trail.session, false, trail.after_ccs);
+        assert_eq!(
+            trail_hr.kind,
+            named.clone(),
+            "trailing empty CCS then HR+CH still prints"
+        );
+
+        let nonempty = parse_tls(&ccs(), TlsSession::Unknown, false);
+        assert!(nonempty.after_ccs);
+        let nonempty_hr = parse_tls_after_ccs(&hr_ch, nonempty.session, false, nonempty.after_ccs);
+        assert_eq!(
+            nonempty_hr.kind,
+            TlsParse::Other,
+            "nonempty CCS then HR+CH next frame"
+        );
+
+        let tls13 = parse_tls(&tls13_server_hello(), TlsSession::Unknown, false);
+        assert_eq!(tls13.session, TlsSession::Tls13);
+        let mut tls13_ccs = empty_ccs;
+        tls13_ccs.extend_from_slice(&no_sni);
+        let tls13_ccs_out = parse_tls_after_ccs(&tls13_ccs, tls13.session, false, false);
+        assert!(
+            !tls13_ccs_out.after_ccs,
+            "TLS 1.3 dummy CCS does not set ccs_frame"
+        );
+        let tls13_hr = parse_tls_after_ccs(
+            &hr_ch,
+            tls13_ccs_out.session,
+            false,
+            tls13_ccs_out.after_ccs,
+        );
+        assert_eq!(
+            tls13_hr.kind, named,
+            "TLS 1.3 empty CCS leftover then HR+CH prints"
         );
     }
 
