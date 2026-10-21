@@ -817,6 +817,94 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             hello_then_split_hello("www.example.com", "www.example.com", 1),
         ),
         ("hello-grease-split-1", hello_then_split_grease(1)),
+        (
+            "unknown-leftover-00-0301",
+            leftover_then_hello(&[], &[0x00], 0x0301),
+        ),
+        (
+            "unknown-leftover-01-0301",
+            leftover_then_hello(&[], &[0x01], 0x0301),
+        ),
+        (
+            "unknown-leftover-13-0301",
+            leftover_then_hello(&[], &[0x13], 0x0301),
+        ),
+        (
+            "unknown-leftover-1b-0301",
+            leftover_then_hello(&[], &[0x1b], 0x0301),
+        ),
+        (
+            "unknown-leftover-ff-0301",
+            leftover_then_hello(&[], &[0xff], 0x0301),
+        ),
+        (
+            "unknown-leftover-00x2-0301",
+            leftover_then_hello(&[], &[0x00, 0x00], 0x0301),
+        ),
+        (
+            "unknown-leftover-00x3-0301",
+            leftover_then_hello(&[], &[0x00, 0x00, 0x00], 0x0301),
+        ),
+        (
+            "unknown-leftover-00x4-0301",
+            leftover_then_hello(&[], &[0x00, 0x00, 0x00, 0x00], 0x0301),
+        ),
+        (
+            "unknown-leftover-14-0301",
+            leftover_then_hello(&[], &[0x14], 0x0301),
+        ),
+        (
+            "unknown-leftover-16-0301",
+            leftover_then_hello(&[], &[0x16], 0x0301),
+        ),
+        (
+            "unknown-leftover-19-0301",
+            leftover_then_hello(&[], &[0x19], 0x0301),
+        ),
+        (
+            "unknown-leftover-1a-0301",
+            leftover_then_hello(&[], &[0x1a], 0x0301),
+        ),
+        (
+            "unknown-leftover-00-0301-ipv6",
+            leftover_then_hello_ipv6(&[0x00], 0x0301),
+        ),
+        (
+            "unknown-leftover-00-0301-src443",
+            leftover_then_hello_ports(443, 50000, &[], &[0x00], 0x0301),
+        ),
+        (
+            "unknown-leftover-00-0301-unnamed",
+            leftover_then_hello_ports(40001, 40002, &[], &[0x00], 0x0301),
+        ),
+        (
+            "empty-hs-leftover-00-grease",
+            leftover_then_hello(&empty_record(0x16), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-hs-leftover-00-0301",
+            leftover_then_hello(&empty_record(0x16), &[0x00], 0x0301),
+        ),
+        (
+            "empty-hs-leftover-01-grease",
+            leftover_then_hello(&empty_record(0x16), &[0x01], 0x0a0a),
+        ),
+        (
+            "empty-hs-leftover-01-0301",
+            leftover_then_hello(&empty_record(0x16), &[0x01], 0x0301),
+        ),
+        (
+            "empty-hs-leftover-02-grease",
+            leftover_then_hello(&empty_record(0x16), &[0x02], 0x0a0a),
+        ),
+        (
+            "empty-hs-leftover-02-0301",
+            leftover_then_hello(&empty_record(0x16), &[0x02], 0x0301),
+        ),
+        (
+            "hello-leftover-00-then-0301",
+            leftover_then_hello(&client_hello(Some("www.example.com")), &[0x00], 0x0301),
+        ),
     ]
     .into_iter()
     .chain(tls13_session_cases())
@@ -957,14 +1045,38 @@ fn empty_then_complete_hello_same(content: u8, version: u16) -> Vec<u8> {
 }
 
 fn leftover_then_hello(prefix: &[u8], leftover: &[u8], version: u16) -> Vec<u8> {
+    leftover_then_hello_ports(50000, 443, prefix, leftover, version)
+}
+
+fn leftover_then_hello_ports(
+    sport: u16,
+    dport: u16,
+    prefix: &[u8],
+    leftover: &[u8],
+    version: u16,
+) -> Vec<u8> {
     let mut first = prefix.to_vec();
     first.extend_from_slice(leftover);
     let hello = client_hello_host(Some(b"www.example.com"), version);
     pcap(
         LINK_ETHERNET,
         &[
-            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
-            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello),
+            eth_ipv4_tcp_seq(OUTER, sport, dport, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, sport, dport, 1 + first.len() as u32, &hello),
+        ],
+    )
+}
+
+fn leftover_then_hello_ipv6(leftover: &[u8], version: u16) -> Vec<u8> {
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth(0x86dd, &ipv6(6, &tcp_seq(50000, 443, 1, leftover))),
+            eth(
+                0x86dd,
+                &ipv6(6, &tcp_seq(50000, 443, 1 + leftover.len() as u32, &hello)),
+            ),
         ],
     )
 }

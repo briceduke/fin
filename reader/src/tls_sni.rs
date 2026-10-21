@@ -531,16 +531,14 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
     while offset < payload.len() {
         let rest = &payload[offset..];
         if rest.len() < RECORD_HEADER {
-            // tshark 4.6.9 dissect_ssl desegments remaining < 5 after a sticky
-            // version even when leftover is not a content type, so the next
-            // TCP segment is Ignored Unknown Record.
-            if is_content_type(rest[0]) || session.skips_looks_like() {
-                return Some(RecordTail {
-                    start: offset,
-                    more: RECORD_HEADER - rest.len(),
-                });
-            }
-            return None;
+            // tshark 4.6.9 dissect_ssl desegments remaining < 5 in both the
+            // sticky arm and the SSL_VER_UNKNOWN default arm, before any
+            // content-type or ssl_looks_like_sslv3 check. The next in-order
+            // segment is Continuation Data.
+            return Some(RecordTail {
+                start: offset,
+                more: RECORD_HEADER - rest.len(),
+            });
         }
         let (content, version, length) = tls_record_header(rest)?;
         if !session.skips_looks_like() && !is_record_version(version) {
@@ -1366,6 +1364,88 @@ mod tests {
             TlsParse::ClientHello(vec!["www.example.com".to_string()]),
             "empty heartbeat leftover throws, next GREASE prints"
         );
+    }
+
+    #[test]
+    fn leftover_shorter_than_header_swallows_the_next_hello_while_unknown() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        let other = client_hello(Some("other.example"));
+        for leftover in [0x00u8, 0x01, 0x13, 0x1b, 0xff] {
+            assert_eq!(
+                truncated_handshake_need(&[leftover]),
+                Some(4),
+                "{leftover:#04x}"
+            );
+            assert_eq!(
+                truncated_handshake_prefix(&[leftover], TlsSession::Unknown),
+                Some(&[leftover][..]),
+                "{leftover:#04x}"
+            );
+            assert_eq!(
+                stitch_leftover(&[leftover], &hello),
+                TlsParse::Other,
+                "{leftover:#04x} 0x0301"
+            );
+            assert_eq!(
+                stitch_leftover(&[leftover], &grease),
+                TlsParse::Other,
+                "{leftover:#04x} grease"
+            );
+        }
+        for n in 2..=4 {
+            let zeros = vec![0u8; n];
+            assert_eq!(truncated_handshake_need(&zeros), Some(5 - n), "{n} zeros");
+            assert_eq!(
+                stitch_leftover(&zeros, &hello),
+                TlsParse::Other,
+                "{n} zeros 0x0301"
+            );
+        }
+        for leftover in [0x00u8, 0x01, 0x02] {
+            let mut first = empty_record(CONTENT_HANDSHAKE);
+            first.push(leftover);
+            let outcome = parse_tls(&first, TlsSession::Unknown, false);
+            assert_eq!(outcome.kind, TlsParse::Unproved, "empty HS+{leftover:#04x}");
+            assert_eq!(
+                truncated_handshake_prefix(&first, TlsSession::Unknown),
+                Some(&[leftover][..]),
+                "empty HS+{leftover:#04x}"
+            );
+            assert_eq!(
+                stitch_leftover(&first, &grease),
+                TlsParse::Other,
+                "empty HS+{leftover:#04x} grease"
+            );
+            assert_eq!(
+                stitch_leftover(&first, &hello),
+                TlsParse::Other,
+                "empty HS+{leftover:#04x} 0x0301"
+            );
+        }
+        let mut hello_leftover = hello.clone();
+        hello_leftover.push(0x00);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&hello_leftover),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        assert_eq!(
+            truncated_handshake_prefix(&hello_leftover, TlsSession::Unknown),
+            Some(&[0x00][..])
+        );
+        assert_eq!(stitch_leftover(&hello_leftover, &other), TlsParse::Other);
+        for leftover in [0x14u8, 0x16, 0x19, 0x1a] {
+            assert_eq!(
+                truncated_handshake_need(&[leftover]),
+                Some(4),
+                "ct {leftover:#04x}"
+            );
+            assert_eq!(
+                stitch_leftover(&[leftover], &hello),
+                TlsParse::Other,
+                "ct {leftover:#04x}"
+            );
+        }
     }
 
     #[test]

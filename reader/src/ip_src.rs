@@ -679,7 +679,11 @@ impl Walk<'_> {
                     self.tls_session.insert(conv, next);
                 }
             }
-            self.set_tls_need(flow, seq, parsed, payload_len, session);
+            // Heuristic TLS (unnamed, unclaimed) never entered dissect_ssl, so
+            // leftover that is not a record start is not desegmented.
+            if outcome.claimed {
+                self.set_tls_need(flow, seq, parsed, payload_len, session);
+            }
         }
         match outcome.kind {
             TlsParse::ClientHello(names) => {
@@ -2117,9 +2121,22 @@ mod tests {
     }
 
     fn next_seq_frames(first: &[u8], second: &[u8]) -> Vec<Cell> {
-        let start = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, first);
-        let rest = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1 + first.len() as u32, second);
+        next_seq_on(50000, 443, first, second)
+    }
+
+    fn next_seq_on(sport: u16, dport: u16, first: &[u8], second: &[u8]) -> Vec<Cell> {
+        let start = eth_ipv4_tcp_seq([10, 0, 0, 1], sport, dport, 1, first);
+        let rest = eth_ipv4_tcp_seq([10, 0, 0, 1], sport, dport, 1 + first.len() as u32, second);
         walk_tls_frames(&[&start, &rest])
+    }
+
+    fn ipv6_tcp_seq(sport: u16, dport: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut tcp = Vec::from(sport.to_be_bytes());
+        tcp.extend_from_slice(&dport.to_be_bytes());
+        tcp.extend_from_slice(&seq.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(payload);
+        eth_ipv6(6, tcp.len() as u16, &tcp)
     }
 
     #[test]
@@ -2548,6 +2565,83 @@ mod tests {
         let mut hb = empty_record(0x18);
         hb.push(0x00);
         let cells = next_seq_frames(&hb, &grease);
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn leftover_shorter_than_header_is_continuation_while_unknown() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        let other = sni_hello("other.example");
+        for leftover in [0x00u8, 0x01, 0x13, 0x1b, 0xff] {
+            let cells = next_seq_frames(&[leftover], &hello);
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "{leftover:#04x}");
+            assert_eq!(cells[0].counted, None, "{leftover:#04x}");
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "{leftover:#04x} 0x0301");
+            assert_eq!(cells[1].counted, None, "{leftover:#04x} 0x0301");
+        }
+        for n in 2..=4 {
+            let zeros = vec![0u8; n];
+            let cells = next_seq_frames(&zeros, &hello);
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "{n} zeros");
+            assert_eq!(cells[1].counted, None, "{n} zeros");
+        }
+        let ipv6 = walk_tls_frames(&[
+            &ipv6_tcp_seq(50000, 443, 1, &[0x00]),
+            &ipv6_tcp_seq(50000, 443, 2, &hello),
+        ]);
+        assert_eq!(ipv6[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(ipv6[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(ipv6[1].counted, None);
+        let src443 = next_seq_on(443, 50000, &[0x00], &hello);
+        assert_eq!(src443[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(src443[1].counted, None);
+        for leftover in [0x00u8, 0x01, 0x02] {
+            let mut first = empty_record(0x16);
+            first.push(leftover);
+            let cells = next_seq_frames(&first, &grease);
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-handshake"),
+                "empty HS+{leftover:#04x}"
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                [] as [&str; 0],
+                "empty HS+{leftover:#04x} grease"
+            );
+            let named = next_seq_frames(&first, &hello);
+            assert_eq!(
+                named[1].tls_sni,
+                [] as [&str; 0],
+                "empty HS+{leftover:#04x} 0x0301"
+            );
+        }
+        let mut hello_leftover = hello.clone();
+        hello_leftover.push(0x00);
+        let cells = next_seq_frames(&hello_leftover, &other);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        for leftover in [0x14u8, 0x16, 0x19, 0x1a] {
+            let cells = next_seq_frames(&[leftover], &hello);
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "ct {leftover:#04x}");
+            assert_eq!(cells[1].counted, None, "ct {leftover:#04x}");
+        }
+        let unnamed = next_seq_on(40001, 40002, &[0x00], &hello);
+        assert_eq!(unnamed[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(unnamed[0].counted, None);
+        assert_eq!(unnamed[1].tls_sni, ["www.example.com"]);
+        assert_eq!(unnamed[1].counted, None);
+        let mut sticky_ccs = ccs();
+        sticky_ccs.push(0x00);
+        let sticky = next_seq_frames(&sticky_ccs, &grease);
+        assert_eq!(sticky[1].tls_sni, [] as [&str; 0]);
+        let mut empty_hs_ccs = empty_record(0x16);
+        empty_hs_ccs.extend_from_slice(&ccs());
+        let cells = next_seq_frames(&empty_hs_ccs, &grease);
         assert_eq!(cells[1].tls_sni, ["www.example.com"]);
         assert_eq!(cells[1].counted, None);
     }
