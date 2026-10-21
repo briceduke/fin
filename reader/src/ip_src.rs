@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tls,
-    truncated_handshake_need_known, TlsOutcome, TlsParse,
+    truncated_handshake_prefix, TlsOutcome, TlsParse,
 };
 use crate::Frame;
 
@@ -630,11 +630,11 @@ impl Walk<'_> {
             .map(|flow| self.tls_known.contains(&flow.conversation()))
             .unwrap_or(false);
         if let Some(flow) = flow {
-            if let Some(outcome) = self.take_tls_need(flow, seq, payload, known) {
+            if let Some((outcome, parsed)) = self.take_tls_need(flow, seq, payload, known) {
                 if let Some(key) = key {
                     self.tls_seen.insert(key);
                 }
-                self.apply_tls_outcome(Some(flow), seq, payload, outcome, false);
+                self.apply_tls_outcome(Some(flow), seq, &parsed, payload.len(), known, outcome);
                 return;
             }
         }
@@ -644,7 +644,7 @@ impl Walk<'_> {
                     .map(|flow| self.tls_claimed.contains(&flow.conversation()))
                     .unwrap_or(false);
             let outcome = parse_tls(payload, known, !claimed);
-            self.apply_tls_outcome(flow, seq, payload, outcome, true);
+            self.apply_tls_outcome(flow, seq, payload, payload.len(), known, outcome);
             return;
         }
         if looks_like_tls_handshake(payload) {
@@ -656,9 +656,10 @@ impl Walk<'_> {
         &mut self,
         flow: Option<TcpFlow>,
         seq: u32,
-        payload: &[u8],
+        parsed: &[u8],
+        payload_len: usize,
+        known: bool,
         outcome: TlsOutcome,
-        buffer_unproved: bool,
     ) {
         if let Some(flow) = flow {
             let conv = flow.conversation();
@@ -670,12 +671,10 @@ impl Walk<'_> {
             } else {
                 self.tls_known.remove(&conv);
             }
+            self.set_tls_need(flow, seq, parsed, payload_len, known);
         }
         match outcome.kind {
             TlsParse::ClientHello(names) => {
-                if let Some(flow) = flow {
-                    self.tls_need.remove(&flow);
-                }
                 if let Some(flow) = flow {
                     self.tls_seen.insert(TcpSeq {
                         src: flow.src,
@@ -696,21 +695,34 @@ impl Walk<'_> {
                         dport: flow.dport,
                         seq,
                     });
-                    if buffer_unproved
-                        && truncated_handshake_need_known(payload, outcome.known).is_some()
-                    {
-                        self.tls_need.insert(
-                            flow,
-                            TlsNeed {
-                                next_seq: seq.wrapping_add(payload.len() as u32),
-                                prefix: payload.to_vec(),
-                            },
-                        );
-                    }
                 }
                 self.count("tls-handshake");
             }
             TlsParse::Other => {}
+        }
+    }
+
+    fn set_tls_need(
+        &mut self,
+        flow: TcpFlow,
+        seq: u32,
+        parsed: &[u8],
+        payload_len: usize,
+        known: bool,
+    ) {
+        match truncated_handshake_prefix(parsed, known) {
+            Some(prefix) => {
+                self.tls_need.insert(
+                    flow,
+                    TlsNeed {
+                        next_seq: seq.wrapping_add(payload_len as u32),
+                        prefix: prefix.to_vec(),
+                    },
+                );
+            }
+            None => {
+                self.tls_need.remove(&flow);
+            }
         }
     }
 
@@ -720,29 +732,15 @@ impl Walk<'_> {
         seq: u32,
         payload: &[u8],
         known: bool,
-    ) -> Option<TlsOutcome> {
-        let need = self.tls_need.get(&flow)?.clone();
+    ) -> Option<(TlsOutcome, Vec<u8>)> {
+        let need = self.tls_need.get(&flow)?;
         if seq != need.next_seq {
             return None;
         }
-        let mut buf = need.prefix;
+        let mut buf = need.prefix.clone();
         buf.extend_from_slice(payload);
-        let next_seq = seq.wrapping_add(payload.len() as u32);
         let outcome = parse_tls(&buf, known, false);
-        if outcome.kind == TlsParse::Unproved
-            && truncated_handshake_need_known(&buf, outcome.known).is_some()
-        {
-            self.tls_need.insert(
-                flow,
-                TlsNeed {
-                    next_seq,
-                    prefix: buf,
-                },
-            );
-        } else {
-            self.tls_need.remove(&flow);
-        }
-        Some(outcome)
+        Some((outcome, buf))
     }
 
     fn tls_from_udp(&mut self, payload: &[u8]) {
@@ -2261,6 +2259,91 @@ mod tests {
                 prefix[0]
             );
         }
+    }
+
+    fn empty_record(content: u8) -> Vec<u8> {
+        vec![content, 0x03, 0x03, 0x00, 0x00]
+    }
+
+    #[test]
+    fn empty_record_then_split_hello_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        for content in [0x16u8, 0x14, 0x15, 0x17] {
+            let empty = empty_record(content);
+            let count_first = content == 0x16;
+            for cut in [1usize, 5, 7] {
+                let mut first = empty.clone();
+                first.extend_from_slice(&hello[..cut]);
+                let cells = next_seq_frames(&first, &hello[cut..]);
+                assert_eq!(
+                    cells[0].tls_sni,
+                    [] as [&str; 0],
+                    "empty {content} cut {cut}"
+                );
+                assert_eq!(
+                    cells[0].counted,
+                    count_first.then_some("tls-handshake"),
+                    "empty {content} cut {cut}"
+                );
+                assert_eq!(
+                    cells[1].tls_sni,
+                    ["www.example.com"],
+                    "empty {content} cut {cut}"
+                );
+                assert_eq!(cells[1].counted, None, "empty {content} cut {cut}");
+            }
+            let cells = next_seq_frames(&empty, &hello);
+            assert_eq!(
+                cells[0].tls_sni,
+                [] as [&str; 0],
+                "empty {content} complete"
+            );
+            assert_eq!(
+                cells[0].counted,
+                if content == 0x16 {
+                    Some("tls-handshake")
+                } else {
+                    None
+                },
+                "empty {content} complete"
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                ["www.example.com"],
+                "empty {content} complete"
+            );
+            assert_eq!(cells[1].counted, None, "empty {content} complete");
+        }
+    }
+
+    #[test]
+    fn complete_hello_then_split_next_hello_prints_each_name() {
+        let first = sni_hello("www.example.com");
+        let second = sni_hello("other.example");
+        for cut in [1usize, 5, 7, 40] {
+            let mut start = first.clone();
+            start.extend_from_slice(&second[..cut]);
+            let cells = next_seq_frames(&start, &second[cut..]);
+            assert_eq!(cells[0].tls_sni, ["www.example.com"], "cut {cut}");
+            assert_eq!(cells[0].counted, None, "cut {cut}");
+            assert_eq!(cells[1].tls_sni, ["other.example"], "cut {cut}");
+            assert_eq!(cells[1].counted, None, "cut {cut}");
+        }
+        let mut same = first.clone();
+        same.extend_from_slice(&first[..1]);
+        let cells = next_seq_frames(&same, &first[1..]);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
+        let grease = grease_hello();
+        let mut mixed = first;
+        mixed.extend_from_slice(&grease[..1]);
+        let cells = next_seq_frames(&mixed, &grease[1..]);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
     }
 
     #[test]

@@ -564,7 +564,88 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             prefix_then_split_hello(&ccs(), 7, 0x0a0a),
         ),
         ("split-hello-40", split_hello_at(40)),
+        ("empty-hs-split-1", empty_then_split_hello(0x16, 1)),
+        ("empty-hs-split-5", empty_then_split_hello(0x16, 5)),
+        ("empty-hs-split-7", empty_then_split_hello(0x16, 7)),
+        ("empty-ccs-split-1", empty_then_split_hello(0x14, 1)),
+        ("empty-ccs-split-5", empty_then_split_hello(0x14, 5)),
+        ("empty-ccs-split-7", empty_then_split_hello(0x14, 7)),
+        ("empty-alert-split-1", empty_then_split_hello(0x15, 1)),
+        ("empty-alert-split-5", empty_then_split_hello(0x15, 5)),
+        ("empty-alert-split-7", empty_then_split_hello(0x15, 7)),
+        ("empty-app-split-1", empty_then_split_hello(0x17, 1)),
+        ("empty-app-split-5", empty_then_split_hello(0x17, 5)),
+        ("empty-app-split-7", empty_then_split_hello(0x17, 7)),
+        ("empty-hs-then-hello", empty_then_complete_hello(0x16)),
+        ("empty-ccs-then-hello", empty_then_complete_hello(0x14)),
+        ("empty-alert-then-hello", empty_then_complete_hello(0x15)),
+        ("empty-app-then-hello", empty_then_complete_hello(0x17)),
+        (
+            "two-hellos-split-1",
+            hello_then_split_hello("www.example.com", "other.example", 1),
+        ),
+        (
+            "two-hellos-split-5",
+            hello_then_split_hello("www.example.com", "other.example", 5),
+        ),
+        (
+            "two-hellos-split-7",
+            hello_then_split_hello("www.example.com", "other.example", 7),
+        ),
+        (
+            "two-hellos-split-40",
+            hello_then_split_hello("www.example.com", "other.example", 40),
+        ),
+        (
+            "two-same-split-1",
+            hello_then_split_hello("www.example.com", "www.example.com", 1),
+        ),
+        ("hello-grease-split-1", hello_then_split_grease(1)),
     ]
+}
+
+fn empty_then_split_hello(content: u8, cut: usize) -> Vec<u8> {
+    prefix_then_split_hello(&empty_record(content), cut, 0x0301)
+}
+
+fn empty_then_complete_hello(content: u8) -> Vec<u8> {
+    let first = empty_record(content);
+    let hello = client_hello(Some("www.example.com"));
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello),
+        ],
+    )
+}
+
+fn hello_then_split_hello(first_sni: &str, second_sni: &str, cut: usize) -> Vec<u8> {
+    let first = client_hello(Some(first_sni));
+    let second = client_hello(Some(second_sni));
+    let mut start = first;
+    start.extend_from_slice(&second[..cut]);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &start),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + start.len() as u32, &second[cut..]),
+        ],
+    )
+}
+
+fn hello_then_split_grease(cut: usize) -> Vec<u8> {
+    let first = client_hello(Some("www.example.com"));
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    let mut start = first;
+    start.extend_from_slice(&grease[..cut]);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &start),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + start.len() as u32, &grease[cut..]),
+        ],
+    )
 }
 
 fn tls13_server_hello_then_hello(version: u16, same_payload: bool) -> Vec<u8> {

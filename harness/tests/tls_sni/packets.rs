@@ -175,6 +175,10 @@ pub fn app_data() -> Vec<u8> {
     vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01]
 }
 
+pub fn empty_record(content: u8) -> Vec<u8> {
+    vec![content, 0x03, 0x03, 0x00, 0x00]
+}
+
 pub fn handshake_record(body: &[u8]) -> Vec<u8> {
     let mut rec = vec![0x16, 0x03, 0x01];
     rec.extend_from_slice(&(body.len() as u16).to_be_bytes());

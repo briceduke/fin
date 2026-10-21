@@ -95,17 +95,19 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
                         saw_hello = true;
                         names.extend(found);
                     }
-                    Hello::Unproved => unproved = true,
+                    Hello::Unproved => {
+                        unproved = true;
+                        break;
+                    }
                 }
                 offset = next;
             }
         }
     }
-    if unproved {
-        return TlsParse::Unproved;
-    }
     if saw_hello {
         TlsParse::ClientHello(names)
+    } else if unproved {
+        TlsParse::Unproved
     } else {
         TlsParse::Other
     }
@@ -368,31 +370,63 @@ pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
 
 /// Like [`truncated_handshake_need`], but a sticky session accepts any record
 /// version the way `dissect_ssl3_record` does. Complete CCS/alert/app-data/
-/// HelloRequest records are skipped so a following truncated handshake is
-/// buffered, matching tshark 4.6.9 `dissect_ssl`.
+/// HelloRequest records, including length-0 records, are skipped so a following
+/// truncated handshake is buffered, matching tshark 4.6.9 `dissect_ssl`.
 pub fn truncated_handshake_need_known(payload: &[u8], known: bool) -> Option<usize> {
+    handshake_tail(payload, known).map(|tail| tail.more)
+}
+
+/// Bytes of `payload` from the incomplete handshake record onward.
+///
+/// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
+/// is parsed without the ClientHellos that already finished in the prefix.
+pub fn truncated_handshake_prefix(payload: &[u8], known: bool) -> Option<&[u8]> {
+    let tail = handshake_tail(payload, known)?;
+    Some(&payload[tail.start..])
+}
+
+struct HandshakeTail {
+    start: usize,
+    more: usize,
+}
+
+fn handshake_tail(payload: &[u8], known: bool) -> Option<HandshakeTail> {
     let mut offset = 0;
     let mut known = known;
     while offset < payload.len() {
         let rest = &payload[offset..];
         if rest.len() < RECORD_HEADER {
-            return (rest[0] == CONTENT_HANDSHAKE).then_some(RECORD_HEADER - rest.len());
+            return (rest[0] == CONTENT_HANDSHAKE).then_some(HandshakeTail {
+                start: offset,
+                more: RECORD_HEADER - rest.len(),
+            });
         }
         let (content, version, length) = tls_record_header(rest)?;
         if !known && !is_record_version(version) {
             return None;
         }
-        if length == 0 || length >= TLS_MAX_RECORD {
+        if length >= TLS_MAX_RECORD {
             return None;
+        }
+        if length == 0 {
+            apply_session_version(&mut known, content, version, None);
+            offset += RECORD_HEADER;
+            continue;
         }
         let need = RECORD_HEADER + length;
         if need > rest.len() {
-            return (content == CONTENT_HANDSHAKE).then_some(need - rest.len());
+            return (content == CONTENT_HANDSHAKE).then_some(HandshakeTail {
+                start: offset,
+                more: need - rest.len(),
+            });
         }
         let body = &rest[RECORD_HEADER..need];
         if content == CONTENT_HANDSHAKE {
             if let Some(more) = handshake_need(body) {
-                return Some(more);
+                return Some(HandshakeTail {
+                    start: offset,
+                    more,
+                });
             }
         }
         apply_session_version(
@@ -716,6 +750,10 @@ mod tests {
         record(0x17, 0x0303, &[0x01])
     }
 
+    fn empty_record(content: u8) -> Vec<u8> {
+        vec![content, 0x03, 0x03, 0x00, 0x00]
+    }
+
     #[test]
     fn sni_name_is_proved() {
         assert_eq!(
@@ -992,6 +1030,58 @@ mod tests {
         assert_eq!(
             truncated_handshake_need(&hello[..40]),
             Some(hello.len() - 40)
+        );
+    }
+
+    #[test]
+    fn truncated_handshake_need_skips_empty_records() {
+        let hello = client_hello(Some("www.example.com"));
+        for content in [CONTENT_HANDSHAKE, 0x14, 0x15, 0x17] {
+            let empty = empty_record(content);
+            assert_eq!(
+                truncated_handshake_need_known(&empty, false),
+                None,
+                "empty {content}"
+            );
+            for cut in [1usize, 5, 7] {
+                let mut payload = empty.clone();
+                payload.extend_from_slice(&hello[..cut]);
+                assert!(
+                    truncated_handshake_need_known(&payload, false).is_some(),
+                    "empty {content} cut {cut}"
+                );
+                let prefix = truncated_handshake_prefix(&payload, false).unwrap();
+                assert_eq!(prefix, &hello[..cut], "empty {content} cut {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn complete_hello_then_truncated_keeps_the_proved_name() {
+        let first = client_hello(Some("www.example.com"));
+        let second = client_hello(Some("other.example"));
+        for cut in [1usize, 5, 7, 40] {
+            let mut payload = first.clone();
+            payload.extend_from_slice(&second[..cut]);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&payload),
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "cut {cut}"
+            );
+            let prefix = truncated_handshake_prefix(&payload, false).unwrap();
+            assert_eq!(prefix, &second[..cut], "cut {cut}");
+        }
+        let mut same = first.clone();
+        same.extend_from_slice(&first[..1]);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&same),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let mut grease_payload = first.clone();
+        grease_payload.extend_from_slice(&grease_hello()[..1]);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&grease_payload),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
     }
 
