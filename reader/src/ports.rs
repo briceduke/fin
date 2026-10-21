@@ -110,6 +110,10 @@ impl PortPick {
     pub fn is_vxlan(self) -> bool {
         self.name == Some("vxlan") && !self.may_reject
     }
+
+    pub fn is_tls(self) -> bool {
+        self.name == Some("tls")
+    }
 }
 
 /// Snapshotted `udp.port` / `tcp.port` tables from tshark 4.6.9.
@@ -260,5 +264,14 @@ mod tests {
         let pick = tables.udp(12345, 9);
         assert_eq!(pick.name, Some("discard"));
         assert!(!pick.must_count());
+    }
+
+    #[test]
+    fn tcp_443_is_tls() {
+        let tables = snapshot();
+        let pick = tables.tcp(50000, 443);
+        assert_eq!(pick.name, Some("tls"));
+        assert!(pick.is_tls());
+        assert!(!pick.is_vxlan());
     }
 }

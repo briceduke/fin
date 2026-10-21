@@ -1,9 +1,13 @@
 //! One-frame `ip.src` walk. Counts any path tshark 4.6.9 may still follow.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use crate::ports::{snapshot, PortPick, PortTables};
+use crate::tls_sni::{
+    looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tcp_tls,
+    TlsParse,
+};
 use crate::Frame;
 
 const ETHERNET: u32 = 1;
@@ -38,10 +42,11 @@ const ETHERIP: u8 = 97;
 const TEB: u16 = 0x6558;
 const DEPTH: usize = 8;
 
-/// Proved IPv4 sources from one frame, and a count if the walk stopped short.
+/// Proved field values from one frame, and a count if the walk stopped short.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub values: Vec<String>,
+    pub tls_sni: Vec<String>,
     pub counted: Option<&'static str>,
 }
 
@@ -59,24 +64,50 @@ struct Ipv4Frag {
     proto: u8,
 }
 
-/// Session state for a sequential `ip.src` walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FlowHost {
+    V4(Ipv4Addr),
+    V6([u8; 16]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TcpSeq {
+    src: FlowHost,
+    dst: FlowHost,
+    sport: u16,
+    dport: u16,
+    seq: u32,
+}
+
+/// Session state for a sequential field walk.
 pub struct IpSrc {
     tables: &'static PortTables,
     frags: FragTable,
+    tls_seen: HashSet<TcpSeq>,
+    want_ip: bool,
+    want_tls: bool,
 }
 
 impl Default for IpSrc {
     fn default() -> Self {
-        Self {
-            tables: snapshot(),
-            frags: FragTable::default(),
-        }
+        Self::query(true, false)
     }
 }
 
 impl IpSrc {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Walk only the fields the CLI asked for.
+    pub fn query(ip_src: bool, tls_sni: bool) -> Self {
+        Self {
+            tables: snapshot(),
+            frags: FragTable::default(),
+            tls_seen: HashSet::new(),
+            want_ip: ip_src || !tls_sni,
+            want_tls: tls_sni,
+        }
     }
 
     pub fn walk(&mut self, frame: &Frame<'_>) -> Cell {
@@ -88,23 +119,36 @@ impl IpSrc {
 pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
     let mut walk = Walk {
         values: Vec::new(),
+        tls_sni: Vec::new(),
         counted: None,
         tables: session.tables,
         frags: &mut session.frags,
+        tls_seen: &mut session.tls_seen,
+        want_ip: session.want_ip,
+        want_tls: session.want_tls,
+        flow_src: None,
+        flow_dst: None,
         depth: 0,
     };
     walk.link(frame.link_type, frame.captured);
     Cell {
         values: walk.values,
+        tls_sni: walk.tls_sni,
         counted: walk.counted,
     }
 }
 
 struct Walk<'a> {
     values: Vec<String>,
+    tls_sni: Vec<String>,
     counted: Option<&'static str>,
     tables: &'static PortTables,
     frags: &'a mut FragTable,
+    tls_seen: &'a mut HashSet<TcpSeq>,
+    want_ip: bool,
+    want_tls: bool,
+    flow_src: Option<FlowHost>,
+    flow_dst: Option<FlowHost>,
     depth: usize,
 }
 
@@ -219,11 +263,15 @@ impl Walk<'_> {
             return;
         }
         let src = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
-        self.values.push(src.to_string());
+        if self.want_ip {
+            self.values.push(src.to_string());
+        }
         if bytes.len() < ihl {
             return;
         }
         let dst = Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]);
+        self.flow_src = Some(FlowHost::V4(src));
+        self.flow_dst = Some(FlowHost::V4(dst));
         let id = u16::from_be_bytes([bytes[4], bytes[5]]);
         let frag = u16::from_be_bytes([bytes[6], bytes[7]]);
         let offset = frag & 0x1fff;
@@ -295,6 +343,12 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 6 {
             return;
         }
+        let mut src = [0u8; 16];
+        let mut dst = [0u8; 16];
+        src.copy_from_slice(&bytes[8..24]);
+        dst.copy_from_slice(&bytes[24..40]);
+        self.flow_src = Some(FlowHost::V6(src));
+        self.flow_dst = Some(FlowHost::V6(dst));
         let plen = u16::from_be_bytes([bytes[4], bytes[5]]) as u32;
         let mut next = bytes[6];
         let body = &bytes[IPV6_HEADER..];
@@ -435,8 +489,10 @@ impl Walk<'_> {
             }
             return;
         }
-        self.values
-            .push(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]).to_string());
+        if self.want_ip {
+            self.values
+                .push(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]).to_string());
+        }
         if bytes.len() > ihl {
             self.count("icmp");
         }
@@ -463,7 +519,16 @@ impl Walk<'_> {
             return;
         }
         let pick = self.tables.udp(src, dst);
-        self.after_ports(pick, payload);
+        if pick.is_vxlan() {
+            self.vxlan(payload);
+            return;
+        }
+        if self.want_tls {
+            self.tls_from_udp(payload);
+        }
+        if self.want_ip {
+            self.after_ports(pick, payload);
+        }
     }
 
     fn tcp(&mut self, bytes: &[u8]) {
@@ -479,8 +544,62 @@ impl Walk<'_> {
         if bytes.len() <= data_off {
             return;
         }
+        let seq = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let pick = self.tables.tcp(src, dst);
-        self.after_ports(pick, &bytes[data_off..]);
+        let payload = &bytes[data_off..];
+        if self.want_tls {
+            self.tls_from_tcp(src, dst, seq, pick, payload);
+        }
+        if self.want_ip {
+            self.after_ports(pick, payload);
+        }
+    }
+
+    fn tls_from_tcp(&mut self, sport: u16, dport: u16, seq: u32, pick: PortPick, payload: &[u8]) {
+        let key = match (self.flow_src, self.flow_dst) {
+            (Some(src), Some(dst)) => Some(TcpSeq {
+                src,
+                dst,
+                sport,
+                dport,
+                seq,
+            }),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if self.tls_seen.contains(&key) {
+                return;
+            }
+        }
+        if pick.is_tls() || pick.name.is_none() {
+            match parse_tcp_tls(payload) {
+                TlsParse::ClientHello(names) => {
+                    if let Some(key) = key {
+                        self.tls_seen.insert(key);
+                    }
+                    self.tls_sni.extend(names);
+                }
+                TlsParse::Unproved => {
+                    if let Some(key) = key {
+                        self.tls_seen.insert(key);
+                    }
+                    self.count("tls-handshake");
+                }
+                TlsParse::Other => {}
+            }
+            return;
+        }
+        if looks_like_tls_handshake(payload) {
+            self.count("tls-handshake");
+        }
+    }
+
+    fn tls_from_udp(&mut self, payload: &[u8]) {
+        if looks_like_dtls_handshake(payload) {
+            self.count("dtls");
+        } else if looks_like_quic_initial(payload) {
+            self.count("quic");
+        }
     }
 
     fn after_ports(&mut self, pick: PortPick, payload: &[u8]) {
@@ -966,6 +1085,7 @@ mod tests {
     fn proved(values: &[&str]) -> Cell {
         Cell {
             values: values.iter().map(|value| (*value).to_string()).collect(),
+            tls_sni: Vec::new(),
             counted: None,
         }
     }
@@ -973,6 +1093,7 @@ mod tests {
     fn blank() -> Cell {
         Cell {
             values: Vec::new(),
+            tls_sni: Vec::new(),
             counted: None,
         }
     }
@@ -1431,5 +1552,132 @@ mod tests {
                 "flags {flags:#x}"
             );
         }
+    }
+
+    fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut tcp = Vec::from(sport.to_be_bytes());
+        tcp.extend_from_slice(&dport.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(payload);
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 6, 0, 0];
+        let total = (20 + tcp.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip.extend_from_slice(&src);
+        ip.extend_from_slice(&[10, 255, 255, 1]);
+        ip.extend_from_slice(&tcp);
+        let mut eth = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
+        ];
+        eth.extend_from_slice(&ip);
+        eth
+    }
+
+    fn sni_hello(name: &str) -> Vec<u8> {
+        let host = name.as_bytes();
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0, 2, 0x00, 0x2f, 1, 0]);
+        let entry_len = 1 + 2 + host.len();
+        let sni_data_len = 2 + entry_len;
+        let ext_len = 4 + sni_data_len;
+        body.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&(sni_data_len as u16).to_be_bytes());
+        body.extend_from_slice(&(entry_len as u16).to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        body.extend_from_slice(host);
+        let hs_len = body.len() as u32;
+        let mut hs = vec![1, (hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8];
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    fn walk_tls(captured: &[u8]) -> Cell {
+        walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured,
+            },
+            &mut IpSrc::query(false, true),
+        )
+    }
+
+    #[test]
+    fn tls_sni_on_443() {
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &sni_hello("www.example.com"));
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.values, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn tls_sni_on_ipv6() {
+        let hello = sni_hello("v6.example");
+        let mut tcp = vec![
+            0xc3, 0x50, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0,
+        ];
+        tcp.extend_from_slice(&hello);
+        let frame = eth_ipv6(6, tcp.len() as u16, &tcp);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, ["v6.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn no_sni_client_hello_is_blank() {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.extend_from_slice(&[0, 0, 2, 0x00, 0x2f, 1, 0, 0, 0]);
+        let hs_len = body.len() as u32;
+        let mut hs = vec![1, (hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8];
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &rec);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_on_443_is_blank() {
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, b"GET / HTTP/1.1\r\nHost: x\r\n");
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn truncated_tls_record_is_counted() {
+        let mut hello = sni_hello("cut.example");
+        hello.truncate(hello.len() - 8);
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &hello);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("tls-handshake"));
+    }
+
+    #[test]
+    fn smtp_client_hello_is_counted() {
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 25, &sni_hello("mail.example"));
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("tls-handshake"));
+    }
+
+    #[test]
+    fn ip_src_query_does_not_fill_sni() {
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &sni_hello("www.example.com"));
+        let cell = walk(&frame);
+        assert_eq!(cell.values, ["10.0.0.1"]);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("may-reject"));
     }
 }
