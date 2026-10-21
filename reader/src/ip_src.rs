@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tcp_tls,
-    parse_tcp_tls_on_tls_port, TlsParse,
+    parse_tcp_tls_on_tls_port, truncated_handshake_need, TlsParse,
 };
 use crate::Frame;
 
@@ -71,6 +71,14 @@ enum FlowHost {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TcpFlow {
+    src: FlowHost,
+    dst: FlowHost,
+    sport: u16,
+    dport: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TcpSeq {
     src: FlowHost,
     dst: FlowHost,
@@ -79,11 +87,18 @@ struct TcpSeq {
     seq: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TlsNeed {
+    next_seq: u32,
+    remaining: usize,
+}
+
 /// Session state for a sequential field walk.
 pub struct IpSrc {
     tables: &'static PortTables,
     frags: FragTable,
     tls_seen: HashSet<TcpSeq>,
+    tls_need: HashMap<TcpFlow, TlsNeed>,
     want_ip: bool,
     want_tls: bool,
 }
@@ -105,6 +120,7 @@ impl IpSrc {
             tables: snapshot(),
             frags: FragTable::default(),
             tls_seen: HashSet::new(),
+            tls_need: HashMap::new(),
             want_ip: ip_src || !tls_sni,
             want_tls: tls_sni,
         }
@@ -124,6 +140,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tables: session.tables,
         frags: &mut session.frags,
         tls_seen: &mut session.tls_seen,
+        tls_need: &mut session.tls_need,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
         flow_src: None,
@@ -145,6 +162,7 @@ struct Walk<'a> {
     tables: &'static PortTables,
     frags: &'a mut FragTable,
     tls_seen: &'a mut HashSet<TcpSeq>,
+    tls_need: &'a mut HashMap<TcpFlow, TlsNeed>,
     want_ip: bool,
     want_tls: bool,
     flow_src: Option<FlowHost>,
@@ -562,18 +580,33 @@ impl Walk<'_> {
     }
 
     fn tls_from_tcp(&mut self, sport: u16, dport: u16, seq: u32, pick: PortPick, payload: &[u8]) {
-        let key = match (self.flow_src, self.flow_dst) {
-            (Some(src), Some(dst)) => Some(TcpSeq {
+        let flow = match (self.flow_src, self.flow_dst) {
+            (Some(src), Some(dst)) => Some(TcpFlow {
                 src,
                 dst,
                 sport,
                 dport,
-                seq,
             }),
             _ => None,
         };
+        let key = flow.map(|flow| TcpSeq {
+            src: flow.src,
+            dst: flow.dst,
+            sport,
+            dport,
+            seq,
+        });
         if let Some(key) = key {
             if self.tls_seen.contains(&key) {
+                return;
+            }
+        }
+        if let Some(flow) = flow {
+            if self.take_tls_need(flow, seq, payload) {
+                if let Some(key) = key {
+                    self.tls_seen.insert(key);
+                }
+                self.count("tls-handshake");
                 return;
             }
         }
@@ -585,6 +618,9 @@ impl Walk<'_> {
             };
             match parsed {
                 TlsParse::ClientHello(names) => {
+                    if let Some(flow) = flow {
+                        self.tls_need.remove(&flow);
+                    }
                     if let Some(key) = key {
                         self.tls_seen.insert(key);
                     }
@@ -593,6 +629,16 @@ impl Walk<'_> {
                 TlsParse::Unproved => {
                     if let Some(key) = key {
                         self.tls_seen.insert(key);
+                    }
+                    if let (Some(flow), Some(remaining)) = (flow, truncated_handshake_need(payload))
+                    {
+                        self.tls_need.insert(
+                            flow,
+                            TlsNeed {
+                                next_seq: seq.wrapping_add(payload.len() as u32),
+                                remaining,
+                            },
+                        );
                     }
                     self.count("tls-handshake");
                 }
@@ -603,6 +649,27 @@ impl Walk<'_> {
         if looks_like_tls_handshake(payload) {
             self.count("tls-handshake");
         }
+    }
+
+    fn take_tls_need(&mut self, flow: TcpFlow, seq: u32, payload: &[u8]) -> bool {
+        let Some(need) = self.tls_need.get(&flow).copied() else {
+            return false;
+        };
+        if seq != need.next_seq {
+            return false;
+        }
+        if payload.len() < need.remaining {
+            self.tls_need.insert(
+                flow,
+                TlsNeed {
+                    next_seq: seq.wrapping_add(payload.len() as u32),
+                    remaining: need.remaining - payload.len(),
+                },
+            );
+        } else {
+            self.tls_need.remove(&flow);
+        }
+        true
     }
 
     fn tls_from_udp(&mut self, payload: &[u8]) {
@@ -1566,9 +1633,14 @@ mod tests {
     }
 
     fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        eth_ipv4_tcp_seq(src, sport, dport, 1, payload)
+    }
+
+    fn eth_ipv4_tcp_seq(src: [u8; 4], sport: u16, dport: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
         let mut tcp = Vec::from(sport.to_be_bytes());
         tcp.extend_from_slice(&dport.to_be_bytes());
-        tcp.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(&seq.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
         tcp.extend_from_slice(payload);
         let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 6, 0, 0];
         let total = (20 + tcp.len()) as u16;
@@ -1690,5 +1762,58 @@ mod tests {
         assert_eq!(cell.values, ["10.0.0.1"]);
         assert_eq!(cell.tls_sni, [] as [&str; 0]);
         assert_eq!(cell.counted, Some("may-reject"));
+    }
+
+    #[test]
+    fn split_client_hello_counts_the_completing_segment() {
+        let hello = sni_hello("www.example.com");
+        let cut = 40;
+        assert!(hello.len() > cut);
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &hello[..cut]);
+        let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1 + cut as u32, &hello[cut..]);
+        let mut session = IpSrc::query(false, true);
+        let start = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let rest = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(start.tls_sni, [] as [&str; 0]);
+        assert_eq!(start.counted, Some("tls-handshake"));
+        assert_eq!(rest.tls_sni, [] as [&str; 0]);
+        assert_eq!(rest.counted, Some("tls-handshake"));
+    }
+
+    #[test]
+    fn unrelated_seq_after_truncated_hello_is_not_counted() {
+        let hello = sni_hello("www.example.com");
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &hello[..40]);
+        let other = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 99, b"not-tls");
+        let mut session = IpSrc::query(false, true);
+        let start = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let rest = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &other,
+            },
+            &mut session,
+        );
+        assert_eq!(start.counted, Some("tls-handshake"));
+        assert_eq!(rest.tls_sni, [] as [&str; 0]);
+        assert_eq!(rest.counted, None);
     }
 }

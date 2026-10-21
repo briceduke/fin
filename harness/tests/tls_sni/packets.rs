@@ -103,7 +103,11 @@ pub fn udp(src: u16, dst: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
-    eth(0x0800, &ipv4(src, 6, &tcp(sport, dport, payload)))
+    eth_ipv4_tcp_seq(src, sport, dport, 1, payload)
+}
+
+pub fn eth_ipv4_tcp_seq(src: [u8; 4], sport: u16, dport: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+    eth(0x0800, &ipv4(src, 6, &tcp_seq(sport, dport, seq, payload)))
 }
 
 pub fn eth_ipv4_udp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {

@@ -211,6 +211,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         ("chunked-sni", chunked_sni()),
+        ("split-hello", split_client_hello()),
         on_disk_named(),
     ]
     .into_iter()
@@ -240,6 +241,18 @@ fn record_version_cases() -> Vec<(&'static str, Vec<u8>)> {
         )
     })
     .collect()
+}
+
+fn split_client_hello() -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let cut = 40;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &hello[..cut]),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + cut as u32, &hello[cut..]),
+        ],
+    )
 }
 
 fn chunked_sni() -> Vec<u8> {
