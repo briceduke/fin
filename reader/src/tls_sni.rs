@@ -148,6 +148,8 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                     }
                 }
                 if handshake_throws(body, &payload[next..], session.tls_version()) {
+                    // THROW(ReportedBoundsError) aborts dissect_ssl. Later
+                    // records in this payload are not walked.
                     break;
                 }
                 offset = next;
@@ -672,6 +674,13 @@ fn parent_byte(parent: &[u8], leftover: &[u8], offset: usize) -> Option<u8> {
     }
 }
 
+fn parent_u16(parent: &[u8], leftover: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([
+        parent_byte(parent, leftover, offset).unwrap_or(0),
+        parent_byte(parent, leftover, offset + 1).unwrap_or(0),
+    ])
+}
+
 /// `ssl_dissect_hnd_cli_hello` subsets the message body, so leftover after the
 /// record cannot satisfy version/random/session_id.
 fn client_hello_throws(body: &[u8]) -> bool {
@@ -754,9 +763,39 @@ fn cert_verify_throws(parent: &[u8], leftover: &[u8], version: u16) -> bool {
     matches!(version, 0x0303 | 0x0304) && parent_avail(parent, leftover) < 2
 }
 
-/// `ssl_dissect_hnd_cert_url` reads type then the URL list length.
+/// `ssl_dissect_hnd_cert_url` reads type then the 2-byte URL list length from
+/// the parent tvb, then `while (url_hash_len-- > 0)` walks that many
+/// URLAndHash entries (tshark treats the vector length as a count). Each
+/// entry reads url_len, url, padding, and a 20-byte SHA-1. A throw aborts
+/// `dissect_ssl`: leftover is not desegmented, and later records in this
+/// payload are not walked.
 fn cert_url_throws(parent: &[u8], leftover: &[u8]) -> bool {
-    parent_avail(parent, leftover) < 3
+    let avail = parent_avail(parent, leftover);
+    if avail < 3 {
+        return true;
+    }
+    let list_len = parent_u16(parent, leftover, 1) as usize;
+    let mut offset = 3;
+    for _ in 0..list_len {
+        if avail.saturating_sub(offset) < 2 {
+            return true;
+        }
+        let url_len = parent_u16(parent, leftover, offset) as usize;
+        offset += 2;
+        if avail.saturating_sub(offset) < url_len {
+            return true;
+        }
+        offset += url_len;
+        if avail.saturating_sub(offset) < 1 {
+            return true;
+        }
+        offset += 1;
+        if avail.saturating_sub(offset) < 20 {
+            return true;
+        }
+        offset += 20;
+    }
+    false
 }
 
 /// `dissect_ssl3_hnd_encrypted_exts` (handshake type 67, NPN).
@@ -1961,6 +2000,86 @@ mod tests {
                 TlsParse::Other,
                 "hb ver {version:#06x} same GREASE"
             );
+        }
+    }
+
+    #[test]
+    fn throwing_cert_url_does_not_walk_a_following_hello_in_the_same_payload() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let bodies: &[&[u8]] = &[
+            &[],
+            &[0x00],
+            &[0x00, 0x01],
+            &[0x00, 0x00, 0x01],
+            &[0x00, 0x05, 0x00, 0x00, 0x00],
+        ];
+        for body in bodies {
+            let rec = handshake_type_record_at(21, 0x0303, body);
+            for following in [&hello, &grease] {
+                let mut payload = rec.clone();
+                payload.extend_from_slice(following);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&payload),
+                    TlsParse::Other,
+                    "cert_url body {} same {}",
+                    body.len(),
+                    following[1]
+                );
+            }
+        }
+        for following in [&hello, &grease] {
+            for leftover in [vec![0x00u8], vec![0x00, 0x00]] {
+                let mut first = handshake_type_record(21);
+                first.extend_from_slice(&leftover);
+                assert_eq!(
+                    stitch_leftover(&first, following),
+                    named.clone(),
+                    "leftover {} then {}",
+                    leftover.len(),
+                    following[1]
+                );
+            }
+            let mut three = handshake_type_record(21);
+            three.extend_from_slice(&[0x00, 0x00, 0x00]);
+            assert_eq!(
+                stitch_leftover(&three, following),
+                TlsParse::Other,
+                "leftover 3 zeros then {}",
+                following[1]
+            );
+            let mut overrun = handshake_type_record(21);
+            overrun.extend_from_slice(&[0x00, 0x01, 0x00]);
+            assert_eq!(
+                truncated_handshake_prefix(&overrun, TlsSession::Unknown),
+                None,
+                "leftover 00 01 00"
+            );
+            assert_eq!(
+                stitch_leftover(&overrun, following),
+                named.clone(),
+                "leftover 00 01 00 then {}",
+                following[1]
+            );
+            let mut empty_list = handshake_type_record_at(21, 0x0303, &[0x00, 0x00, 0x00]);
+            empty_list.extend_from_slice(following);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&empty_list),
+                named.clone(),
+                "list_len 0 then {}",
+                following[1]
+            );
+            for msg_type in [2u8, 4, 6, 8, 15, 25, 67] {
+                let mut payload = handshake_type_record(msg_type);
+                payload.extend_from_slice(following);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&payload),
+                    named.clone(),
+                    "empty type {msg_type} then {}",
+                    following[1]
+                );
+            }
         }
     }
 

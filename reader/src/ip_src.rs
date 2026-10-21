@@ -2616,6 +2616,43 @@ mod tests {
         let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &empty_sh));
         assert_eq!(cell.tls_sni, ["www.example.com"]);
         assert_eq!(cell.counted, None);
+        for body in [
+            Vec::new(),
+            vec![0x00],
+            vec![0x00, 0x01],
+            vec![0x00, 0x00, 0x01],
+            vec![0x00, 0x05, 0x00, 0x00, 0x00],
+        ] {
+            let n = body.len() as u32;
+            let mut hs = vec![21, (n >> 16) as u8, (n >> 8) as u8, n as u8];
+            hs.extend_from_slice(&body);
+            let rec = handshake_record_body(&hs);
+            for following in [grease.as_slice(), hello.as_slice()] {
+                let mut payload = rec.clone();
+                payload.extend_from_slice(following);
+                let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload));
+                assert_eq!(
+                    cell.tls_sni,
+                    [] as [&str; 0],
+                    "cert_url body {} same",
+                    body.len()
+                );
+                assert_eq!(cell.counted, None, "cert_url body {} same", body.len());
+            }
+        }
+        let mut overrun = handshake_type(21);
+        overrun.extend_from_slice(&[0x00, 0x01, 0x00]);
+        let cells = next_seq_frames(&overrun, &hello);
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
+        let grease_cells = next_seq_frames(&overrun, &grease);
+        assert_eq!(grease_cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(grease_cells[1].counted, None);
+        let mut three = handshake_type(21);
+        three.extend_from_slice(&[0x00, 0x00, 0x00]);
+        let iur = next_seq_frames(&three, &hello);
+        assert_eq!(iur[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(iur[1].counted, None);
     }
 
     #[test]

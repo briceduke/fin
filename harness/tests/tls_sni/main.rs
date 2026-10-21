@@ -1241,6 +1241,63 @@ fn throwing_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
         "hb-len1-type00-same-0301",
         prefix_then_hello_same(&tls_record(0x18, 0x0303, &[0x00]), 0x0301),
     ));
+    for (tag, body) in [
+        ("empty", &[][..]),
+        ("body00", &[0x00][..]),
+        ("body0001", &[0x00, 0x01][..]),
+        ("body000001", &[0x00, 0x00, 0x01][..]),
+        ("body0005000000", &[0x00, 0x05, 0x00, 0x00, 0x00][..]),
+    ] {
+        let rec = handshake_body_record(21, 0x0303, body);
+        cases.push((
+            leak(format!("cert-url-{tag}-same-0301")),
+            prefix_then_hello_same(&rec, 0x0301),
+        ));
+        cases.push((
+            leak(format!("cert-url-{tag}-same-grease")),
+            prefix_then_hello_same(&rec, 0x0a0a),
+        ));
+    }
+    cases.push((
+        "empty-cert-url-left-000100-0301",
+        leftover_then_hello(
+            &handshake_type_record(21, 0x0303),
+            &[0x00, 0x01, 0x00],
+            0x0301,
+        ),
+    ));
+    cases.push((
+        "empty-cert-url-left-000100-grease",
+        leftover_then_hello(
+            &handshake_type_record(21, 0x0303),
+            &[0x00, 0x01, 0x00],
+            0x0a0a,
+        ),
+    ));
+    cases.push((
+        "cert-url-list0-same-0301",
+        prefix_then_hello_same(
+            &handshake_body_record(21, 0x0303, &[0x00, 0x00, 0x00]),
+            0x0301,
+        ),
+    ));
+    cases.push((
+        "cert-url-list0-same-grease",
+        prefix_then_hello_same(
+            &handshake_body_record(21, 0x0303, &[0x00, 0x00, 0x00]),
+            0x0a0a,
+        ),
+    ));
+    for msg_type in [2u8, 4, 6, 8, 15, 25, 67] {
+        cases.push((
+            leak(format!("empty-hs{msg_type}-same-0301")),
+            prefix_then_hello_same(&handshake_type_record(msg_type, 0x0303), 0x0301),
+        ));
+        cases.push((
+            leak(format!("empty-hs{msg_type}-same-grease")),
+            prefix_then_hello_same(&handshake_type_record(msg_type, 0x0303), 0x0a0a),
+        ));
+    }
     cases
 }
 
