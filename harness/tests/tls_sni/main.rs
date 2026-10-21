@@ -77,31 +77,31 @@ fn combined_ip_src_and_sni_matches_tshark_469() {
         return;
     };
     let dir = work_dir();
-    let file = pcap(
-        LINK_ETHERNET,
-        &[eth_ipv4_tcp(
-            OUTER,
-            50000,
-            443,
-            &client_hello(Some("www.example.com")),
-        )],
-    );
-    let path = dir.join("combined.pcap");
-    fs::write(&path, file).unwrap();
-    let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
-    args.extend(
-        ["-n", "-T", "fields", "-e", "ip.src", "-e", FIELD]
-            .into_iter()
-            .map(OsString::from),
-    );
-    let output = run_pair(&tshark, &fin, &args).expect("pair");
-    let report = check_pair(&output).expect("check");
-    assert!(
-        report.faults.is_empty(),
-        "{report} tshark={:?} fin={:?}",
-        output.tshark_stdout,
-        output.fin_stdout
-    );
+    for (name, host) in [
+        ("combined", client_hello(Some("www.example.com"))),
+        ("combined-tab", client_hello_host(Some(b"ab\tcd"), 0x0301)),
+        ("combined-nl", client_hello_host(Some(b"ab\ncd"), 0x0301)),
+        ("combined-cr", client_hello_host(Some(b"ab\rcd"), 0x0301)),
+        ("combined-bs", client_hello_host(Some(b"ab\\cd"), 0x0301)),
+    ] {
+        let file = pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &host)]);
+        let path = dir.join(format!("{name}.pcap"));
+        fs::write(&path, file).unwrap();
+        let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
+        args.extend(
+            ["-n", "-T", "fields", "-e", "ip.src", "-e", FIELD]
+                .into_iter()
+                .map(OsString::from),
+        );
+        let output = run_pair(&tshark, &fin, &args).expect("pair");
+        let report = check_pair(&output).expect("check");
+        assert!(
+            report.faults.is_empty(),
+            "{name}: {report} tshark={:?} fin={:?}",
+            output.tshark_stdout,
+            output.fin_stdout
+        );
+    }
 }
 
 #[test]
@@ -216,6 +216,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     ]
     .into_iter()
     .chain(record_version_cases())
+    .chain(review_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -244,8 +245,11 @@ fn record_version_cases() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn split_client_hello() -> Vec<u8> {
+    split_hello_at(40)
+}
+
+fn split_hello_at(cut: usize) -> Vec<u8> {
     let hello = client_hello(Some("www.example.com"));
-    let cut = 40;
     pcap(
         LINK_ETHERNET,
         &[
@@ -253,6 +257,203 @@ fn split_client_hello() -> Vec<u8> {
             eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + cut as u32, &hello[cut..]),
         ],
     )
+}
+
+fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let hello = client_hello(Some("www.example.com"));
+    let mut hello_0304 = hello.clone();
+    hello_0304[1..3].copy_from_slice(&0x0304u16.to_be_bytes());
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    let mut ccs_hello = ccs();
+    ccs_hello.extend_from_slice(&hello);
+    let mut alert_hello = vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    alert_hello.extend_from_slice(&hello);
+    let mut heartbeat_hello = vec![0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00];
+    heartbeat_hello.extend_from_slice(&hello);
+    let mut app_hello = vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01];
+    app_hello.extend_from_slice(&hello);
+    let mut ccs_grease = ccs();
+    ccs_grease.extend_from_slice(&grease);
+    let mut alert_grease = vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    alert_grease.extend_from_slice(&grease);
+    let mut app_grease = vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01];
+    app_grease.extend_from_slice(&grease);
+    let mut heartbeat_grease = vec![0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00];
+    heartbeat_grease.extend_from_slice(&grease);
+    vec![
+        (
+            "unnamed-0304",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 40001, 40002, &hello_0304)],
+            ),
+        ),
+        (
+            "unnamed-ccs-hello",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 40001, 40002, &ccs_hello)],
+            ),
+        ),
+        (
+            "unnamed-alert-hello",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 40001, 40002, &alert_hello)],
+            ),
+        ),
+        (
+            "unnamed-heartbeat-hello",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 40001, 40002, &heartbeat_hello)],
+            ),
+        ),
+        (
+            "unnamed-app-hello",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 40001, 40002, &app_hello)],
+            ),
+        ),
+        (
+            "sni-nul-mid",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"www\0.example"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "sni-nul-trail",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"www.example\0"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "sni-nul-multi",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"a\0b\0c"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "sni-tab",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"ab\tcd"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "sni-newline",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"ab\ncd"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "sni-cr",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"ab\rcd"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "sni-backslash",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &client_hello_host(Some(b"ab\\cd"), 0x0301),
+                )],
+            ),
+        ),
+        (
+            "ccs-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 443, &ccs_grease)],
+            ),
+        ),
+        (
+            "alert-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 443, &alert_grease)],
+            ),
+        ),
+        (
+            "app-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 443, &app_grease)],
+            ),
+        ),
+        (
+            "heartbeat-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 443, &heartbeat_grease)],
+            ),
+        ),
+        (
+            "ccs-then-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &ccs()),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + ccs().len() as u32, &grease),
+                ],
+            ),
+        ),
+        ("split-hello-1", split_hello_at(1)),
+        ("split-hello-2", split_hello_at(2)),
+        ("split-hello-3", split_hello_at(3)),
+        ("split-hello-4", split_hello_at(4)),
+        ("split-hello-5", split_hello_at(5)),
+        ("ccs-grease-0305", ccs_then_hello(0x0305)),
+        ("ccs-grease-7f1c", ccs_then_hello(0x7f1c)),
+        ("ccs-grease-feff", ccs_then_hello(0xfeff)),
+        ("ccs-grease-0002", ccs_then_hello(0x0002)),
+    ]
+}
+
+fn ccs_then_hello(version: u16) -> Vec<u8> {
+    let mut payload = ccs();
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
 }
 
 fn chunked_sni() -> Vec<u8> {

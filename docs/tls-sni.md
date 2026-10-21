@@ -21,7 +21,7 @@ These frames are counted when they look like a TLS/DTLS/QUIC handshake, and left
 
 | Case | Why |
 | --- | --- |
-| ClientHello split across TCP segments | Needs TCP reassembly. |
+| ClientHello split across TCP segments | Sequential in-order splits of one record print SNI on the completing frame. Out-of-order and multi-record stitches are counted. |
 | ClientHello length past this TLS record | tshark stitches records; v1 does not. |
 | DTLS | UDP. Handshake records are counted. |
 | QUIC Initial | UDP. Counted, not decrypted. |

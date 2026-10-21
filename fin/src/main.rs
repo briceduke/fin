@@ -70,8 +70,8 @@ fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i3
         let mut columns = Vec::with_capacity(fields.len());
         for field in fields {
             match field {
-                Field::IpSrc => columns.push(cell.values.join(",")),
-                Field::TlsSni => columns.push(cell.tls_sni.join(",")),
+                Field::IpSrc => columns.push(escape_field(&cell.values.join(","))),
+                Field::TlsSni => columns.push(escape_field(&cell.tls_sni.join(","))),
             }
         }
         println!("{}", columns.join("\t"));
@@ -161,4 +161,41 @@ fn next_str(
     value
         .into_string()
         .map_err(|_| format!("missing {flag} value"))
+}
+
+/// tshark 4.6.9 `-T fields` (`ws_escape_csv` with whitespace escapes).
+fn escape_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0b}' => out.push_str("\\v"),
+            '\\' => out.push_str("\\\\"),
+            '\0' => out.push_str("\\0"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_field;
+
+    #[test]
+    fn fields_escape_tab_newline_cr_backslash() {
+        assert_eq!(escape_field("ab\tcd"), "ab\\tcd");
+        assert_eq!(escape_field("ab\ncd"), "ab\\ncd");
+        assert_eq!(escape_field("ab\rcd"), "ab\\rcd");
+        assert_eq!(escape_field("ab\\cd"), "ab\\\\cd");
+        assert_eq!(escape_field("ab\u{0c}cd"), "ab\\fcd");
+        assert_eq!(escape_field("ab\u{0b}cd"), "ab\\vcd");
+        assert_eq!(escape_field("ab\u{07}cd"), "ab\\acd");
+        assert_eq!(escape_field("ab\u{08}cd"), "ab\\bcd");
+    }
 }

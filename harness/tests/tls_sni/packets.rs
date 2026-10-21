@@ -115,6 +115,10 @@ pub fn eth_ipv4_udp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec
 }
 
 pub fn client_hello(sni: Option<&str>) -> Vec<u8> {
+    client_hello_host(sni.map(str::as_bytes), 0x0301)
+}
+
+pub fn client_hello_host(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
     let mut body = vec![0x03, 0x03];
     body.extend_from_slice(&[0x11u8; 32]);
     body.push(0);
@@ -122,8 +126,7 @@ pub fn client_hello(sni: Option<&str>) -> Vec<u8> {
     body.extend_from_slice(&[1, 0]);
     match sni {
         None => body.extend_from_slice(&[0, 0]),
-        Some(name) => {
-            let host = name.as_bytes();
+        Some(host) => {
             let entry_len = 1 + 2 + host.len();
             let sni_data_len = 2 + entry_len;
             let ext_len = 4 + sni_data_len;
@@ -136,7 +139,13 @@ pub fn client_hello(sni: Option<&str>) -> Vec<u8> {
             body.extend_from_slice(host);
         }
     }
-    handshake_record(&handshake(1, &body))
+    let mut rec = handshake_record(&handshake(1, &body));
+    rec[1..3].copy_from_slice(&version.to_be_bytes());
+    rec
+}
+
+pub fn ccs() -> Vec<u8> {
+    vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
 }
 
 pub fn handshake_record(body: &[u8]) -> Vec<u8> {

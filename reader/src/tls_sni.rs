@@ -18,20 +18,47 @@ const EXT_SERVER_NAME: u16 = 0;
 const RECORD_HEADER: usize = 5;
 const TLS_MAX_RECORD: usize = 16384 + 2048;
 
-/// Parse SNI from one TCP payload. One TLS record only; a ClientHello that
-/// continues past that record is [`TlsParse::Unproved`].
+/// Result of one TCP payload, plus whether tshark would keep this conversation
+/// as TLS and whether a later record may skip `ssl_looks_like_sslv3`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsOutcome {
+    pub kind: TlsParse,
+    pub claimed: bool,
+    pub known: bool,
+}
+
+/// Parse SNI from one TCP payload on an unnamed port. The first record must
+/// pass tshark 4.6.9 `is_sslv3_or_tls`.
 pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
-    parse_records(payload)
+    parse_tls(payload, false, true).kind
 }
 
 /// Port 443 (and the other `tls` ports) force the TLS dissector. An unknown
-/// session still uses `ssl_looks_like_sslv3`, so the record versions are the
-/// same as [`parse_tcp_tls`].
+/// session uses `ssl_looks_like_sslv3`; after an authoritative SSLv3/TLS 1.0–1.2
+/// or TLCP record, later records follow `dissect_ssl3_record`.
 pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
-    parse_tcp_tls(payload)
+    parse_tls(payload, false, false).kind
 }
 
-fn parse_records(payload: &[u8]) -> TlsParse {
+/// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate. `known` is a
+/// conversation whose version already stuck as SSLv3/TLS 1.0–1.2/TLCP.
+pub fn parse_tls(payload: &[u8], known: bool, heuristic: bool) -> TlsOutcome {
+    if heuristic && !is_sslv3_or_tls(payload) {
+        return TlsOutcome {
+            kind: TlsParse::Other,
+            claimed: false,
+            known,
+        };
+    }
+    let mut known = known;
+    TlsOutcome {
+        kind: parse_records(payload, &mut known),
+        claimed: true,
+        known,
+    }
+}
+
+fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
     if payload.is_empty() {
         return TlsParse::Other;
     }
@@ -40,9 +67,18 @@ fn parse_records(payload: &[u8]) -> TlsParse {
     let mut saw_hello = false;
     let mut unproved = false;
     while offset < payload.len() {
-        match take_record(payload, offset) {
+        match take_record(payload, offset, *known) {
             Record::Done => break,
-            Record::Other { next } => offset = next,
+            Record::Other {
+                next,
+                version,
+                content,
+            } => {
+                if sets_known(content, version) {
+                    *known = true;
+                }
+                offset = next;
+            }
             Record::Unproved => {
                 unproved = true;
                 break;
@@ -102,8 +138,15 @@ pub fn looks_like_quic_initial(payload: &[u8]) -> bool {
 }
 
 enum Record<'a> {
-    Handshake { body: &'a [u8], next: usize },
-    Other { next: usize },
+    Handshake {
+        body: &'a [u8],
+        next: usize,
+    },
+    Other {
+        next: usize,
+        version: u16,
+        content: u8,
+    },
     Unproved,
     Done,
 }
@@ -114,7 +157,7 @@ enum Hello {
     Unproved,
 }
 
-fn take_record(payload: &[u8], offset: usize) -> Record<'_> {
+fn take_record(payload: &[u8], offset: usize, known: bool) -> Record<'_> {
     let rest = &payload[offset..];
     if rest.is_empty() {
         return Record::Done;
@@ -126,7 +169,7 @@ fn take_record(payload: &[u8], offset: usize) -> Record<'_> {
             Record::Done
         };
     };
-    if !is_record_version(version) {
+    if !known && !is_record_version(version) {
         return Record::Done;
     }
     if length == 0 || length >= TLS_MAX_RECORD {
@@ -149,7 +192,11 @@ fn take_record(payload: &[u8], offset: usize) -> Record<'_> {
     if content == CONTENT_HANDSHAKE {
         Record::Handshake { body, next: end }
     } else {
-        Record::Other { next: end }
+        Record::Other {
+            next: end,
+            version,
+            content,
+        }
     }
 }
 
@@ -176,10 +223,51 @@ fn is_record_version(version: u16) -> bool {
     matches!(version, 0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0304 | 0x0101)
 }
 
+/// Versions that `dissect_ssl` keeps in the SSLv3/TLS 1.0–1.2/TLCP switch,
+/// so a later record is fed to `dissect_ssl3_record` without `ssl_looks_like_sslv3`.
+fn is_sticky_version(version: u16) -> bool {
+    matches!(version, 0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0101)
+}
+
+fn sets_known(content: u8, version: u16) -> bool {
+    content != CONTENT_HANDSHAKE && is_content_type(content) && is_sticky_version(version)
+}
+
+/// tshark 4.6.9 `is_sslv3_or_tls`: Handshake or Application Data, SSLv3/TLS 1.0–1.2
+/// or TLCP, nonzero length below `TLS_MAX_RECORD_LENGTH+2048`. TLS 1.3 (0x0304)
+/// and CCS/alert/heartbeat are not TLS on an unnamed port.
+fn is_sslv3_or_tls(payload: &[u8]) -> bool {
+    let Some((content, version, length)) = tls_record_header(payload) else {
+        return false;
+    };
+    if content != CONTENT_HANDSHAKE && content != 0x17 {
+        return false;
+    }
+    if !is_sticky_version(version) {
+        return false;
+    }
+    length != 0 && length < TLS_MAX_RECORD
+}
+
 /// Bytes still needed to finish a handshake record that starts in `payload`.
 pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
+    truncated_handshake_need_known(payload, false)
+}
+
+/// Like [`truncated_handshake_need`], but a sticky session accepts any record
+/// version the way `dissect_ssl3_record` does.
+pub fn truncated_handshake_need_known(payload: &[u8], known: bool) -> Option<usize> {
+    if payload.is_empty() {
+        return None;
+    }
+    if payload.len() < RECORD_HEADER {
+        return (payload[0] == CONTENT_HANDSHAKE).then_some(RECORD_HEADER - payload.len());
+    }
     let (content, version, length) = tls_record_header(payload)?;
-    if content != CONTENT_HANDSHAKE || !is_record_version(version) {
+    if content != CONTENT_HANDSHAKE {
+        return None;
+    }
+    if !known && !is_record_version(version) {
         return None;
     }
     if length == 0 || length >= TLS_MAX_RECORD {
@@ -310,10 +398,12 @@ fn parse_server_name(data: &[u8]) -> Option<Vec<String>> {
     Some(names)
 }
 
-/// tshark 4.6.9 `ENC_ASCII` emits a UTF-8 replacement for any non-ASCII byte.
+/// tshark 4.6.9 `ENC_ASCII` stops at the first NUL and emits a UTF-8
+/// replacement for any non-ASCII byte.
 fn ascii_name(bytes: &[u8]) -> String {
     bytes
         .iter()
+        .take_while(|&&b| b != 0)
         .map(|&b| if b < 0x80 { char::from(b) } else { '\u{FFFD}' })
         .collect()
 }
@@ -408,6 +498,10 @@ mod tests {
     }
 
     fn client_hello(sni: Option<&str>) -> Vec<u8> {
+        client_hello_bytes(sni.map(str::as_bytes), 0x0301)
+    }
+
+    fn client_hello_bytes(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
         let mut body = vec![0x03, 0x03];
         body.extend_from_slice(&[0u8; 32]);
         body.push(0);
@@ -417,8 +511,7 @@ mod tests {
             None => {
                 body.extend_from_slice(&[0, 0]);
             }
-            Some(name) => {
-                let host = name.as_bytes();
+            Some(host) => {
                 let entry_len = 1 + 2 + host.len();
                 let list_len = entry_len;
                 let sni_data_len = 2 + list_len;
@@ -434,9 +527,13 @@ mod tests {
         }
         record(
             CONTENT_HANDSHAKE,
-            0x0301,
+            version,
             &handshake(HANDSHAKE_CLIENT_HELLO, &body),
         )
+    }
+
+    fn ccs() -> Vec<u8> {
+        record(0x14, 0x0303, &[0x01])
     }
 
     #[test]
@@ -531,6 +628,74 @@ mod tests {
         );
         assert_eq!(truncated_handshake_need(&hello), None);
         assert_eq!(truncated_handshake_need(&hello[..5]), Some(hello.len() - 5));
+        for header_cut in 1..5 {
+            assert_eq!(
+                truncated_handshake_need(&hello[..header_cut]),
+                Some(5 - header_cut),
+                "cut {header_cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_port_rejects_tls13_record_version() {
+        let hello = client_hello_bytes(Some(b"www.example.com"), 0x0304);
+        assert_eq!(parse_tcp_tls(&hello), TlsParse::Other);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&hello),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn unnamed_port_rejects_ccs_alert_heartbeat_prefix() {
+        let hello = client_hello(Some("www.example.com"));
+        let alert = record(0x15, 0x0303, &[0x02, 0x28]);
+        let heartbeat = record(0x18, 0x0303, &[0x01, 0x00, 0x00]);
+        for prefix in [ccs(), alert, heartbeat] {
+            let mut payload = prefix;
+            payload.extend_from_slice(&hello);
+            assert_eq!(parse_tcp_tls(&payload), TlsParse::Other);
+        }
+        let mut app = record(0x17, 0x0303, &[1]);
+        app.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tcp_tls(&app),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn sni_stops_at_first_nul() {
+        assert_eq!(ascii_name(b"www\0.example"), "www");
+        assert_eq!(ascii_name(b"www.example\0"), "www.example");
+        assert_eq!(ascii_name(b"a\0b\0c"), "a");
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&client_hello_bytes(Some(b"www\0.example"), 0x0301)),
+            TlsParse::ClientHello(vec!["www".to_string()])
+        );
+    }
+
+    #[test]
+    fn sticky_session_reads_grease_after_ccs() {
+        let mut payload = ccs();
+        payload.extend_from_slice(&client_hello_bytes(Some(b"www.example.com"), 0x0a0a));
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&payload),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        assert_eq!(
+            parse_tcp_tls(&payload),
+            TlsParse::Other,
+            "unnamed port CCS prefix is not is_sslv3_or_tls"
+        );
+        let lone = client_hello_bytes(Some(b"www.example.com"), 0x0a0a);
+        assert_eq!(parse_tcp_tls_on_tls_port(&lone), TlsParse::Other);
+        let after = parse_tls(&lone, true, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
     }
 
     #[test]

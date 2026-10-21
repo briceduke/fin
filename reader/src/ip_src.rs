@@ -5,8 +5,8 @@ use std::net::Ipv4Addr;
 
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
-    looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tcp_tls,
-    parse_tcp_tls_on_tls_port, truncated_handshake_need, TlsParse,
+    looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tls,
+    truncated_handshake_need_known, TlsOutcome, TlsParse,
 };
 use crate::Frame;
 
@@ -87,10 +87,10 @@ struct TcpSeq {
     seq: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TlsNeed {
     next_seq: u32,
-    remaining: usize,
+    prefix: Vec<u8>,
 }
 
 /// Session state for a sequential field walk.
@@ -99,6 +99,8 @@ pub struct IpSrc {
     frags: FragTable,
     tls_seen: HashSet<TcpSeq>,
     tls_need: HashMap<TcpFlow, TlsNeed>,
+    tls_claimed: HashSet<TcpFlow>,
+    tls_known: HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
 }
@@ -121,6 +123,8 @@ impl IpSrc {
             frags: FragTable::default(),
             tls_seen: HashSet::new(),
             tls_need: HashMap::new(),
+            tls_claimed: HashSet::new(),
+            tls_known: HashSet::new(),
             want_ip: ip_src || !tls_sni,
             want_tls: tls_sni,
         }
@@ -141,6 +145,8 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         frags: &mut session.frags,
         tls_seen: &mut session.tls_seen,
         tls_need: &mut session.tls_need,
+        tls_claimed: &mut session.tls_claimed,
+        tls_known: &mut session.tls_known,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
         flow_src: None,
@@ -163,6 +169,8 @@ struct Walk<'a> {
     frags: &'a mut FragTable,
     tls_seen: &'a mut HashSet<TcpSeq>,
     tls_need: &'a mut HashMap<TcpFlow, TlsNeed>,
+    tls_claimed: &'a mut HashSet<TcpFlow>,
+    tls_known: &'a mut HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
     flow_src: Option<FlowHost>,
@@ -601,49 +609,25 @@ impl Walk<'_> {
                 return;
             }
         }
+        let known = flow
+            .map(|flow| self.tls_known.contains(&flow))
+            .unwrap_or(false);
         if let Some(flow) = flow {
-            if self.take_tls_need(flow, seq, payload) {
+            if let Some(outcome) = self.take_tls_need(flow, seq, payload, known) {
                 if let Some(key) = key {
                     self.tls_seen.insert(key);
                 }
-                self.count("tls-handshake");
+                self.apply_tls_outcome(Some(flow), seq, payload, outcome, false);
                 return;
             }
         }
         if pick.is_tls() || pick.name.is_none() {
-            let parsed = if pick.is_tls() {
-                parse_tcp_tls_on_tls_port(payload)
-            } else {
-                parse_tcp_tls(payload)
-            };
-            match parsed {
-                TlsParse::ClientHello(names) => {
-                    if let Some(flow) = flow {
-                        self.tls_need.remove(&flow);
-                    }
-                    if let Some(key) = key {
-                        self.tls_seen.insert(key);
-                    }
-                    self.tls_sni.extend(names);
-                }
-                TlsParse::Unproved => {
-                    if let Some(key) = key {
-                        self.tls_seen.insert(key);
-                    }
-                    if let (Some(flow), Some(remaining)) = (flow, truncated_handshake_need(payload))
-                    {
-                        self.tls_need.insert(
-                            flow,
-                            TlsNeed {
-                                next_seq: seq.wrapping_add(payload.len() as u32),
-                                remaining,
-                            },
-                        );
-                    }
-                    self.count("tls-handshake");
-                }
-                TlsParse::Other => {}
-            }
+            let claimed = pick.is_tls()
+                || flow
+                    .map(|flow| self.tls_claimed.contains(&flow))
+                    .unwrap_or(false);
+            let outcome = parse_tls(payload, known, !claimed);
+            self.apply_tls_outcome(flow, seq, payload, outcome, true);
             return;
         }
         if looks_like_tls_handshake(payload) {
@@ -651,25 +635,94 @@ impl Walk<'_> {
         }
     }
 
-    fn take_tls_need(&mut self, flow: TcpFlow, seq: u32, payload: &[u8]) -> bool {
-        let Some(need) = self.tls_need.get(&flow).copied() else {
-            return false;
-        };
-        if seq != need.next_seq {
-            return false;
+    fn apply_tls_outcome(
+        &mut self,
+        flow: Option<TcpFlow>,
+        seq: u32,
+        payload: &[u8],
+        outcome: TlsOutcome,
+        buffer_unproved: bool,
+    ) {
+        if let Some(flow) = flow {
+            if outcome.claimed {
+                self.tls_claimed.insert(flow);
+            }
+            if outcome.known {
+                self.tls_known.insert(flow);
+            }
         }
-        if payload.len() < need.remaining {
+        match outcome.kind {
+            TlsParse::ClientHello(names) => {
+                if let Some(flow) = flow {
+                    self.tls_need.remove(&flow);
+                }
+                if let Some(flow) = flow {
+                    self.tls_seen.insert(TcpSeq {
+                        src: flow.src,
+                        dst: flow.dst,
+                        sport: flow.sport,
+                        dport: flow.dport,
+                        seq,
+                    });
+                }
+                self.tls_sni.extend(names);
+            }
+            TlsParse::Unproved => {
+                if let Some(flow) = flow {
+                    self.tls_seen.insert(TcpSeq {
+                        src: flow.src,
+                        dst: flow.dst,
+                        sport: flow.sport,
+                        dport: flow.dport,
+                        seq,
+                    });
+                    if buffer_unproved
+                        && truncated_handshake_need_known(payload, outcome.known).is_some()
+                    {
+                        self.tls_need.insert(
+                            flow,
+                            TlsNeed {
+                                next_seq: seq.wrapping_add(payload.len() as u32),
+                                prefix: payload.to_vec(),
+                            },
+                        );
+                    }
+                }
+                self.count("tls-handshake");
+            }
+            TlsParse::Other => {}
+        }
+    }
+
+    fn take_tls_need(
+        &mut self,
+        flow: TcpFlow,
+        seq: u32,
+        payload: &[u8],
+        known: bool,
+    ) -> Option<TlsOutcome> {
+        let need = self.tls_need.get(&flow)?.clone();
+        if seq != need.next_seq {
+            return None;
+        }
+        let mut buf = need.prefix;
+        buf.extend_from_slice(payload);
+        let next_seq = seq.wrapping_add(payload.len() as u32);
+        let outcome = parse_tls(&buf, known, false);
+        if outcome.kind == TlsParse::Unproved
+            && truncated_handshake_need_known(&buf, outcome.known).is_some()
+        {
             self.tls_need.insert(
                 flow,
                 TlsNeed {
-                    next_seq: seq.wrapping_add(payload.len() as u32),
-                    remaining: need.remaining - payload.len(),
+                    next_seq,
+                    prefix: buf,
                 },
             );
         } else {
             self.tls_need.remove(&flow);
         }
-        true
+        Some(outcome)
     }
 
     fn tls_from_udp(&mut self, payload: &[u8]) {
@@ -1656,7 +1709,10 @@ mod tests {
     }
 
     fn sni_hello(name: &str) -> Vec<u8> {
-        let host = name.as_bytes();
+        sni_hello_host(name.as_bytes())
+    }
+
+    fn sni_hello_host(host: &[u8]) -> Vec<u8> {
         let mut body = vec![0x03, 0x03];
         body.extend_from_slice(&[0u8; 32]);
         body.push(0);
@@ -1765,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn split_client_hello_counts_the_completing_segment() {
+    fn split_client_hello_prints_sni_on_the_completing_segment() {
         let hello = sni_hello("www.example.com");
         let cut = 40;
         assert!(hello.len() > cut);
@@ -1788,8 +1844,106 @@ mod tests {
         );
         assert_eq!(start.tls_sni, [] as [&str; 0]);
         assert_eq!(start.counted, Some("tls-handshake"));
-        assert_eq!(rest.tls_sni, [] as [&str; 0]);
-        assert_eq!(rest.counted, Some("tls-handshake"));
+        assert_eq!(rest.tls_sni, ["www.example.com"]);
+        assert_eq!(rest.counted, None);
+    }
+
+    #[test]
+    fn split_client_hello_before_record_header_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        for cut in 1..5 {
+            let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &hello[..cut]);
+            let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1 + cut as u32, &hello[cut..]);
+            let mut session = IpSrc::query(false, true);
+            let start = walk_ip_src(
+                &Frame {
+                    link_type: ETHERNET,
+                    captured: &first,
+                },
+                &mut session,
+            );
+            let rest = walk_ip_src(
+                &Frame {
+                    link_type: ETHERNET,
+                    captured: &second,
+                },
+                &mut session,
+            );
+            assert_eq!(start.tls_sni, [] as [&str; 0], "cut {cut}");
+            assert_eq!(start.counted, Some("tls-handshake"), "cut {cut}");
+            assert_eq!(rest.tls_sni, ["www.example.com"], "cut {cut}");
+            assert_eq!(rest.counted, None, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn unnamed_port_tls13_record_version_is_blank() {
+        let mut hello = sni_hello("www.example.com");
+        hello[1..3].copy_from_slice(&0x0304u16.to_be_bytes());
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &hello);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn unnamed_port_ccs_prefix_is_blank() {
+        let hello = sni_hello("www.example.com");
+        let mut payload = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        payload.extend_from_slice(&hello);
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &payload);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn sni_stops_at_nul() {
+        let hello = sni_hello_host(b"www\0.example");
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &hello);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, ["www"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn ccs_then_grease_hello_prints_sni() {
+        let mut hello = sni_hello("www.example.com");
+        hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        let mut payload = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        payload.extend_from_slice(&hello);
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn ccs_then_grease_hello_on_next_frame_prints_sni() {
+        let mut hello = sni_hello("www.example.com");
+        hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        let ccs = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &ccs);
+        let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1 + ccs.len() as u32, &hello);
+        let mut session = IpSrc::query(false, true);
+        let start = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let rest = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(start.tls_sni, [] as [&str; 0]);
+        assert_eq!(start.counted, None);
+        assert_eq!(rest.tls_sni, ["www.example.com"]);
+        assert_eq!(rest.counted, None);
     }
 
     #[test]
