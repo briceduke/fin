@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use reader::ports::{checked_in_decodes, checked_in_heuristics, is_pinned_name};
+use reader::ports::{
+    checked_in_decodes, checked_in_heuristics, checked_in_tls_ports, is_pinned_name,
+};
 
 #[test]
 fn decodes_dump_matches_tshark_469() {
@@ -44,6 +46,21 @@ fn decodes_dump_matches_tshark_469() {
         "pinned port names differ from tshark 4.6.9:\n{}",
         mismatches.join("\n")
     );
+}
+
+#[test]
+fn tls_port_dump_matches_tshark_469() {
+    let Some(tshark) = tshark_path() else {
+        eprintln!("skip: tshark 4.6.9 is not installed");
+        return;
+    };
+    if !version_ok(&tshark) {
+        eprintln!("skip: tshark version is not 4.6.9");
+        return;
+    }
+    let live = tls_port_keys(&dump(&tshark, "decodes"));
+    let pinned = tls_port_keys(checked_in_tls_ports());
+    assert_eq!(live, pinned);
 }
 
 #[test]
@@ -124,6 +141,24 @@ fn port_rows(text: &str) -> String {
         .filter(|line| line.starts_with("udp.port\t") || line.starts_with("tcp.port\t"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn tls_port_keys(text: &str) -> BTreeMap<u16, String> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        let Some(table) = cols.next() else { continue };
+        if table != "tls.port" {
+            continue;
+        }
+        let Some(key) = cols.next() else { continue };
+        let Some(name) = cols.next() else { continue };
+        let Ok(port) = key.parse::<u16>() else {
+            continue;
+        };
+        map.entry(port).or_insert_with(|| name.to_string());
+    }
+    map
 }
 
 fn udp_tcp_heuristics(text: &str) -> String {
