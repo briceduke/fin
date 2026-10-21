@@ -15,13 +15,23 @@ pub enum TlsParse {
 const CONTENT_HANDSHAKE: u8 = 0x16;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const EXT_SERVER_NAME: u16 = 0;
-const NAME_HOST_NAME: u8 = 0;
 const RECORD_HEADER: usize = 5;
 const TLS_MAX_RECORD: usize = 16384 + 2048;
 
 /// Parse SNI from one TCP payload. One TLS record only; a ClientHello that
 /// continues past that record is [`TlsParse::Unproved`].
 pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
+    parse_records(payload, false)
+}
+
+/// Port 443 (and the other `tls` ports) force the TLS dissector, so a
+/// handshake record is walked even when the record version is not one of
+/// the common 0x03xx values.
+pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
+    parse_records(payload, true)
+}
+
+fn parse_records(payload: &[u8], on_tls_port: bool) -> TlsParse {
     if payload.is_empty() {
         return TlsParse::Other;
     }
@@ -30,7 +40,7 @@ pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
     let mut saw_hello = false;
     let mut unproved = false;
     while offset < payload.len() {
-        match take_record(payload, offset) {
+        match take_record(payload, offset, on_tls_port) {
             Record::Done => break,
             Record::Other { next } => offset = next,
             Record::Unproved => {
@@ -104,7 +114,7 @@ enum Hello {
     Unproved,
 }
 
-fn take_record(payload: &[u8], offset: usize) -> Record<'_> {
+fn take_record(payload: &[u8], offset: usize, on_tls_port: bool) -> Record<'_> {
     let rest = &payload[offset..];
     if rest.is_empty() {
         return Record::Done;
@@ -116,11 +126,15 @@ fn take_record(payload: &[u8], offset: usize) -> Record<'_> {
             Record::Done
         };
     };
-    if !is_tls_version(version) {
+    if !is_record_version(version, on_tls_port) {
         return Record::Done;
     }
     if length == 0 || length >= TLS_MAX_RECORD {
-        return Record::Done;
+        return if content == CONTENT_HANDSHAKE {
+            Record::Unproved
+        } else {
+            Record::Done
+        };
     }
     let start = offset + RECORD_HEADER;
     let end = start.saturating_add(length);
@@ -158,6 +172,42 @@ fn is_content_type(content: u8) -> bool {
 
 fn is_tls_version(version: u16) -> bool {
     matches!(version, 0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0304 | 0x0101)
+}
+
+/// tshark 4.6.9 `ssl_is_valid_ssl_version` / `ssl_versions` on a TLS port.
+fn is_record_version(version: u16, on_tls_port: bool) -> bool {
+    if is_tls_version(version) {
+        return true;
+    }
+    if !on_tls_port {
+        return false;
+    }
+    matches!(
+        version,
+        0x0002 | 0x0100 | 0x7f0e
+            ..=0x7f1c
+                | 0xfb17
+                | 0xfb1a
+                | 0x0a0a
+                | 0x1a1a
+                | 0x2a2a
+                | 0x3a3a
+                | 0x4a4a
+                | 0x5a5a
+                | 0x6a6a
+                | 0x7a7a
+                | 0x8a8a
+                | 0x9a9a
+                | 0xaaaa
+                | 0xbaba
+                | 0xcaca
+                | 0xdada
+                | 0xeaea
+                | 0xfafa
+                | 0xfeff
+                | 0xfefd
+                | 0xfefc
+    )
 }
 
 fn parse_handshake_messages(body: &[u8]) -> Hello {
@@ -265,8 +315,7 @@ fn parse_server_name(data: &[u8]) -> Option<Vec<String>> {
     let mut offset = 0;
     let mut names = Vec::new();
     while offset < list.len() {
-        let name_type = *list.get(offset)?;
-        offset += 1;
+        offset += 1; // name type; tshark prints every ServerName, not only host_name
         if offset + 2 > list.len() {
             return None;
         }
@@ -277,15 +326,17 @@ fn parse_server_name(data: &[u8]) -> Option<Vec<String>> {
         }
         let name = &list[offset..offset + name_len];
         offset += name_len;
-        if name_type == NAME_HOST_NAME {
-            names.push(ascii_name(name));
-        }
+        names.push(ascii_name(name));
     }
     Some(names)
 }
 
+/// tshark 4.6.9 `ENC_ASCII` emits a UTF-8 replacement for any non-ASCII byte.
 fn ascii_name(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| char::from(b)).collect()
+    bytes
+        .iter()
+        .map(|&b| if b < 0x80 { char::from(b) } else { '\u{FFFD}' })
+        .collect()
 }
 
 fn u24(bytes: &[u8]) -> usize {
@@ -397,7 +448,7 @@ mod tests {
                 body.extend_from_slice(&EXT_SERVER_NAME.to_be_bytes());
                 body.extend_from_slice(&(sni_data_len as u16).to_be_bytes());
                 body.extend_from_slice(&(list_len as u16).to_be_bytes());
-                body.push(NAME_HOST_NAME);
+                body.push(0);
                 body.extend_from_slice(&(host.len() as u16).to_be_bytes());
                 body.extend_from_slice(host);
             }
@@ -449,6 +500,30 @@ mod tests {
     fn app_data_is_other() {
         let rec = record(0x17, 0x0303, &[1, 2, 3, 4]);
         assert_eq!(parse_tcp_tls(&rec), TlsParse::Other);
+    }
+
+    #[test]
+    fn non_ascii_sni_byte_is_replacement() {
+        assert_eq!(ascii_name(&[b'a', 0x80, b'b']), "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn unknown_name_type_still_prints() {
+        let mut hello = client_hello(Some("fuzz.example"));
+        let idx = hello.len() - "fuzz.example".len() - 3;
+        hello[idx] = 185;
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&hello),
+            TlsParse::ClientHello(vec!["fuzz.example".to_string()])
+        );
+    }
+
+    #[test]
+    fn unknown_record_version_is_other() {
+        let mut hello = client_hello(Some("www.example.com"));
+        hello[1] = 0x03;
+        hello[2] = 0x10;
+        assert_eq!(parse_tcp_tls_on_tls_port(&hello), TlsParse::Other);
     }
 
     #[test]

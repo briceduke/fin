@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tcp_tls,
-    TlsParse,
+    parse_tcp_tls_on_tls_port, TlsParse,
 };
 use crate::Frame;
 
@@ -572,7 +572,12 @@ impl Walk<'_> {
             }
         }
         if pick.is_tls() || pick.name.is_none() {
-            match parse_tcp_tls(payload) {
+            let parsed = if pick.is_tls() {
+                parse_tcp_tls_on_tls_port(payload)
+            } else {
+                parse_tcp_tls(payload)
+            };
+            match parsed {
                 TlsParse::ClientHello(names) => {
                     if let Some(key) = key {
                         self.tls_seen.insert(key);
