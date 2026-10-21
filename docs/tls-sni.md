@@ -6,9 +6,10 @@ A counted miss is allowed. Fin never prints a server name tshark did not print.
 
 ## What v1 proves
 
-One TCP payload, one TLS record, the ClientHello `server_name` extension, `host_name` type. IPv4 and IPv6, plus VLAN/QinQ, SLL, SLL2, and the tunnels `ip.src` already walks (VXLAN, IPIP, TEB, EtherIP).
+The ClientHello `server_name` extension, `host_name` type. An in-order TCP split of one TLS record prints the name on the completing segment. IPv4 and IPv6, plus VLAN/QinQ, SLL, SLL2, and the tunnels `ip.src` already walks (VXLAN, IPIP, TEB, EtherIP).
 
 - A complete ClientHello with SNI prints the name.
+- An in-order split of one ClientHello record prints the name on the completing segment.
 - A complete ClientHello without SNI prints an empty line.
 - A port-443 payload that is not TLS prints an empty line.
 - A retransmission of a TCP sequence already consumed prints an empty line, matching tshark's reassembly skip.
@@ -21,7 +22,7 @@ These frames are counted when they look like a TLS/DTLS/QUIC handshake, and left
 
 | Case | Why |
 | --- | --- |
-| ClientHello split across TCP segments | Sequential in-order splits of one record print SNI on the completing frame. Out-of-order and multi-record stitches are counted. |
+| ClientHello split out of order, or across TLS records | tshark stitches; v1 counts. |
 | ClientHello length past this TLS record | tshark stitches records; v1 does not. |
 | DTLS | UDP. Handshake records are counted. |
 | QUIC Initial | UDP. Counted, not decrypted. |

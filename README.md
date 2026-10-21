@@ -34,7 +34,7 @@ flowchart LR
 
 A capture file becomes frames: link type and the captured bytes. A classic pcap is mapped and split across cores. Each core proves that its chunk starts where the previous one stopped. A seam that does not prove is reread by the sequential reader, front to back on one core. pcapng, stdin, and live capture use that reader too.
 
-Header fields are read from the packet in hand. A TLS server name is proved from one TCP payload and one TLS record; a handshake that spans packets is counted. Rows from every core merge back into file order.
+Header fields are read from the packet in hand. A TLS server name is proved from a ClientHello `server_name` extension. An in-order split of one TLS record prints the name on the TCP segment that completes it; out-of-order and multi-record stitches are counted. Rows from every core merge back into file order.
 
 Those rows are the product. The CLI prints them as `-T fields`. The index answers the same query over an archive of captures. Parquet is the export. The desktop app is the Wireshark replacement, and it decodes only the packets on screen.
 
@@ -68,7 +68,7 @@ Each step is checked against the one before it.
 2. The sequential reader. Done. `read_capture` reads a file front to back on one core and returns frames: link type and the captured bytes. Tests cover the four pcap magics, pcapng blocks, and the file faults tshark 4.6.9 raises, including ISB, NRB, DSB, custom blocks, and systemd journal export.
 3. `ip.src`. Done. The walker covers Ethernet, classic SLL, SLL2, VLAN, QinQ, IPv4, IPv6 extension headers, ICMP errors, IP-in-IP, and VXLAN. UDP/TCP use the snapshotted tshark 4.6.9 port table. Any path it cannot prove is counted on stderr. HTTP is not in this step.
 4. The chunk split. Done. A mapped classic pcap is split across cores. Each core proves its start is the byte where the previous chunk stopped. A seam that does not prove is reread by `read_capture`. pcapng stays sequential: hopping blocks in parallel still peels frames in file order, and the measured win is on pcap. Tests diff chunked frames against the sequential reader, including adversarial pcap payloads and the file faults tshark 4.6.9 raises.
-5. TLS server names. Done. One TCP payload, one TLS record, the ClientHello `server_name` / `host_name` extension. A handshake that needs reassembly, a second TLS record, QUIC, or DTLS is counted. Notes: `docs/tls-sni.md`.
+5. TLS server names. Done. ClientHello `server_name` / `host_name`. An in-order split of one TLS record prints the name on the completing segment. Out-of-order stitches, a second TLS record, QUIC, or DTLS are counted. Notes: `docs/tls-sni.md`.
 6. HTTP.
 
 After TLS server names, QUIC Initials are decrypted and read with the same ClientHello parser. The index, the Parquet export, and the desktop app follow.
@@ -87,7 +87,7 @@ TShark 4.6.9 (`v4.6.9-0-g2d548b197c75`). Intel Core i9-14900HX, 32 GB RAM, Windo
 
 The prototype's `ip.src` output matched tshark on both million-packet files. The TLS names matched too, including tshark's blank line for a retransmitted ClientHello.
 
-The prototype did not reassemble split TLS handshakes. The v1 reader does not either: a split ClientHello is counted. bigFlows.pcap is older traffic, where every handshake fits in one packet. Modern browsers often split them, so those files will show counted misses.
+The prototype did not reassemble split TLS handshakes. The v1 reader prints the name on the in-order completing segment of one TLS record; out-of-order and multi-record stitches are counted. bigFlows.pcap is older traffic, where every handshake fits in one packet. Modern browsers often split them out of order, so those files will show counted misses.
 
 Inside tshark, the `ip.src` query costs about the same as printing the packet number. Disabling UDP, TCP, DNS, HTTP, TLS, and data dissection in tshark saves only 22%. The cost is tshark's per-packet engine itself.
 
