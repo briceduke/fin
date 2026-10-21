@@ -1,6 +1,6 @@
 # fin
 
-> TLS server names on a 368 MB capture: 0.226 seconds, against 7.87 seconds for tshark 4.6.9. Same 1,252 names. Preliminary, from a prototype that has since been removed.
+> TLS server names on a 368 MB capture: 0.206 seconds, against 6.39 seconds for tshark 4.6.9. 791,615 frames, 1,251 proved names.
 
 **Status:** `fin -r <file> [-n] -T fields -e ip.src` and `-e tls.handshake.extensions_server_name` map the file, split a classic pcap across cores, and print the field. pcapng and stdin use the sequential reader. Next is HTTP.
 
@@ -126,6 +126,18 @@ Linux VM, 4 cores. One warmup, then the median of three, warm cache. The walk is
 | chunked, 4 threads | same | 0.0044 s |
 
 `fin -e ip.src` on that file, stdout discarded, was 0.311 s. Rows still merge and the ip.src walk stays sequential.
+
+## TLS server names, 21 Oct 2026
+
+Linux VM, 4 cores. One warmup, then the median of three, warm cache. Release `fin`, stdout and stderr discarded. tshark 4.6.9 was passed `-n` and an empty config directory.
+
+| Query | Capture | tshark 4.6.9 | fin |
+| --- | --- | ---: | ---: |
+| TLS server name | bigFlows.pcap, 368 MB, 791,615 packets | 6.39 s | 0.206 s |
+| `ip.src` | 1,000,000 Ethernet + IPv4 + UDP, 74 MB | 5.83 s | 0.345 s |
+| `ip.src` | 1,000,000 QinQ + IPv4 + UDP, 82 MB | 6.74 s | 0.343 s |
+
+791,615 frames compared on bigFlows. 1,251 proved names against tshark's 1,252. The one miss is a ClientHello on TCP 5222 (XMPP STARTTLS); it is counted. `ip.src` on the million-packet files stays in the same range as the 19 Oct chunk-split row.
 
 ## License
 
