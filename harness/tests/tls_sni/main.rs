@@ -905,6 +905,87 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             "hello-leftover-00-then-0301",
             leftover_then_hello(&client_hello(Some("www.example.com")), &[0x00], 0x0301),
         ),
+        (
+            "tls13-sh-leftover-00-0301",
+            leftover_then_hello(&tls13_server_hello(), &[0x00], 0x0301),
+        ),
+        (
+            "empty-sh-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(2, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-nst-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(4, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-hrr-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(6, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-cv-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(15, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-cert-url-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(21, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-comp-cert-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(25, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-ee67-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(67, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "sh-legacy-leftover-00-grease",
+            leftover_then_hello(
+                &handshake_body_record(2, 0x0303, &[0x03, 0x03]),
+                &[0x00],
+                0x0a0a,
+            ),
+        ),
+        (
+            "empty-hs0-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(0, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-cert-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(11, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-shd-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(14, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-finished-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(20, 0x0303), &[0x00], 0x0a0a),
+        ),
+        (
+            "valid-sh-leftover-00-grease",
+            leftover_then_hello(&server_hello(), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-sh-leftover-00-0301",
+            leftover_then_hello(&handshake_type_record(2, 0x0303), &[0x00], 0x0301),
+        ),
+        (
+            "empty-ch-leftover-00-0301",
+            leftover_then_hello(&handshake_type_record(1, 0x0303), &[0x00], 0x0301),
+        ),
+        (
+            "sslv3-finished-leftover-00-grease",
+            leftover_then_hello(&handshake_type_record(20, 0x0300), &[0x00], 0x0a0a),
+        ),
+        (
+            "ccs-0301-empty-cv-leftover-00-grease",
+            leftover_after_prefix(
+                &ccs_version(0x0301),
+                &handshake_type_record(15, 0x0303),
+                &[0x00],
+                0x0a0a,
+            ),
+        ),
     ]
     .into_iter()
     .chain(tls13_session_cases())
@@ -1046,6 +1127,22 @@ fn empty_then_complete_hello_same(content: u8, version: u16) -> Vec<u8> {
 
 fn leftover_then_hello(prefix: &[u8], leftover: &[u8], version: u16) -> Vec<u8> {
     leftover_then_hello_ports(50000, 443, prefix, leftover, version)
+}
+
+fn leftover_after_prefix(first: &[u8], second: &[u8], leftover: &[u8], version: u16) -> Vec<u8> {
+    let mut mid = second.to_vec();
+    mid.extend_from_slice(leftover);
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    let second_seq = 1 + first.len() as u32;
+    let third_seq = second_seq + mid.len() as u32;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, second_seq, &mid),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, third_seq, &hello),
+        ],
+    )
 }
 
 fn leftover_then_hello_ports(

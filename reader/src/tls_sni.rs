@@ -29,7 +29,8 @@ pub enum TlsSession {
     #[default]
     Unknown,
     /// SSLv3 / TLS 1.0–1.2 / TLCP. `dissect_ssl3_record` without `ssl_looks_like_sslv3`.
-    Sticky,
+    /// The `u16` is the stored `SslSession.version` (`ssl_try_set_version`).
+    Sticky(u16),
     /// TLS 1.3. `dissect_ssl`'s default arm still needs `ssl_looks_like_sslv3`,
     /// and record-level `ssl_try_set_version` does not run.
     Tls13,
@@ -37,7 +38,16 @@ pub enum TlsSession {
 
 impl TlsSession {
     fn skips_looks_like(self) -> bool {
-        matches!(self, Self::Sticky)
+        matches!(self, Self::Sticky(_))
+    }
+
+    /// `SslSession.version` as a wire value. Unknown is 0.
+    fn tls_version(self) -> u16 {
+        match self {
+            Self::Unknown => 0,
+            Self::Sticky(version) => version,
+            Self::Tls13 => 0x0304,
+        }
     }
 }
 
@@ -308,7 +318,7 @@ fn is_authoritative(content: u8, handshake_type: Option<u8>) -> bool {
 fn session_from_version(version: u16) -> Option<TlsSession> {
     let version = normalize_tls_version(version);
     if is_sticky_version(version) {
-        Some(TlsSession::Sticky)
+        Some(TlsSession::Sticky(version))
     } else if version == 0x0304 {
         Some(TlsSession::Tls13)
     } else {
@@ -579,9 +589,174 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
             version,
             (content == CONTENT_HANDSHAKE).then_some(body),
         );
+        if content == CONTENT_HANDSHAKE
+            && handshake_throws(body, &rest[need..], session.tls_version())
+        {
+            // tshark 4.6.9 THROW(ReportedBoundsError) aborts dissect_ssl.
+            // Leftover is not desegmented; the next TCP payload is a new record.
+            return None;
+        }
         offset += need;
     }
     None
+}
+
+/// tshark 4.6.9 handshake dissectors THROW when an unconditional
+/// `proto_tree_add_item` / `tvb_get_*` reads past the tvb. `ssl_add_vector`
+/// checks `offset_end` and does not throw. ClientHello reads a subset of the
+/// message body; the others read the parent tvb, so leftover after the record
+/// is available. A throw aborts `dissect_ssl`, so leftover is not desegmented.
+fn handshake_throws(body: &[u8], leftover: &[u8], version: u16) -> bool {
+    let mut offset = 0;
+    while offset < body.len() {
+        if body.len() - offset < 4 {
+            return false;
+        }
+        let msg_type = body[offset];
+        let msg_len = u24(&body[offset + 1..offset + 4]);
+        let start = offset + 4;
+        let end = start.saturating_add(msg_len);
+        if end > body.len() {
+            return false;
+        }
+        let msg_body = &body[start..end];
+        let parent = &body[start..];
+        if message_throws(msg_type, msg_body, parent, leftover, version) {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn message_throws(msg_type: u8, body: &[u8], parent: &[u8], leftover: &[u8], version: u16) -> bool {
+    match msg_type {
+        0 | 5 | 8 | 11 | 12 | 13 | 14 | 16 | 23 => false,
+        HANDSHAKE_CLIENT_HELLO => client_hello_throws(body),
+        HANDSHAKE_SERVER_HELLO => server_hello_throws(parent, leftover, version),
+        4 => new_session_ticket_throws(parent, leftover, version),
+        6 => hello_retry_throws(parent, leftover),
+        15 => cert_verify_throws(parent, leftover, version),
+        20 => version == 0x0300 && parent_avail(parent, leftover) < 36,
+        21 => cert_url_throws(parent, leftover),
+        22 | 24 => parent_avail(parent, leftover) < 1,
+        25 => parent_avail(parent, leftover) < 5,
+        67 => npn_encrypted_exts_throws(parent, leftover),
+        _ => false,
+    }
+}
+
+fn parent_avail(parent: &[u8], leftover: &[u8]) -> usize {
+    parent.len() + leftover.len()
+}
+
+fn parent_byte(parent: &[u8], leftover: &[u8], offset: usize) -> Option<u8> {
+    if offset < parent.len() {
+        Some(parent[offset])
+    } else {
+        leftover.get(offset - parent.len()).copied()
+    }
+}
+
+/// `ssl_dissect_hnd_cli_hello` subsets the message body, so leftover after the
+/// record cannot satisfy version/random/session_id.
+fn client_hello_throws(body: &[u8]) -> bool {
+    if body.len() < 35 {
+        return true;
+    }
+    let sid_len = body[34] as usize;
+    body.len() < 35 + sid_len
+}
+
+/// `ssl_dissect_hnd_srv_hello` then `ssl_dissect_hnd_hello_common`.
+fn server_hello_throws(parent: &[u8], leftover: &[u8], version: u16) -> bool {
+    let avail = parent_avail(parent, leftover);
+    let mut offset = 0;
+    if avail < 2 {
+        return true;
+    }
+    offset += 2;
+    if avail < offset + 32 {
+        return true;
+    }
+    offset += 32;
+    let draft = if (version & 0xff00) == 0x7f00 {
+        version as u8
+    } else {
+        0
+    };
+    if version == 0x0304 && draft > 0 && draft < 22 {
+        return avail < offset + 2;
+    }
+    if avail < offset + 1 {
+        return true;
+    }
+    let sid_len = parent_byte(parent, leftover, offset).unwrap_or(0) as usize;
+    offset += 1;
+    if avail < offset + sid_len {
+        return true;
+    }
+    offset += sid_len;
+    if avail < offset + 2 {
+        return true;
+    }
+    offset += 2;
+    avail < offset + 1
+}
+
+/// `ssl_dissect_hnd_new_ses_ticket`: lifetime, then TLS 1.3 age_add.
+fn new_session_ticket_throws(parent: &[u8], leftover: &[u8], version: u16) -> bool {
+    let avail = parent_avail(parent, leftover);
+    if avail < 4 {
+        return true;
+    }
+    version == 0x0304 && avail < 8
+}
+
+/// Draft TLS 1.3 `ssl_dissect_hnd_hello_retry_request`.
+fn hello_retry_throws(parent: &[u8], leftover: &[u8]) -> bool {
+    let avail = parent_avail(parent, leftover);
+    if avail < 2 {
+        return true;
+    }
+    let ver = u16::from_be_bytes([
+        parent_byte(parent, leftover, 0).unwrap_or(0),
+        parent_byte(parent, leftover, 1).unwrap_or(0),
+    ]);
+    let draft = if (ver & 0xff00) == 0x7f00 {
+        ver as u8
+    } else {
+        0
+    };
+    if draft == 0 || draft >= 19 {
+        avail < 4
+    } else {
+        false
+    }
+}
+
+/// `ssl_dissect_hnd_cli_cert_verify` / `ssl_dissect_digitally_signed`.
+fn cert_verify_throws(parent: &[u8], leftover: &[u8], version: u16) -> bool {
+    matches!(version, 0x0303 | 0x0304) && parent_avail(parent, leftover) < 2
+}
+
+/// `ssl_dissect_hnd_cert_url` reads type then the URL list length.
+fn cert_url_throws(parent: &[u8], leftover: &[u8]) -> bool {
+    parent_avail(parent, leftover) < 3
+}
+
+/// `dissect_ssl3_hnd_encrypted_exts` (handshake type 67, NPN).
+fn npn_encrypted_exts_throws(parent: &[u8], leftover: &[u8]) -> bool {
+    let avail = parent_avail(parent, leftover);
+    if avail < 1 {
+        return true;
+    }
+    let proto_len = parent_byte(parent, leftover, 0).unwrap_or(0) as usize;
+    if avail < 1 + proto_len + 1 {
+        return true;
+    }
+    let pad_len = parent_byte(parent, leftover, 1 + proto_len).unwrap_or(0) as usize;
+    avail < 1 + proto_len + 1 + pad_len
 }
 
 /// Missing handshake bytes inside a complete record. A 4-byte header whose
@@ -866,6 +1041,19 @@ mod tests {
         record(CONTENT_HANDSHAKE, 0x0303, &handshake(msg_type, &[]))
     }
 
+    fn handshake_type_record_at(msg_type: u8, version: u16, body: &[u8]) -> Vec<u8> {
+        record(CONTENT_HANDSHAKE, version, &handshake(msg_type, body))
+    }
+
+    fn valid_server_hello() -> Vec<u8> {
+        let mut hello = Vec::from(0x0303u16.to_be_bytes());
+        hello.extend_from_slice(&[0x22u8; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0x00, 0x2f]);
+        hello.push(0);
+        handshake_type_record_at(HANDSHAKE_SERVER_HELLO, 0x0303, &hello)
+    }
+
     fn grease_hello() -> Vec<u8> {
         client_hello_bytes(Some(b"www.example.com"), 0x0a0a)
     }
@@ -1108,7 +1296,7 @@ mod tests {
         );
         let lone = grease_hello();
         assert_eq!(parse_tcp_tls_on_tls_port(&lone), TlsParse::Other);
-        let after = parse_tls(&lone, TlsSession::Sticky, false);
+        let after = parse_tls(&lone, TlsSession::Sticky(0x0303), false);
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
@@ -1124,8 +1312,8 @@ mod tests {
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
         let first = parse_tls(&handshake_type_record(2), TlsSession::Unknown, false);
-        assert_eq!(first.session, TlsSession::Sticky);
-        let after = parse_tls(&grease_hello(), TlsSession::Sticky, false);
+        assert_eq!(first.session, TlsSession::Sticky(0x0303));
+        let after = parse_tls(&grease_hello(), TlsSession::Sticky(0x0303), false);
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
@@ -1176,7 +1364,7 @@ mod tests {
 
     #[test]
     fn tls13_server_hello_unsticks_a_prior_session() {
-        let after = parse_tls(&tls13_server_hello(), TlsSession::Sticky, false);
+        let after = parse_tls(&tls13_server_hello(), TlsSession::Sticky(0x0303), false);
         assert_eq!(after.session, TlsSession::Tls13);
         let grease = parse_tls(&grease_hello(), after.session, false);
         assert_eq!(grease.kind, TlsParse::Other);
@@ -1269,7 +1457,7 @@ mod tests {
             );
         }
         let complete = parse_tls(&ccs(), TlsSession::Unknown, false);
-        assert_eq!(complete.session, TlsSession::Sticky);
+        assert_eq!(complete.session, TlsSession::Sticky(0x0303));
         let after = parse_tls(&grease, complete.session, false);
         assert_eq!(
             after.kind,
@@ -1305,7 +1493,7 @@ mod tests {
                 );
                 assert_eq!(
                     outcome.session,
-                    TlsSession::Sticky,
+                    TlsSession::Sticky(0x0303),
                     "empty {content}+{leftover:#04x}"
                 );
                 let prefix = truncated_handshake_prefix(&first, TlsSession::Unknown).unwrap();
@@ -1449,6 +1637,90 @@ mod tests {
     }
 
     #[test]
+    fn leftover_after_a_throwing_handshake_prints_the_next_hello() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let throwing = [
+            handshake_type_record(2),
+            handshake_type_record(4),
+            handshake_type_record(6),
+            handshake_type_record(15),
+            handshake_type_record(21),
+            handshake_type_record(25),
+            handshake_type_record(67),
+            handshake_type_record_at(2, 0x0303, &[0x03, 0x03]),
+            handshake_type_record_at(20, 0x0300, &[]),
+        ];
+        for first in throwing {
+            let mut payload = first.clone();
+            payload.push(0x00);
+            assert_eq!(
+                truncated_handshake_prefix(&payload, TlsSession::Unknown),
+                None,
+                "type {}",
+                first[5]
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &grease),
+                named,
+                "type {}",
+                first[5]
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &hello),
+                named,
+                "type {} 0x0301",
+                first[5]
+            );
+        }
+        let mut empty_ch = handshake_type_record(1);
+        empty_ch.push(0x00);
+        assert_eq!(
+            truncated_handshake_prefix(&empty_ch, TlsSession::Unknown),
+            None
+        );
+        assert_eq!(stitch_leftover(&empty_ch, &hello), named);
+        assert_eq!(stitch_leftover(&empty_ch, &grease), TlsParse::Other);
+        let keep = [
+            handshake_type_record(0),
+            handshake_type_record(11),
+            handshake_type_record(14),
+            handshake_type_record(20),
+            valid_server_hello(),
+        ];
+        for first in keep {
+            let mut payload = first;
+            payload.push(0x00);
+            assert_eq!(
+                truncated_handshake_prefix(&payload, TlsSession::Unknown),
+                Some(&[0x00][..]),
+                "keep {}",
+                payload[5]
+            );
+            assert_eq!(
+                stitch_leftover(&payload, &grease),
+                TlsParse::Other,
+                "keep {}",
+                payload[5]
+            );
+        }
+        let tls10 = parse_tls(&ccs_at(0x0301), TlsSession::Unknown, false);
+        assert_eq!(tls10.session, TlsSession::Sticky(0x0301));
+        let mut cv = handshake_type_record(15);
+        cv.push(0x00);
+        assert_eq!(
+            truncated_handshake_prefix(&cv, tls10.session),
+            Some(&[0x00][..]),
+            "TLS 1.0 Certificate Verify leftover is ssl_add_vector"
+        );
+        let mut cv12 = handshake_type_record(15);
+        cv12.push(0x00);
+        let tls12 = parse_tls(&ccs(), TlsSession::Unknown, false);
+        assert_eq!(truncated_handshake_prefix(&cv12, tls12.session), None);
+    }
+
+    #[test]
     fn empty_handshake_next_byte_sticks_a_later_grease_hello() {
         let hello = client_hello(Some("www.example.com"));
         let grease = grease_hello();
@@ -1473,7 +1745,7 @@ mod tests {
             );
             assert_eq!(
                 outcome.session,
-                TlsSession::Sticky,
+                TlsSession::Sticky(0x0303),
                 "empty HS then {}",
                 following[0]
             );
@@ -1579,7 +1851,7 @@ mod tests {
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
         let complete = parse_tls(&ccs(), TlsSession::Unknown, false);
-        assert_eq!(complete.session, TlsSession::Sticky);
+        assert_eq!(complete.session, TlsSession::Sticky(0x0303));
         let after = parse_tls(&grease, complete.session, false);
         assert_eq!(
             after.kind,
