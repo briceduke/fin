@@ -1918,6 +1918,112 @@ mod tests {
         assert_eq!(cell.counted, None);
     }
 
+    fn handshake_type(msg_type: u8) -> Vec<u8> {
+        vec![0x16, 0x03, 0x03, 0, 4, msg_type, 0, 0, 0]
+    }
+
+    fn grease_hello() -> Vec<u8> {
+        let mut hello = sni_hello("www.example.com");
+        hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        hello
+    }
+
+    #[test]
+    fn server_hello_then_grease_hello_prints_sni() {
+        let mut payload = handshake_type(2);
+        payload.extend_from_slice(&grease_hello());
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn handshake_types_then_grease_hello_print_sni() {
+        for msg_type in [0u8, 4, 11, 14, 20] {
+            let mut payload = handshake_type(msg_type);
+            payload.extend_from_slice(&grease_hello());
+            let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload);
+            let cell = walk_tls(&frame);
+            assert_eq!(cell.tls_sni, ["www.example.com"], "type {msg_type}");
+            assert_eq!(cell.counted, None, "type {msg_type}");
+        }
+    }
+
+    #[test]
+    fn server_hello_then_grease_hello_on_next_frame_prints_sni() {
+        let first_payload = handshake_type(2);
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &first_payload);
+        let second = eth_ipv4_tcp_seq(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            1 + first_payload.len() as u32,
+            &grease_hello(),
+        );
+        let mut session = IpSrc::query(false, true);
+        let start = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let rest = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(start.tls_sni, [] as [&str; 0]);
+        assert_eq!(start.counted, None);
+        assert_eq!(rest.tls_sni, ["www.example.com"]);
+        assert_eq!(rest.counted, None);
+    }
+
+    #[test]
+    fn client_hello_then_grease_hello_does_not_print_sni() {
+        let mut payload = sni_hello("first.example");
+        payload.extend_from_slice(&grease_hello());
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, ["first.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn client_hello_then_grease_hello_on_next_frame_stays_blank() {
+        let first_payload = sni_hello("first.example");
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &first_payload);
+        let second = eth_ipv4_tcp_seq(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            1 + first_payload.len() as u32,
+            &grease_hello(),
+        );
+        let mut session = IpSrc::query(false, true);
+        let start = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let rest = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(start.tls_sni, ["first.example"]);
+        assert_eq!(start.counted, None);
+        assert_eq!(rest.tls_sni, [] as [&str; 0]);
+        assert_eq!(rest.counted, None);
+    }
+
     #[test]
     fn ccs_then_grease_hello_on_next_frame_prints_sni() {
         let mut hello = sni_hello("www.example.com");

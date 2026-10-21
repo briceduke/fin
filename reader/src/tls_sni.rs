@@ -74,7 +74,7 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
                 version,
                 content,
             } => {
-                if sets_known(content, version) {
+                if sets_known(content, version, None) {
                     *known = true;
                 }
                 offset = next;
@@ -83,7 +83,14 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
                 unproved = true;
                 break;
             }
-            Record::Handshake { body, next } => {
+            Record::Handshake {
+                body,
+                next,
+                version,
+            } => {
+                if sets_known(CONTENT_HANDSHAKE, version, body.first().copied()) {
+                    *known = true;
+                }
                 match parse_handshake_messages(body) {
                     Hello::None => {}
                     Hello::Names(found) => {
@@ -141,6 +148,7 @@ enum Record<'a> {
     Handshake {
         body: &'a [u8],
         next: usize,
+        version: u16,
     },
     Other {
         next: usize,
@@ -190,7 +198,11 @@ fn take_record(payload: &[u8], offset: usize, known: bool) -> Record<'_> {
     }
     let body = &payload[start..end];
     if content == CONTENT_HANDSHAKE {
-        Record::Handshake { body, next: end }
+        Record::Handshake {
+            body,
+            next: end,
+            version,
+        }
     } else {
         Record::Other {
             next: end,
@@ -214,7 +226,7 @@ fn tls_record_header(payload: &[u8]) -> Option<(u8, u16, usize)> {
 }
 
 fn is_content_type(content: u8) -> bool {
-    matches!(content, 20 | 21 | 22 | 23 | 24 | 25 | 26)
+    matches!(content, 20..=26)
 }
 
 /// tshark 4.6.9 `ssl_looks_like_sslv3`: SSLv3, TLS 1.0–1.3, and TLCP.
@@ -229,8 +241,25 @@ fn is_sticky_version(version: u16) -> bool {
     matches!(version, 0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0101)
 }
 
-fn sets_known(content: u8, version: u16) -> bool {
-    content != CONTENT_HANDSHAKE && is_content_type(content) && is_sticky_version(version)
+/// tshark 4.6.9 `ssl_is_authoritative_version_message`: a valid handshake
+/// except ClientHello, or any other valid content type. Combined with
+/// [`is_sticky_version`], this is when `dissect_ssl` later skips
+/// `ssl_looks_like_sslv3` and calls `dissect_ssl3_record`.
+fn sets_known(content: u8, version: u16, handshake_type: Option<u8>) -> bool {
+    if !is_sticky_version(version) {
+        return false;
+    }
+    if content == CONTENT_HANDSHAKE {
+        handshake_type
+            .is_some_and(|hs| is_valid_tls_handshake_type(hs) && hs != HANDSHAKE_CLIENT_HELLO)
+    } else {
+        is_content_type(content)
+    }
+}
+
+/// tshark 4.6.9 `ssl_is_valid_handshake_type` with `is_dtls == false`.
+fn is_valid_tls_handshake_type(hs_type: u8) -> bool {
+    matches!(hs_type, 0 | 1 | 2 | 4..=6 | 8 | 11..=16 | 20..=25 | 67)
 }
 
 /// tshark 4.6.9 `is_sslv3_or_tls`: Handshake or Application Data, SSLv3/TLS 1.0–1.2
@@ -536,6 +565,14 @@ mod tests {
         record(0x14, 0x0303, &[0x01])
     }
 
+    fn handshake_type_record(msg_type: u8) -> Vec<u8> {
+        record(CONTENT_HANDSHAKE, 0x0303, &handshake(msg_type, &[]))
+    }
+
+    fn grease_hello() -> Vec<u8> {
+        client_hello_bytes(Some(b"www.example.com"), 0x0a0a)
+    }
+
     #[test]
     fn sni_name_is_proved() {
         assert_eq!(
@@ -679,7 +716,7 @@ mod tests {
     #[test]
     fn sticky_session_reads_grease_after_ccs() {
         let mut payload = ccs();
-        payload.extend_from_slice(&client_hello_bytes(Some(b"www.example.com"), 0x0a0a));
+        payload.extend_from_slice(&grease_hello());
         assert_eq!(
             parse_tcp_tls_on_tls_port(&payload),
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
@@ -689,12 +726,60 @@ mod tests {
             TlsParse::Other,
             "unnamed port CCS prefix is not is_sslv3_or_tls"
         );
-        let lone = client_hello_bytes(Some(b"www.example.com"), 0x0a0a);
+        let lone = grease_hello();
         assert_eq!(parse_tcp_tls_on_tls_port(&lone), TlsParse::Other);
         let after = parse_tls(&lone, true, false);
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn sticky_session_reads_grease_after_server_hello() {
+        let mut payload = handshake_type_record(2);
+        payload.extend_from_slice(&grease_hello());
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&payload),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let first = parse_tls(&handshake_type_record(2), false, false);
+        assert!(first.known);
+        let after = parse_tls(&grease_hello(), true, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn sticky_session_reads_grease_after_non_client_hello_handshake() {
+        for msg_type in [0u8, 4, 11, 14, 20] {
+            let mut payload = handshake_type_record(msg_type);
+            payload.extend_from_slice(&grease_hello());
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&payload),
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "handshake type {msg_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_hello_does_not_stick_a_later_grease_hello() {
+        let first = parse_tls(&client_hello(None), false, false);
+        assert!(!first.known);
+        let mut payload = client_hello(None);
+        payload.extend_from_slice(&grease_hello());
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&payload),
+            TlsParse::ClientHello(Vec::new())
+        );
+        let mut named = client_hello(Some("first.example"));
+        named.extend_from_slice(&grease_hello());
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&named),
+            TlsParse::ClientHello(vec!["first.example".to_string()])
         );
     }
 

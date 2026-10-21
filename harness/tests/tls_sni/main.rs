@@ -447,7 +447,58 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
         ("ccs-grease-7f1c", ccs_then_hello(0x7f1c)),
         ("ccs-grease-feff", ccs_then_hello(0xfeff)),
         ("ccs-grease-0002", ccs_then_hello(0x0002)),
+        ("serverhello-grease", handshake_then_hello(2)),
+        ("hs0-grease", handshake_then_hello(0)),
+        ("hs4-grease", handshake_then_hello(4)),
+        ("hs11-grease", handshake_then_hello(11)),
+        ("hs14-grease", handshake_then_hello(14)),
+        ("hs20-grease", handshake_then_hello(20)),
+        (
+            "serverhello-then-grease",
+            handshake_then_hello_next_frame(2),
+        ),
+        ("clienthello-grease", client_hello_then_grease()),
+        (
+            "clienthello-then-grease",
+            client_hello_then_grease_next_frame(),
+        ),
     ]
+}
+
+fn handshake_then_hello(msg_type: u8) -> Vec<u8> {
+    let mut payload = handshake_type_record(msg_type, 0x0303);
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), 0x0a0a));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn handshake_then_hello_next_frame(msg_type: u8) -> Vec<u8> {
+    let first = handshake_type_record(msg_type, 0x0303);
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &grease),
+        ],
+    )
+}
+
+fn client_hello_then_grease() -> Vec<u8> {
+    let mut payload = client_hello(None);
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), 0x0a0a));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn client_hello_then_grease_next_frame() -> Vec<u8> {
+    let first = client_hello(None);
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &grease),
+        ],
+    )
 }
 
 fn ccs_then_hello(version: u16) -> Vec<u8> {
