@@ -3387,4 +3387,41 @@ mod tests {
         assert_eq!(cells[2].tls_sni, blank, "unnamed 40001→40002");
         assert_eq!(cells[2].counted, None, "unnamed 40001→40002");
     }
+
+    #[test]
+    fn tls_port_associations_arm_server_ccs() {
+        let nonempty = ccs();
+        let empty = empty_record(0x14);
+        let hr_ch = hello_request_then_sni();
+        let blank: [&str; 0] = [];
+        const TLS_ONLY: [u16; 9] = [3389, 4420, 4460, 6514, 8009, 10050, 10051, 10809, 27017];
+        const DESTS: [u16; 4] = [443, 465, 636, 853];
+        const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for sport in TLS_ONLY {
+            let cells = server_then_client(sport, 443, &nonempty, &hr_ch);
+            assert_eq!(cells[0].tls_sni, blank, "{sport}→443 first");
+            assert_eq!(cells[0].counted, None, "{sport}→443 first");
+            assert_eq!(cells[1].tls_sni, blank, "{sport}→443 extra SNI");
+            assert_eq!(cells[1].counted, None, "{sport}→443 extra SNI");
+        }
+        for dport in DESTS {
+            let cells = server_then_client(3389, dport, &nonempty, &hr_ch);
+            assert_eq!(cells[1].tls_sni, blank, "3389→{dport} extra SNI");
+            assert_eq!(cells[1].counted, None, "3389→{dport} extra SNI");
+        }
+        let mut leftover = empty.clone();
+        leftover.push(0x00);
+        let cells = server_then_client(3389, 443, &leftover, &hr_ch);
+        assert_eq!(cells[1].tls_sni, blank, "empty CCS leftover 00");
+        assert_eq!(cells[1].counted, None, "empty CCS leftover 00");
+        let v6_ccs = eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 3389, 443, 1, &nonempty);
+        let v6_hr = eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 443, 3389, 1, &hr_ch);
+        let cells = walk_tls_frames(&[&v6_ccs, &v6_hr]);
+        assert_eq!(cells[1].tls_sni, blank, "ipv6 3389→443 extra SNI");
+        assert_eq!(cells[1].counted, None, "ipv6 3389→443 extra SNI");
+        let cells = server_then_client(443, 3389, &nonempty, &hr_ch);
+        assert_eq!(cells[1].tls_sni, blank, "inverse 443→3389 extra SNI");
+        assert_eq!(cells[1].counted, None, "inverse 443→3389 extra SNI");
+    }
 }

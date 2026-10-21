@@ -993,7 +993,59 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(encrypted_handshake_cases())
     .chain(empty_ccs_encrypted_cases())
     .chain(ccs_role_cases())
+    .chain(tls_port_association_cases())
     .collect()
+}
+
+/// CCS from a `tls.port` that is not first-named `tls` on `tcp.port`.
+fn tls_port_association_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let nonempty = ccs();
+    let empty = empty_record(0x14);
+    let hr_ch =
+        handshake_messages_record(0x0303, &[(0, &[]), (1, &hello_inner("www.example.com"))]);
+    let mut leftover = empty.clone();
+    leftover.push(0x00);
+    let mut cases = Vec::new();
+    for sport in [3389u16, 4420, 4460, 6514, 8009, 10050, 10051, 10809, 27017] {
+        cases.push((
+            leak(format!("tlsport-{sport}-ccs-then-peer-hr-ch")),
+            two_way_ipv4(
+                (PEER, OUTER, sport, 443, &nonempty),
+                (OUTER, PEER, 443, sport, &hr_ch),
+            ),
+        ));
+    }
+    for dport in [443u16, 465, 636, 853] {
+        cases.push((
+            leak(format!("tlsport-3389-ccs-then-peer-hr-ch-{dport}")),
+            two_way_ipv4(
+                (PEER, OUTER, 3389, dport, &nonempty),
+                (OUTER, PEER, dport, 3389, &hr_ch),
+            ),
+        ));
+    }
+    cases.push((
+        "tlsport-3389-empty-ccs-00-then-peer-hr-ch",
+        two_way_ipv4(
+            (PEER, OUTER, 3389, 443, &leftover),
+            (OUTER, PEER, 443, 3389, &hr_ch),
+        ),
+    ));
+    cases.push((
+        "tlsport-3389-ccs-then-peer-hr-ch-ipv6",
+        two_way_ipv6(
+            (PEER_V6, OUTER_V6, 3389, 443, &nonempty),
+            (OUTER_V6, PEER_V6, 443, 3389, &hr_ch),
+        ),
+    ));
+    cases.push((
+        "tlsport-443-ccs-then-3389-hr-ch",
+        two_way_ipv4(
+            (PEER, OUTER, 443, 3389, &nonempty),
+            (OUTER, PEER, 3389, 443, &hr_ch),
+        ),
+    ));
+    cases
 }
 
 fn empty_ccs_encrypted_cases() -> Vec<(&'static str, Vec<u8>)> {
