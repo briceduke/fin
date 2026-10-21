@@ -98,7 +98,14 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                 version,
                 content,
             } => {
-                apply_session_version(session, content, version, None);
+                // tshark 4.6.9 ssl_try_set_version reads the first body byte.
+                // A length-0 record at the end of the payload throws (Info
+                // [Malformed Packet]), so the session stays unknown. A following
+                // byte in this payload is readable, so an in-record GREASE hello
+                // still prints.
+                if next > offset + RECORD_HEADER || next < payload.len() {
+                    apply_session_version(session, content, version, None);
+                }
                 offset = next;
             }
             Record::Unproved => {
@@ -1208,6 +1215,39 @@ mod tests {
                 assert_eq!(prefix, &hello[..cut], "empty {content} cut {cut}");
             }
         }
+    }
+
+    #[test]
+    fn empty_record_does_not_stick_a_later_grease_hello() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        for content in [0x14u8, 0x15, 0x17, 0x18] {
+            let first = parse_tls(&empty_record(content), TlsSession::Unknown, false);
+            assert_eq!(first.kind, TlsParse::Other, "empty {content}");
+            assert_eq!(first.session, TlsSession::Unknown, "empty {content}");
+            let after = parse_tls(&grease, first.session, false);
+            assert_eq!(after.kind, TlsParse::Other, "empty {content} grease");
+            let named = parse_tls(&hello, first.session, false);
+            assert_eq!(
+                named.kind,
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "empty {content} 0x0301"
+            );
+            let mut same = empty_record(content);
+            same.extend_from_slice(&grease);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "empty {content} grease same"
+            );
+        }
+        let complete = parse_tls(&ccs(), TlsSession::Unknown, false);
+        assert_eq!(complete.session, TlsSession::Sticky);
+        let after = parse_tls(&grease, complete.session, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
     }
 
     #[test]

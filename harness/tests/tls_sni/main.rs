@@ -581,6 +581,38 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
         ("empty-alert-then-hello", empty_then_complete_hello(0x15)),
         ("empty-app-then-hello", empty_then_complete_hello(0x17)),
         (
+            "empty-ccs-then-grease",
+            empty_then_hello_version(0x14, 0x0a0a),
+        ),
+        (
+            "empty-alert-then-grease",
+            empty_then_hello_version(0x15, 0x0a0a),
+        ),
+        (
+            "empty-app-then-grease",
+            empty_then_hello_version(0x17, 0x0a0a),
+        ),
+        (
+            "empty-heartbeat-then-grease",
+            empty_then_hello_version(0x18, 0x0a0a),
+        ),
+        (
+            "peer-empty-ccs-then-grease",
+            peer_then_grease(443, 50000, &empty_record(0x14)),
+        ),
+        (
+            "peer-empty-alert-then-grease",
+            peer_then_grease(443, 50000, &empty_record(0x15)),
+        ),
+        (
+            "peer-empty-app-then-grease",
+            peer_then_grease(443, 50000, &empty_record(0x17)),
+        ),
+        (
+            "peer-empty-heartbeat-then-grease",
+            peer_then_grease(443, 50000, &empty_record(0x18)),
+        ),
+        (
             "empty-ccs-then-hello-same",
             empty_then_complete_hello_same(0x14, 0x0301),
         ),
@@ -803,8 +835,12 @@ fn empty_then_split_hello(content: u8, cut: usize) -> Vec<u8> {
 }
 
 fn empty_then_complete_hello(content: u8) -> Vec<u8> {
+    empty_then_hello_version(content, 0x0301)
+}
+
+fn empty_then_hello_version(content: u8, version: u16) -> Vec<u8> {
     let first = empty_record(content);
-    let hello = client_hello(Some("www.example.com"));
+    let hello = client_hello_host(Some(b"www.example.com"), version);
     pcap(
         LINK_ETHERNET,
         &[

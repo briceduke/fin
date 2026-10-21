@@ -2438,6 +2438,48 @@ mod tests {
     }
 
     #[test]
+    fn empty_record_then_grease_hello_stays_blank() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        for content in [0x14u8, 0x15, 0x17, 0x18] {
+            let empty = empty_record(content);
+            let cells = next_seq_frames(&empty, &grease);
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "empty {content}");
+            assert_eq!(cells[0].counted, None, "empty {content}");
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "empty {content} grease");
+            assert_eq!(cells[1].counted, None, "empty {content} grease");
+            let named = next_seq_frames(&empty, &hello);
+            assert_eq!(
+                named[1].tls_sni,
+                ["www.example.com"],
+                "empty {content} 0x0301"
+            );
+            assert_eq!(named[1].counted, None, "empty {content} 0x0301");
+            let peer = server_then_client(443, 50000, &empty, &grease);
+            assert_eq!(peer[0].tls_sni, [] as [&str; 0], "peer empty {content}");
+            assert_eq!(peer[0].counted, None, "peer empty {content}");
+            assert_eq!(
+                peer[1].tls_sni,
+                [] as [&str; 0],
+                "peer empty {content} grease"
+            );
+            assert_eq!(peer[1].counted, None, "peer empty {content} grease");
+            let mut same = empty.clone();
+            same.extend_from_slice(&grease);
+            let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &same));
+            assert_eq!(
+                cell.tls_sni,
+                ["www.example.com"],
+                "empty {content} grease same"
+            );
+            assert_eq!(cell.counted, None, "empty {content} grease same");
+        }
+        let complete = next_seq_frames(&ccs(), &grease);
+        assert_eq!(complete[1].tls_sni, ["www.example.com"]);
+        assert_eq!(complete[1].counted, None);
+    }
+
+    #[test]
     fn empty_non_handshake_then_complete_hello_same_payload_prints_sni() {
         let hello = sni_hello("www.example.com");
         let grease = grease_hello();
