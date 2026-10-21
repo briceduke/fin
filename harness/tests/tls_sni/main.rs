@@ -214,7 +214,31 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         on_disk_named(),
     ]
     .into_iter()
+    .chain(record_version_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
+    .collect()
+}
+
+fn record_version_cases() -> Vec<(&'static str, Vec<u8>)> {
+    [
+        ("record-ver-0a0a", 0x0a0au16),
+        ("record-ver-0002", 0x0002),
+        ("record-ver-0100", 0x0100),
+        ("record-ver-7f1c", 0x7f1c),
+        ("record-ver-fb17", 0xfb17),
+        ("record-ver-feff", 0xfeff),
+        ("record-ver-fefd", 0xfefd),
+        ("record-ver-fefc", 0xfefc),
+    ]
+    .into_iter()
+    .map(|(name, version)| {
+        let mut hello = client_hello(Some("www.example.com"));
+        hello[1..3].copy_from_slice(&version.to_be_bytes());
+        (
+            name,
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &hello)]),
+        )
+    })
     .collect()
 }
 

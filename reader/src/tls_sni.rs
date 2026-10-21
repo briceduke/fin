@@ -21,17 +21,17 @@ const TLS_MAX_RECORD: usize = 16384 + 2048;
 /// Parse SNI from one TCP payload. One TLS record only; a ClientHello that
 /// continues past that record is [`TlsParse::Unproved`].
 pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
-    parse_records(payload, false)
+    parse_records(payload)
 }
 
-/// Port 443 (and the other `tls` ports) force the TLS dissector, so a
-/// handshake record is walked even when the record version is not one of
-/// the common 0x03xx values.
+/// Port 443 (and the other `tls` ports) force the TLS dissector. An unknown
+/// session still uses `ssl_looks_like_sslv3`, so the record versions are the
+/// same as [`parse_tcp_tls`].
 pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
-    parse_records(payload, true)
+    parse_tcp_tls(payload)
 }
 
-fn parse_records(payload: &[u8], on_tls_port: bool) -> TlsParse {
+fn parse_records(payload: &[u8]) -> TlsParse {
     if payload.is_empty() {
         return TlsParse::Other;
     }
@@ -40,7 +40,7 @@ fn parse_records(payload: &[u8], on_tls_port: bool) -> TlsParse {
     let mut saw_hello = false;
     let mut unproved = false;
     while offset < payload.len() {
-        match take_record(payload, offset, on_tls_port) {
+        match take_record(payload, offset) {
             Record::Done => break,
             Record::Other { next } => offset = next,
             Record::Unproved => {
@@ -114,7 +114,7 @@ enum Hello {
     Unproved,
 }
 
-fn take_record(payload: &[u8], offset: usize, on_tls_port: bool) -> Record<'_> {
+fn take_record(payload: &[u8], offset: usize) -> Record<'_> {
     let rest = &payload[offset..];
     if rest.is_empty() {
         return Record::Done;
@@ -126,7 +126,7 @@ fn take_record(payload: &[u8], offset: usize, on_tls_port: bool) -> Record<'_> {
             Record::Done
         };
     };
-    if !is_record_version(version, on_tls_port) {
+    if !is_record_version(version) {
         return Record::Done;
     }
     if length == 0 || length >= TLS_MAX_RECORD {
@@ -170,44 +170,23 @@ fn is_content_type(content: u8) -> bool {
     matches!(content, 20 | 21 | 22 | 23 | 24 | 25 | 26)
 }
 
-fn is_tls_version(version: u16) -> bool {
+/// tshark 4.6.9 `ssl_looks_like_sslv3`: SSLv3, TLS 1.0–1.3, and TLCP.
+/// GREASE, DTLS, TLS 1.3 drafts, and SSL 2.0 are continuation data.
+fn is_record_version(version: u16) -> bool {
     matches!(version, 0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0304 | 0x0101)
 }
 
-/// tshark 4.6.9 `ssl_is_valid_ssl_version` / `ssl_versions` on a TLS port.
-fn is_record_version(version: u16, on_tls_port: bool) -> bool {
-    if is_tls_version(version) {
-        return true;
+/// Bytes still needed to finish a handshake record that starts in `payload`.
+pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
+    let (content, version, length) = tls_record_header(payload)?;
+    if content != CONTENT_HANDSHAKE || !is_record_version(version) {
+        return None;
     }
-    if !on_tls_port {
-        return false;
+    if length == 0 || length >= TLS_MAX_RECORD {
+        return None;
     }
-    matches!(
-        version,
-        0x0002 | 0x0100 | 0x7f0e
-            ..=0x7f1c
-                | 0xfb17
-                | 0xfb1a
-                | 0x0a0a
-                | 0x1a1a
-                | 0x2a2a
-                | 0x3a3a
-                | 0x4a4a
-                | 0x5a5a
-                | 0x6a6a
-                | 0x7a7a
-                | 0x8a8a
-                | 0x9a9a
-                | 0xaaaa
-                | 0xbaba
-                | 0xcaca
-                | 0xdada
-                | 0xeaea
-                | 0xfafa
-                | 0xfeff
-                | 0xfefd
-                | 0xfefc
-    )
+    let need = RECORD_HEADER + length;
+    (need > payload.len()).then(|| need - payload.len())
 }
 
 fn parse_handshake_messages(body: &[u8]) -> Hello {
@@ -524,6 +503,34 @@ mod tests {
         hello[1] = 0x03;
         hello[2] = 0x10;
         assert_eq!(parse_tcp_tls_on_tls_port(&hello), TlsParse::Other);
+    }
+
+    #[test]
+    fn ssl_looks_like_sslv3_rejects_grease_dtls_drafts_and_ssl2() {
+        for version in [
+            0x0a0au16, 0x0002, 0x0100, 0x7f1c, 0xfb17, 0xfeff, 0xfefd, 0xfefc,
+        ] {
+            let mut hello = client_hello(Some("www.example.com"));
+            hello[1..3].copy_from_slice(&version.to_be_bytes());
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&hello),
+                TlsParse::Other,
+                "{version:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_handshake_need_is_the_missing_record_bytes() {
+        let hello = client_hello(Some("www.example.com"));
+        let cut = 40;
+        assert!(hello.len() > cut);
+        assert_eq!(
+            truncated_handshake_need(&hello[..cut]),
+            Some(hello.len() - cut)
+        );
+        assert_eq!(truncated_handshake_need(&hello), None);
+        assert_eq!(truncated_handshake_need(&hello[..5]), Some(hello.len() - 5));
     }
 
     #[test]
