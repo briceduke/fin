@@ -270,8 +270,10 @@ impl Walk<'_> {
             return;
         }
         let dst = Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]);
-        self.flow_src = Some(FlowHost::V4(src));
-        self.flow_dst = Some(FlowHost::V4(dst));
+        if self.want_tls {
+            self.flow_src = Some(FlowHost::V4(src));
+            self.flow_dst = Some(FlowHost::V4(dst));
+        }
         let id = u16::from_be_bytes([bytes[4], bytes[5]]);
         let frag = u16::from_be_bytes([bytes[6], bytes[7]]);
         let offset = frag & 0x1fff;
@@ -343,12 +345,14 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 6 {
             return;
         }
-        let mut src = [0u8; 16];
-        let mut dst = [0u8; 16];
-        src.copy_from_slice(&bytes[8..24]);
-        dst.copy_from_slice(&bytes[24..40]);
-        self.flow_src = Some(FlowHost::V6(src));
-        self.flow_dst = Some(FlowHost::V6(dst));
+        if self.want_tls {
+            let mut src = [0u8; 16];
+            let mut dst = [0u8; 16];
+            src.copy_from_slice(&bytes[8..24]);
+            dst.copy_from_slice(&bytes[24..40]);
+            self.flow_src = Some(FlowHost::V6(src));
+            self.flow_dst = Some(FlowHost::V6(dst));
+        }
         let plen = u16::from_be_bytes([bytes[4], bytes[5]]) as u32;
         let mut next = bytes[6];
         let body = &bytes[IPV6_HEADER..];
@@ -519,16 +523,18 @@ impl Walk<'_> {
             return;
         }
         let pick = self.tables.udp(src, dst);
-        if pick.is_vxlan() {
-            self.vxlan(payload);
+        if self.want_tls {
+            if pick.is_vxlan() {
+                self.vxlan(payload);
+                return;
+            }
+            self.tls_from_udp(payload);
+            if self.want_ip {
+                self.after_ports(pick, payload);
+            }
             return;
         }
-        if self.want_tls {
-            self.tls_from_udp(payload);
-        }
-        if self.want_ip {
-            self.after_ports(pick, payload);
-        }
+        self.after_ports(pick, payload);
     }
 
     fn tcp(&mut self, bytes: &[u8]) {
