@@ -136,7 +136,10 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                 version,
             } => {
                 apply_session_version(session, CONTENT_HANDSHAKE, version, Some(body));
-                match parse_handshake_messages(body) {
+                let leftover = &payload[next..];
+                let (hello, threw) =
+                    parse_handshake_messages(body, leftover, session.tls_version());
+                match hello {
                     Hello::None => {}
                     Hello::Names(found) => {
                         saw_hello = true;
@@ -147,9 +150,10 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                         break;
                     }
                 }
-                if handshake_throws(body, &payload[next..], session.tls_version()) {
-                    // THROW(ReportedBoundsError) aborts dissect_ssl. Later
-                    // records in this payload are not walked.
+                if threw {
+                    // THROW(ReportedBoundsError) aborts dissect_ssl at that
+                    // handshake message. Later messages in this record and
+                    // later records in this payload are not walked.
                     break;
                 }
                 offset = next;
@@ -849,23 +853,23 @@ fn handshake_need(body: &[u8]) -> Option<usize> {
     None
 }
 
-fn parse_handshake_messages(body: &[u8]) -> Hello {
+fn parse_handshake_messages(body: &[u8], leftover: &[u8], version: u16) -> (Hello, bool) {
     if body.is_empty() {
-        return Hello::Unproved;
+        return (Hello::Unproved, false);
     }
     let mut offset = 0;
     let mut names = Vec::new();
     let mut saw_hello = false;
     while offset < body.len() {
         if body.len() - offset < 4 {
-            return Hello::Unproved;
+            return (Hello::Unproved, false);
         }
         let msg_type = body[offset];
         let msg_len = u24(&body[offset + 1..offset + 4]);
         let start = offset + 4;
         let end = start.saturating_add(msg_len);
         if end > body.len() {
-            return Hello::Unproved;
+            return (Hello::Unproved, false);
         }
         if msg_type == HANDSHAKE_CLIENT_HELLO {
             match parse_client_hello(&body[start..end]) {
@@ -873,11 +877,22 @@ fn parse_handshake_messages(body: &[u8]) -> Hello {
                     saw_hello = true;
                     names.extend(found);
                 }
-                None => return Hello::Unproved,
+                None => return (Hello::Unproved, false),
             }
+        }
+        let msg_body = &body[start..end];
+        let parent = &body[start..];
+        if message_throws(msg_type, msg_body, parent, leftover, version) {
+            // THROW(ReportedBoundsError) aborts dissect_ssl at this message.
+            // Later handshake messages in this record are not walked.
+            return (hello_names(saw_hello, names), true);
         }
         offset = end;
     }
+    (hello_names(saw_hello, names), false)
+}
+
+fn hello_names(saw_hello: bool, names: Vec<String>) -> Hello {
     if saw_hello {
         Hello::Names(names)
     } else {
@@ -2049,19 +2064,21 @@ mod tests {
                 "leftover 3 zeros then {}",
                 following[1]
             );
-            let mut overrun = handshake_type_record(21);
-            overrun.extend_from_slice(&[0x00, 0x01, 0x00]);
-            assert_eq!(
-                truncated_handshake_prefix(&overrun, TlsSession::Unknown),
-                None,
-                "leftover 00 01 00"
-            );
-            assert_eq!(
-                stitch_leftover(&overrun, following),
-                named.clone(),
-                "leftover 00 01 00 then {}",
-                following[1]
-            );
+            for leftover in [vec![0x00u8, 0x01, 0x00], vec![0xff, 0xff, 0xff]] {
+                let mut overrun = handshake_type_record(21);
+                overrun.extend_from_slice(&leftover);
+                assert_eq!(
+                    truncated_handshake_prefix(&overrun, TlsSession::Unknown),
+                    None,
+                    "leftover {leftover:?}"
+                );
+                assert_eq!(
+                    stitch_leftover(&overrun, following),
+                    named.clone(),
+                    "leftover {leftover:?} then {}",
+                    following[1]
+                );
+            }
             let mut empty_list = handshake_type_record_at(21, 0x0303, &[0x00, 0x00, 0x00]);
             empty_list.extend_from_slice(following);
             assert_eq!(
@@ -2081,6 +2098,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn client_hello_hs(sni: &str) -> Vec<u8> {
+        client_hello(Some(sni))[RECORD_HEADER..].to_vec()
+    }
+
+    fn handshake_record_messages(parts: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for part in parts {
+            body.extend_from_slice(part);
+        }
+        record(CONTENT_HANDSHAKE, 0x0303, &body)
+    }
+
+    #[test]
+    fn throwing_handshake_does_not_walk_a_later_hello_in_the_same_record() {
+        let hello_hs = client_hello_hs("www.example.com");
+        let other_hs = client_hello_hs("other.example");
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let throwing = [
+            (21u8, &[0x00][..]),
+            (21, &[0x00, 0x01]),
+            (21, &[0x00, 0x00, 0x01]),
+            (21, &[0x00, 0x05, 0x00, 0x00, 0x00]),
+            (67, &[0xff]),
+            (67, &[0x7f]),
+            (67, &[0xfe]),
+        ];
+        for (msg_type, body) in throwing {
+            let rec = handshake_record_messages(&[handshake(msg_type, body), hello_hs.clone()]);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&rec),
+                TlsParse::Other,
+                "type {msg_type} body {body:?} then CH"
+            );
+            let both = handshake_record_messages(&[
+                hello_hs.clone(),
+                handshake(msg_type, body),
+                other_hs.clone(),
+            ]);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&both),
+                named.clone(),
+                "CH then type {msg_type} body {body:?} then CH"
+            );
+        }
+        for msg_type in [2u8, 4, 6, 15, 25, 67] {
+            let rec = handshake_record_messages(&[handshake(msg_type, &[]), hello_hs.clone()]);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&rec),
+                named.clone(),
+                "empty type {msg_type} then CH same record"
+            );
+        }
+        let empty_then_record = {
+            let mut payload = handshake_type_record(21);
+            payload.extend_from_slice(&client_hello(Some("www.example.com")));
+            payload
+        };
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&empty_then_record),
+            TlsParse::Other,
+            "empty CertificateURL then CH as a second record"
+        );
     }
 
     #[test]

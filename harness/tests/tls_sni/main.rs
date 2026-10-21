@@ -1275,6 +1275,22 @@ fn throwing_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
         ),
     ));
     cases.push((
+        "empty-cert-url-left-ffffff-0301",
+        leftover_then_hello(
+            &handshake_type_record(21, 0x0303),
+            &[0xff, 0xff, 0xff],
+            0x0301,
+        ),
+    ));
+    cases.push((
+        "empty-cert-url-left-ffffff-grease",
+        leftover_then_hello(
+            &handshake_type_record(21, 0x0303),
+            &[0xff, 0xff, 0xff],
+            0x0a0a,
+        ),
+    ));
+    cases.push((
         "cert-url-list0-same-0301",
         prefix_then_hello_same(
             &handshake_body_record(21, 0x0303, &[0x00, 0x00, 0x00]),
@@ -1296,6 +1312,32 @@ fn throwing_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
         cases.push((
             leak(format!("empty-hs{msg_type}-same-grease")),
             prefix_then_hello_same(&handshake_type_record(msg_type, 0x0303), 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("empty-hs{msg_type}-same-rec-0301")),
+            handshake_then_hello_same_record(msg_type, &[]),
+        ));
+    }
+    for (tag, msg_type, body) in [
+        ("cert-url-body00", 21u8, &[0x00][..]),
+        ("cert-url-body0001", 21, &[0x00, 0x01]),
+        ("cert-url-body000001", 21, &[0x00, 0x00, 0x01]),
+        (
+            "cert-url-body0005000000",
+            21,
+            &[0x00, 0x05, 0x00, 0x00, 0x00],
+        ),
+        ("ee67-bodyff", 67, &[0xff]),
+        ("ee67-body7f", 67, &[0x7f]),
+        ("ee67-bodyfe", 67, &[0xfe]),
+    ] {
+        cases.push((
+            leak(format!("{tag}-same-rec-0301")),
+            handshake_then_hello_same_record(msg_type, body),
+        ));
+        cases.push((
+            leak(format!("ch-{tag}-ch-same-rec")),
+            hello_throw_hello_same_record(msg_type, body),
         ));
     }
     cases
@@ -1501,6 +1543,37 @@ fn prefix_then_hello_same(prefix: &[u8], version: u16) -> Vec<u8> {
     let mut payload = prefix.to_vec();
     payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
     pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn hello_inner(sni: &str) -> Vec<u8> {
+    client_hello(Some(sni))[9..].to_vec()
+}
+
+fn handshake_then_hello_same_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let hello = hello_inner("www.example.com");
+    pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(
+            OUTER,
+            50000,
+            443,
+            &handshake_messages_record(0x0303, &[(msg_type, body), (1, &hello)]),
+        )],
+    )
+}
+
+fn hello_throw_hello_same_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let first = hello_inner("www.example.com");
+    let second = hello_inner("other.example");
+    pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(
+            OUTER,
+            50000,
+            443,
+            &handshake_messages_record(0x0303, &[(1, &first), (msg_type, body), (1, &second)]),
+        )],
+    )
 }
 
 fn empty_then_record_then_hello_same(content: u8, following: &[u8], version: u16) -> Vec<u8> {

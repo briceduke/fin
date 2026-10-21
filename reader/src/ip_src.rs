@@ -2640,19 +2640,108 @@ mod tests {
                 assert_eq!(cell.counted, None, "cert_url body {} same", body.len());
             }
         }
-        let mut overrun = handshake_type(21);
-        overrun.extend_from_slice(&[0x00, 0x01, 0x00]);
-        let cells = next_seq_frames(&overrun, &hello);
-        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
-        assert_eq!(cells[1].counted, None);
-        let grease_cells = next_seq_frames(&overrun, &grease);
-        assert_eq!(grease_cells[1].tls_sni, ["www.example.com"]);
-        assert_eq!(grease_cells[1].counted, None);
+        for leftover in [vec![0x00u8, 0x01, 0x00], vec![0xff, 0xff, 0xff]] {
+            let mut overrun = handshake_type(21);
+            overrun.extend_from_slice(&leftover);
+            let cells = next_seq_frames(&overrun, &hello);
+            assert_eq!(
+                cells[1].tls_sni,
+                ["www.example.com"],
+                "leftover {leftover:?}"
+            );
+            assert_eq!(cells[1].counted, None, "leftover {leftover:?}");
+            let grease_cells = next_seq_frames(&overrun, &grease);
+            assert_eq!(
+                grease_cells[1].tls_sni,
+                ["www.example.com"],
+                "leftover {leftover:?} grease"
+            );
+            assert_eq!(
+                grease_cells[1].counted, None,
+                "leftover {leftover:?} grease"
+            );
+        }
         let mut three = handshake_type(21);
         three.extend_from_slice(&[0x00, 0x00, 0x00]);
         let iur = next_seq_frames(&three, &hello);
         assert_eq!(iur[1].tls_sni, [] as [&str; 0]);
         assert_eq!(iur[1].counted, None);
+    }
+
+    fn handshake_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let n = body.len() as u32;
+        let mut hs = vec![msg_type, (n >> 16) as u8, (n >> 8) as u8, n as u8];
+        hs.extend_from_slice(body);
+        hs
+    }
+
+    #[test]
+    fn throwing_handshake_does_not_walk_a_later_hello_in_the_same_record() {
+        let hello = sni_hello("www.example.com");
+        let hello_hs = hello[5..].to_vec();
+        let other_hs = sni_hello("other.example")[5..].to_vec();
+        let throwing = [
+            (21u8, &[0x00][..]),
+            (21, &[0x00, 0x01]),
+            (21, &[0x00, 0x00, 0x01]),
+            (21, &[0x00, 0x05, 0x00, 0x00, 0x00]),
+            (67, &[0xff]),
+            (67, &[0x7f]),
+            (67, &[0xfe]),
+        ];
+        for (msg_type, body) in throwing {
+            let mut rec_body = handshake_msg(msg_type, body);
+            rec_body.extend_from_slice(&hello_hs);
+            let cell = walk_tls(&eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                443,
+                &handshake_record_body(&rec_body),
+            ));
+            assert_eq!(
+                cell.tls_sni,
+                [] as [&str; 0],
+                "type {msg_type} body {body:?} then CH"
+            );
+            assert_eq!(cell.counted, None, "type {msg_type} body {body:?} then CH");
+            let mut both = hello_hs.clone();
+            both.extend_from_slice(&handshake_msg(msg_type, body));
+            both.extend_from_slice(&other_hs);
+            let cell = walk_tls(&eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                443,
+                &handshake_record_body(&both),
+            ));
+            assert_eq!(
+                cell.tls_sni,
+                ["www.example.com"],
+                "CH then type {msg_type} body {body:?} then CH"
+            );
+            assert_eq!(
+                cell.counted, None,
+                "CH then type {msg_type} body {body:?} then CH"
+            );
+        }
+        for msg_type in [2u8, 4, 6, 15, 25, 67] {
+            let mut rec_body = handshake_msg(msg_type, &[]);
+            rec_body.extend_from_slice(&hello_hs);
+            let cell = walk_tls(&eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                443,
+                &handshake_record_body(&rec_body),
+            ));
+            assert_eq!(
+                cell.tls_sni,
+                ["www.example.com"],
+                "empty type {msg_type} then CH same record"
+            );
+            assert_eq!(
+                cell.counted, None,
+                "empty type {msg_type} then CH same record"
+            );
+        }
     }
 
     #[test]
