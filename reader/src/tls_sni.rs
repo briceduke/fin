@@ -288,13 +288,6 @@ fn take_record<'a>(payload: &'a [u8], offset: usize, session: &mut TlsSession) -
     if !session.skips_looks_like() && !is_record_version(version) {
         return Record::Done;
     }
-    if length >= TLS_MAX_RECORD {
-        return if content == CONTENT_HANDSHAKE {
-            Record::Unproved
-        } else {
-            Record::Done
-        };
-    }
     // tshark 4.6.9 dissect_ssl3_record consumes a length-0 CCS/alert/app-data/
     // heartbeat and continues. An empty handshake is still Unproved: a following
     // complete ClientHello in this payload is a counted miss. ssl_try_set_version
@@ -320,7 +313,11 @@ fn take_record<'a>(payload: &'a [u8], offset: usize, session: &mut TlsSession) -
     }
     let start = offset + RECORD_HEADER;
     let end = start.saturating_add(length);
-    if end > payload.len() {
+    // dissect_ssl3_record desegments an incomplete record before
+    // ssl_check_record_length. A complete record at or above TLS_MAX_RECORD
+    // is still Unproved/Done; an incomplete one of any u16 length is too,
+    // and record_tail buffers it.
+    if end > payload.len() || length >= TLS_MAX_RECORD {
         return if content == CONTENT_HANDSHAKE {
             Record::Unproved
         } else {
@@ -697,6 +694,17 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
         if !session.skips_looks_like() && !is_record_version(version) {
             return None;
         }
+        let need = RECORD_HEADER + length;
+        if need > rest.len() {
+            // tshark 4.6.9 dissect_ssl3_record desegments any incomplete
+            // record after a valid content type, including u16 length
+            // 18432–65535. TLS_MAX_RECORD is ssl_check_record_length, which
+            // runs only after the full record is assembled.
+            return Some(RecordTail {
+                start: offset,
+                more: need - rest.len(),
+            });
+        }
         if length >= TLS_MAX_RECORD {
             return None;
         }
@@ -709,13 +717,6 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
             }
             offset += RECORD_HEADER;
             continue;
-        }
-        let need = RECORD_HEADER + length;
-        if need > rest.len() {
-            return Some(RecordTail {
-                start: offset,
-                more: need - rest.len(),
-            });
         }
         let body = &rest[RECORD_HEADER..need];
         let encrypted =
@@ -1223,6 +1224,13 @@ mod tests {
         let mut out = vec![content];
         out.extend_from_slice(&version.to_be_bytes());
         out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn claimed_record(content: u8, length: u16, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![content, 0x03, 0x03];
+        out.extend_from_slice(&length.to_be_bytes());
         out.extend_from_slice(body);
         out
     }
@@ -2738,6 +2746,51 @@ mod tests {
         let named = parse_tls(&hello, complete.session, false);
         assert_eq!(
             named.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn oversized_incomplete_record_desegments_like_tshark() {
+        let hello = client_hello(Some("www.example.com"));
+        let hr_ch = hello_request_then_hello("www.example.com");
+        let body = [0x01u8];
+        for content in [CONTENT_CCS, 0x15, 0x17, 0x18, CONTENT_HANDSHAKE] {
+            for length in [18431u16, 18432, 65535] {
+                let first = claimed_record(content, length, &body);
+                let more = RECORD_HEADER + length as usize - first.len();
+                assert_eq!(
+                    truncated_handshake_need(&first),
+                    Some(more),
+                    "content {content} length {length}"
+                );
+                let prefix = truncated_handshake_prefix(&first, TlsSession::Unknown).unwrap();
+                assert_eq!(
+                    prefix,
+                    first.as_slice(),
+                    "content {content} length {length}"
+                );
+                let continuation = if content == CONTENT_HANDSHAKE {
+                    TlsParse::Unproved
+                } else {
+                    TlsParse::Other
+                };
+                assert_eq!(
+                    stitch_leftover(&first, &hr_ch),
+                    continuation.clone(),
+                    "content {content} length {length} HR+CH"
+                );
+                assert_eq!(
+                    stitch_leftover(&first, &hello),
+                    continuation,
+                    "content {content} length {length} hello"
+                );
+            }
+        }
+        let complete = record(CONTENT_CCS, 0x0303, &[0x01]);
+        assert_eq!(truncated_handshake_need(&complete), None);
+        assert_eq!(
+            stitch_leftover(&complete, &hello),
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
     }

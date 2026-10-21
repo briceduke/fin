@@ -995,7 +995,44 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(ccs_role_cases())
     .chain(tls_port_association_cases())
     .chain(client_hello_sets_server_cases())
+    .chain(oversized_incomplete_record_cases())
     .collect()
+}
+
+/// Incomplete TLS records with u16 length 18431, 18432, or 65535 desegment.
+/// The next in-order Hello Request plus ClientHello is Continuation Data.
+fn oversized_incomplete_record_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let hr_ch =
+        handshake_messages_record(0x0303, &[(0, &[]), (1, &hello_inner("www.example.com"))]);
+    let body = [0x01u8];
+    let mut cases = Vec::new();
+    for (tag, content) in [
+        ("ccs", 0x14u8),
+        ("alert", 0x15),
+        ("app", 0x17),
+        ("hb", 0x18),
+        ("hs", 0x16),
+    ] {
+        for length in [18431u16, 18432, 65535] {
+            let first = claimed_tls_record(content, length, &body);
+            cases.push((
+                leak(format!("{tag}-{length}-then-hr-ch")),
+                sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&first, &hr_ch]),
+            ));
+            cases.push((
+                leak(format!("{tag}-{length}-then-hr-ch-dest")),
+                sequential_payloads(50000, 443, &[&first, &hr_ch]),
+            ));
+        }
+    }
+    cases
+}
+
+fn claimed_tls_record(content: u8, length: u16, body: &[u8]) -> Vec<u8> {
+    let mut rec = vec![content, 0x03, 0x03];
+    rec.extend_from_slice(&length.to_be_bytes());
+    rec.extend_from_slice(body);
+    rec
 }
 
 /// Empty or short ClientHello still calls `ssl_set_server` at arm entry.

@@ -3149,6 +3149,72 @@ mod tests {
         }
     }
 
+    fn claimed_record(content: u8, length: u16, body: &[u8]) -> Vec<u8> {
+        let mut rec = vec![content, 0x03, 0x03];
+        rec.extend_from_slice(&length.to_be_bytes());
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    #[test]
+    fn oversized_incomplete_record_then_hello_is_continuation() {
+        let hr_ch = hello_request_then_sni();
+        let blank: [&str; 0] = [];
+        let body = [0x01u8];
+        for content in [0x14u8, 0x15, 0x17, 0x18] {
+            for length in [18431u16, 18432, 65535] {
+                let first = claimed_record(content, length, &body);
+                for (label, cells) in [
+                    (
+                        "src443",
+                        next_seq_flow(SERVER, CLIENT, 443, 50000, &first, &hr_ch),
+                    ),
+                    ("dst443", next_seq_on(50000, 443, &first, &hr_ch)),
+                ] {
+                    assert_eq!(
+                        cells[0].tls_sni, blank,
+                        "content {content} length {length} {label} first"
+                    );
+                    assert_eq!(
+                        cells[0].counted, None,
+                        "content {content} length {length} {label} first"
+                    );
+                    assert_eq!(
+                        cells[1].tls_sni, blank,
+                        "content {content} length {length} {label} HR+CH"
+                    );
+                    assert_eq!(
+                        cells[1].counted, None,
+                        "content {content} length {length} {label} HR+CH"
+                    );
+                }
+            }
+        }
+        for length in [18431u16, 18432, 65535] {
+            let first = claimed_record(0x16, length, &body);
+            let cells = next_seq_flow(SERVER, CLIENT, 443, 50000, &first, &hr_ch);
+            assert_eq!(cells[0].tls_sni, blank, "handshake length {length} first");
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-handshake"),
+                "handshake length {length} first"
+            );
+            assert_eq!(cells[1].tls_sni, blank, "handshake length {length} HR+CH");
+            assert_eq!(
+                cells[1].counted,
+                Some("tls-handshake"),
+                "handshake length {length} HR+CH"
+            );
+            let dest = next_seq_on(50000, 443, &first, &hr_ch);
+            assert_eq!(dest[1].tls_sni, blank, "handshake length {length} dest 443");
+            assert_eq!(
+                dest[1].counted,
+                Some("tls-handshake"),
+                "handshake length {length} dest 443"
+            );
+        }
+    }
+
     #[test]
     fn complete_hello_then_split_next_hello_prints_each_name() {
         let first = sni_hello("www.example.com");
