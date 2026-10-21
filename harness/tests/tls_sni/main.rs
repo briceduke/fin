@@ -581,6 +581,90 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
         ("empty-alert-then-hello", empty_then_complete_hello(0x15)),
         ("empty-app-then-hello", empty_then_complete_hello(0x17)),
         (
+            "empty-ccs-then-hello-same",
+            empty_then_complete_hello_same(0x14, 0x0301),
+        ),
+        (
+            "empty-alert-then-hello-same",
+            empty_then_complete_hello_same(0x15, 0x0301),
+        ),
+        (
+            "empty-app-then-hello-same",
+            empty_then_complete_hello_same(0x17, 0x0301),
+        ),
+        (
+            "empty-heartbeat-then-hello-same",
+            empty_then_complete_hello_same(0x18, 0x0301),
+        ),
+        (
+            "empty-ccs-ccs-then-hello-same",
+            two_empty_then_complete_hello_same(0x14, 0x0301),
+        ),
+        (
+            "empty-ccs-then-grease-same",
+            empty_then_complete_hello_same(0x14, 0x0a0a),
+        ),
+        (
+            "empty-hs-then-hello-same",
+            empty_then_complete_hello_same(0x16, 0x0301),
+        ),
+        (
+            "ccs-byte-then-rest-then-grease",
+            split_record_then_later_hello(&ccs(), 1, 0x0a0a),
+        ),
+        (
+            "ccs-byte-then-rest-then-0301",
+            split_record_then_later_hello(&ccs(), 1, 0x0301),
+        ),
+        (
+            "ccs-cut-1-hello-same",
+            split_record_rest_and_hello(&ccs(), 1, 0x0301),
+        ),
+        (
+            "ccs-cut-3-hello-same",
+            split_record_rest_and_hello(&ccs(), 3, 0x0301),
+        ),
+        (
+            "ccs-cut-4-hello-same",
+            split_record_rest_and_hello(&ccs(), 4, 0x0301),
+        ),
+        (
+            "alert-cut-1-hello-same",
+            split_record_rest_and_hello(&alert(), 1, 0x0301),
+        ),
+        (
+            "alert-cut-3-hello-same",
+            split_record_rest_and_hello(&alert(), 3, 0x0301),
+        ),
+        (
+            "alert-cut-4-hello-same",
+            split_record_rest_and_hello(&alert(), 4, 0x0301),
+        ),
+        (
+            "app-cut-1-hello-same",
+            split_record_rest_and_hello(&app_data(), 1, 0x0301),
+        ),
+        (
+            "app-cut-3-hello-same",
+            split_record_rest_and_hello(&app_data(), 3, 0x0301),
+        ),
+        (
+            "app-cut-4-hello-same",
+            split_record_rest_and_hello(&app_data(), 4, 0x0301),
+        ),
+        (
+            "alert-byte-then-rest-then-0301",
+            split_record_then_later_hello(&alert(), 1, 0x0301),
+        ),
+        (
+            "app-byte-then-rest-then-0301",
+            split_record_then_later_hello(&app_data(), 1, 0x0301),
+        ),
+        (
+            "heartbeat-byte-then-rest-then-0301",
+            split_record_then_later_hello(&heartbeat(), 1, 0x0301),
+        ),
+        (
             "two-hellos-split-1",
             hello_then_split_hello("www.example.com", "other.example", 1),
         ),
@@ -726,6 +810,45 @@ fn empty_then_complete_hello(content: u8) -> Vec<u8> {
         &[
             eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
             eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello),
+        ],
+    )
+}
+
+fn empty_then_complete_hello_same(content: u8, version: u16) -> Vec<u8> {
+    let mut payload = empty_record(content);
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn two_empty_then_complete_hello_same(content: u8, version: u16) -> Vec<u8> {
+    let mut payload = empty_record(content);
+    payload.extend_from_slice(&empty_record(content));
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn split_record_then_later_hello(record: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    let rest = 1 + cut as u32;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &record[..cut]),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, rest, &record[cut..]),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + record.len() as u32, &hello),
+        ],
+    )
+}
+
+fn split_record_rest_and_hello(record: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    let mut second = record[cut..].to_vec();
+    second.extend_from_slice(&hello);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &record[..cut]),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + cut as u32, &second),
         ],
     )
 }

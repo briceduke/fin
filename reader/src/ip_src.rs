@@ -2390,9 +2390,8 @@ mod tests {
     #[test]
     fn empty_record_then_split_hello_prints_sni() {
         let hello = sni_hello("www.example.com");
-        for content in [0x16u8, 0x14, 0x15, 0x17] {
+        for content in [0x16u8, 0x14, 0x15, 0x17, 0x18] {
             let empty = empty_record(content);
-            let count_first = content == 0x16;
             for cut in [1usize, 5, 7] {
                 let mut first = empty.clone();
                 first.extend_from_slice(&hello[..cut]);
@@ -2404,7 +2403,7 @@ mod tests {
                 );
                 assert_eq!(
                     cells[0].counted,
-                    count_first.then_some("tls-handshake"),
+                    Some("tls-handshake"),
                     "empty {content} cut {cut}"
                 );
                 assert_eq!(
@@ -2435,6 +2434,85 @@ mod tests {
                 "empty {content} complete"
             );
             assert_eq!(cells[1].counted, None, "empty {content} complete");
+        }
+    }
+
+    #[test]
+    fn empty_non_handshake_then_complete_hello_same_payload_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        for content in [0x14u8, 0x15, 0x17, 0x18] {
+            let mut payload = empty_record(content);
+            payload.extend_from_slice(&hello);
+            let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload));
+            assert_eq!(cell.tls_sni, ["www.example.com"], "empty {content}");
+            assert_eq!(cell.counted, None, "empty {content}");
+        }
+        let mut two = empty_record(0x14);
+        two.extend_from_slice(&empty_record(0x14));
+        two.extend_from_slice(&hello);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &two));
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+        let mut grease_payload = empty_record(0x14);
+        grease_payload.extend_from_slice(&grease);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &grease_payload));
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+        let mut empty_hs = empty_record(0x16);
+        empty_hs.extend_from_slice(&hello);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &empty_hs));
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("tls-handshake"));
+    }
+
+    #[test]
+    fn split_ccs_alert_or_app_data_then_hello_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        let prefixes = [ccs(), alert(), app_data(), heartbeat()];
+        for rec in &prefixes {
+            let cells = seq_payloads(&[&rec[..1], &rec[1..], grease.as_slice()]);
+            assert_eq!(
+                cells[0].tls_sni,
+                [] as [&str; 0],
+                "content {} first",
+                rec[0]
+            );
+            assert_eq!(cells[0].counted, None, "content {} first", rec[0]);
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "content {} rest", rec[0]);
+            assert_eq!(
+                cells[2].tls_sni,
+                ["www.example.com"],
+                "content {} grease",
+                rec[0]
+            );
+            let named = seq_payloads(&[&rec[..1], &rec[1..], hello.as_slice()]);
+            assert_eq!(
+                named[2].tls_sni,
+                ["www.example.com"],
+                "content {} 0x0301",
+                rec[0]
+            );
+            for cut in [1usize, 3, 4] {
+                let mut second = rec[cut..].to_vec();
+                second.extend_from_slice(&hello);
+                let cells = next_seq_frames(&rec[..cut], &second);
+                assert_eq!(
+                    cells[0].tls_sni,
+                    [] as [&str; 0],
+                    "content {} cut {cut}",
+                    rec[0]
+                );
+                assert_eq!(cells[0].counted, None, "content {} cut {cut}", rec[0]);
+                assert_eq!(
+                    cells[1].tls_sni,
+                    ["www.example.com"],
+                    "content {} cut {cut}",
+                    rec[0]
+                );
+                assert_eq!(cells[1].counted, None, "content {} cut {cut}", rec[0]);
+            }
         }
     }
 

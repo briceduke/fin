@@ -202,11 +202,25 @@ fn take_record(payload: &[u8], offset: usize, session: TlsSession) -> Record<'_>
     if !session.skips_looks_like() && !is_record_version(version) {
         return Record::Done;
     }
-    if length == 0 || length >= TLS_MAX_RECORD {
+    if length >= TLS_MAX_RECORD {
         return if content == CONTENT_HANDSHAKE {
             Record::Unproved
         } else {
             Record::Done
+        };
+    }
+    // tshark 4.6.9 dissect_ssl3_record consumes a length-0 CCS/alert/app-data/
+    // heartbeat and continues. An empty handshake is still Unproved: a following
+    // complete ClientHello in this payload is a counted miss.
+    if length == 0 {
+        return if content == CONTENT_HANDSHAKE {
+            Record::Unproved
+        } else {
+            Record::Other {
+                next: offset + RECORD_HEADER,
+                version,
+                content,
+            }
         };
     }
     let start = offset + RECORD_HEADER;
@@ -463,44 +477,45 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
     length != 0 && length < TLS_MAX_RECORD
 }
 
-/// Bytes still needed to finish a handshake that starts in `payload`.
+/// Bytes still needed to finish a TLS record that starts in `payload`.
 ///
-/// tshark 4.6.9 `dissect_tls_handshake` desegments when the record is complete
-/// but the handshake is shorter than 4 bytes, or the u24 length overruns the
-/// record. The next in-order payload on that flow is continuation, not a new
+/// tshark 4.6.9 `dissect_ssl3_record` desegments any incomplete record
+/// (CCS/alert/handshake/app-data/heartbeat). A complete record whose handshake
+/// is shorter than 4 bytes, or whose u24 length overruns, is also buffered.
+/// The next in-order payload on that flow is continuation, not a new
 /// ClientHello.
 pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
     truncated_handshake_need_known(payload, TlsSession::Unknown)
 }
 
 /// Like [`truncated_handshake_need`], but a sticky session accepts any record
-/// version the way `dissect_ssl3_record` does. Complete CCS/alert/app-data/
-/// HelloRequest records, including length-0 records, are skipped so a following
-/// truncated handshake is buffered, matching tshark 4.6.9 `dissect_ssl`.
+/// version the way `dissect_ssl3_record` does. Complete records, including
+/// length-0 CCS/alert/app-data/heartbeat, are skipped so a following truncated
+/// record is buffered, matching tshark 4.6.9 `dissect_ssl`.
 pub fn truncated_handshake_need_known(payload: &[u8], session: TlsSession) -> Option<usize> {
-    handshake_tail(payload, session).map(|tail| tail.more)
+    record_tail(payload, session).map(|tail| tail.more)
 }
 
-/// Bytes of `payload` from the incomplete handshake record onward.
+/// Bytes of `payload` from the incomplete record onward.
 ///
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
 pub fn truncated_handshake_prefix(payload: &[u8], session: TlsSession) -> Option<&[u8]> {
-    let tail = handshake_tail(payload, session)?;
+    let tail = record_tail(payload, session)?;
     Some(&payload[tail.start..])
 }
 
-struct HandshakeTail {
+struct RecordTail {
     start: usize,
     more: usize,
 }
 
-fn handshake_tail(payload: &[u8], mut session: TlsSession) -> Option<HandshakeTail> {
+fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
     let mut offset = 0;
     while offset < payload.len() {
         let rest = &payload[offset..];
         if rest.len() < RECORD_HEADER {
-            return (rest[0] == CONTENT_HANDSHAKE).then_some(HandshakeTail {
+            return is_content_type(rest[0]).then_some(RecordTail {
                 start: offset,
                 more: RECORD_HEADER - rest.len(),
             });
@@ -519,7 +534,7 @@ fn handshake_tail(payload: &[u8], mut session: TlsSession) -> Option<HandshakeTa
         }
         let need = RECORD_HEADER + length;
         if need > rest.len() {
-            return (content == CONTENT_HANDSHAKE).then_some(HandshakeTail {
+            return Some(RecordTail {
                 start: offset,
                 more: need - rest.len(),
             });
@@ -527,7 +542,7 @@ fn handshake_tail(payload: &[u8], mut session: TlsSession) -> Option<HandshakeTa
         let body = &rest[RECORD_HEADER..need];
         if content == CONTENT_HANDSHAKE {
             if let Some(more) = handshake_need(body) {
-                return Some(HandshakeTail {
+                return Some(RecordTail {
                     start: offset,
                     more,
                 });
@@ -1175,7 +1190,7 @@ mod tests {
     #[test]
     fn truncated_handshake_need_skips_empty_records() {
         let hello = client_hello(Some("www.example.com"));
-        for content in [CONTENT_HANDSHAKE, 0x14, 0x15, 0x17] {
+        for content in [CONTENT_HANDSHAKE, 0x14, 0x15, 0x17, 0x18] {
             let empty = empty_record(content);
             assert_eq!(
                 truncated_handshake_need_known(&empty, TlsSession::Unknown),
@@ -1193,6 +1208,92 @@ mod tests {
                 assert_eq!(prefix, &hello[..cut], "empty {content} cut {cut}");
             }
         }
+    }
+
+    #[test]
+    fn empty_non_handshake_then_complete_hello_prints_sni() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        for content in [0x14u8, 0x15, 0x17, 0x18] {
+            let mut payload = empty_record(content);
+            payload.extend_from_slice(&hello);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&payload),
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "empty {content}"
+            );
+        }
+        let mut two = empty_record(0x14);
+        two.extend_from_slice(&empty_record(0x14));
+        two.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&two),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let mut grease_payload = empty_record(0x14);
+        grease_payload.extend_from_slice(&grease);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&grease_payload),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let mut empty_hs = empty_record(CONTENT_HANDSHAKE);
+        empty_hs.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&empty_hs),
+            TlsParse::Unproved,
+            "empty handshake then complete hello in the same payload is a counted miss"
+        );
+    }
+
+    #[test]
+    fn truncated_record_need_covers_ccs_alert_app_data_and_heartbeat() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        for rec in [ccs(), alert(), app_data(), heartbeat()] {
+            for cut in [1usize, 3, 4] {
+                assert!(
+                    truncated_handshake_need(&rec[..cut]).is_some(),
+                    "content {} cut {cut}",
+                    rec[0]
+                );
+                let prefix = truncated_handshake_prefix(&rec[..cut], TlsSession::Unknown).unwrap();
+                assert_eq!(prefix, &rec[..cut], "content {} cut {cut}", rec[0]);
+                let mut stitched = rec[..cut].to_vec();
+                stitched.extend_from_slice(&rec[cut..]);
+                stitched.extend_from_slice(&hello);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&stitched),
+                    TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                    "content {} cut {cut} 0x0301",
+                    rec[0]
+                );
+            }
+            assert_eq!(truncated_handshake_need(&rec), None, "content {}", rec[0]);
+        }
+        assert_eq!(
+            parse_tls(&ccs()[..1], TlsSession::Unknown, false).kind,
+            TlsParse::Other
+        );
+        let mut rest = ccs()[1..].to_vec();
+        rest.extend_from_slice(&grease);
+        let mut buf = ccs()[..1].to_vec();
+        buf.extend_from_slice(&rest);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&buf),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let complete = parse_tls(&ccs(), TlsSession::Unknown, false);
+        assert_eq!(complete.session, TlsSession::Sticky);
+        let after = parse_tls(&grease, complete.session, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let named = parse_tls(&hello, complete.session, false);
+        assert_eq!(
+            named.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
     }
 
     #[test]
