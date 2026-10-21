@@ -64,7 +64,7 @@ struct Ipv4Frag {
     proto: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum FlowHost {
     V4(Ipv4Addr),
     V6([u8; 16]),
@@ -76,6 +76,22 @@ struct TcpFlow {
     dst: FlowHost,
     sport: u16,
     dport: u16,
+}
+
+impl TcpFlow {
+    /// tshark 4.6.9 `SslSession` lives on the TCP conversation, not one direction.
+    fn conversation(self) -> Self {
+        if (self.src, self.sport) <= (self.dst, self.dport) {
+            self
+        } else {
+            Self {
+                src: self.dst,
+                dst: self.src,
+                sport: self.dport,
+                dport: self.sport,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +115,7 @@ pub struct IpSrc {
     frags: FragTable,
     tls_seen: HashSet<TcpSeq>,
     tls_need: HashMap<TcpFlow, TlsNeed>,
+    /// Conversation keys. tshark keeps TLS version on the TCP 4-tuple.
     tls_claimed: HashSet<TcpFlow>,
     tls_known: HashSet<TcpFlow>,
     want_ip: bool,
@@ -610,7 +627,7 @@ impl Walk<'_> {
             }
         }
         let known = flow
-            .map(|flow| self.tls_known.contains(&flow))
+            .map(|flow| self.tls_known.contains(&flow.conversation()))
             .unwrap_or(false);
         if let Some(flow) = flow {
             if let Some(outcome) = self.take_tls_need(flow, seq, payload, known) {
@@ -624,7 +641,7 @@ impl Walk<'_> {
         if pick.is_tls() || pick.name.is_none() {
             let claimed = pick.is_tls()
                 || flow
-                    .map(|flow| self.tls_claimed.contains(&flow))
+                    .map(|flow| self.tls_claimed.contains(&flow.conversation()))
                     .unwrap_or(false);
             let outcome = parse_tls(payload, known, !claimed);
             self.apply_tls_outcome(flow, seq, payload, outcome, true);
@@ -644,11 +661,12 @@ impl Walk<'_> {
         buffer_unproved: bool,
     ) {
         if let Some(flow) = flow {
+            let conv = flow.conversation();
             if outcome.claimed {
-                self.tls_claimed.insert(flow);
+                self.tls_claimed.insert(conv);
             }
             if outcome.known {
-                self.tls_known.insert(flow);
+                self.tls_known.insert(conv);
             }
         }
         match outcome.kind {
@@ -1685,11 +1703,25 @@ mod tests {
         }
     }
 
+    const CLIENT: [u8; 4] = [10, 0, 0, 1];
+    const SERVER: [u8; 4] = [10, 255, 255, 1];
+
     fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
         eth_ipv4_tcp_seq(src, sport, dport, 1, payload)
     }
 
     fn eth_ipv4_tcp_seq(src: [u8; 4], sport: u16, dport: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        eth_ipv4_tcp_flow(src, SERVER, sport, dport, seq, payload)
+    }
+
+    fn eth_ipv4_tcp_flow(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut tcp = Vec::from(sport.to_be_bytes());
         tcp.extend_from_slice(&dport.to_be_bytes());
         tcp.extend_from_slice(&seq.to_be_bytes());
@@ -1699,7 +1731,7 @@ mod tests {
         let total = (20 + tcp.len()) as u16;
         ip[2..4].copy_from_slice(&total.to_be_bytes());
         ip.extend_from_slice(&src);
-        ip.extend_from_slice(&[10, 255, 255, 1]);
+        ip.extend_from_slice(&dst);
         ip.extend_from_slice(&tcp);
         let mut eth = vec![
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
@@ -1928,6 +1960,55 @@ mod tests {
         hello
     }
 
+    fn alert() -> Vec<u8> {
+        vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]
+    }
+
+    fn app_data() -> Vec<u8> {
+        vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01]
+    }
+
+    fn walk_tls_frames(frames: &[&[u8]]) -> Vec<Cell> {
+        let mut session = IpSrc::query(false, true);
+        frames
+            .iter()
+            .map(|captured| {
+                walk_ip_src(
+                    &Frame {
+                        link_type: ETHERNET,
+                        captured,
+                    },
+                    &mut session,
+                )
+            })
+            .collect()
+    }
+
+    fn server_then_client(
+        server_sport: u16,
+        client_sport: u16,
+        server_payload: &[u8],
+        client_payload: &[u8],
+    ) -> Vec<Cell> {
+        let first = eth_ipv4_tcp_flow(
+            SERVER,
+            CLIENT,
+            server_sport,
+            client_sport,
+            1,
+            server_payload,
+        );
+        let second = eth_ipv4_tcp_flow(
+            CLIENT,
+            SERVER,
+            client_sport,
+            server_sport,
+            1,
+            client_payload,
+        );
+        walk_tls_frames(&[&first, &second])
+    }
+
     #[test]
     fn server_hello_then_grease_hello_prints_sni() {
         let mut payload = handshake_type(2);
@@ -2075,5 +2156,54 @@ mod tests {
         assert_eq!(start.counted, Some("tls-handshake"));
         assert_eq!(rest.tls_sni, [] as [&str; 0]);
         assert_eq!(rest.counted, None);
+    }
+
+    fn ccs() -> Vec<u8> {
+        vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
+    }
+
+    #[test]
+    fn peer_record_then_grease_hello_on_443_prints_sni() {
+        let ccs = ccs();
+        let alert = alert();
+        let app = app_data();
+        let server_hello = handshake_type(2);
+        for (label, first) in [
+            ("ccs", ccs.as_slice()),
+            ("alert", alert.as_slice()),
+            ("app-data", app.as_slice()),
+            ("server-hello", server_hello.as_slice()),
+        ] {
+            let cells = server_then_client(443, 50000, first, &grease_hello());
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "{label} first");
+            assert_eq!(cells[0].counted, None, "{label} first");
+            assert_eq!(cells[1].tls_sni, ["www.example.com"], "{label} grease");
+            assert_eq!(cells[1].counted, None, "{label} grease");
+        }
+    }
+
+    #[test]
+    fn peer_record_then_grease_hello_on_unnamed_port() {
+        let ccs = ccs();
+        let alert = alert();
+        let app = app_data();
+        let server_hello = handshake_type(2);
+        for (label, first, want) in [
+            ("ccs", ccs.as_slice(), None),
+            ("alert", alert.as_slice(), None),
+            ("app-data", app.as_slice(), Some("www.example.com")),
+            (
+                "server-hello",
+                server_hello.as_slice(),
+                Some("www.example.com"),
+            ),
+        ] {
+            let cells = server_then_client(40002, 40001, first, &grease_hello());
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "{label} first");
+            assert_eq!(cells[0].counted, None, "{label} first");
+            let got = cells[1].tls_sni.first().map(String::as_str);
+            assert_eq!(got, want, "{label} grease");
+            assert_eq!(cells[1].counted, None, "{label} grease");
+        }
     }
 }

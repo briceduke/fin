@@ -7,6 +7,7 @@ const ETH_SRC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 pub const LINK_ETHERNET: u32 = 1;
 pub const LINK_SLL: u32 = 113;
 pub const OUTER: [u8; 4] = [10, 0, 0, 1];
+pub const PEER: [u8; 4] = [10, 255, 255, 1];
 
 pub fn pcap(link: u32, frames: &[Vec<u8>]) -> Vec<u8> {
     let mut file = Vec::new();
@@ -62,11 +63,15 @@ pub fn sll(proto: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn ipv4(src: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
+    ipv4_to(src, PEER, proto, payload)
+}
+
+pub fn ipv4_to(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
     let total = (20 + payload.len()) as u16;
     let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, proto, 0, 0];
     ip[2..4].copy_from_slice(&total.to_be_bytes());
     ip.extend_from_slice(&src);
-    ip.extend_from_slice(&[10, 255, 255, 1]);
+    ip.extend_from_slice(&dst);
     ip.extend_from_slice(payload);
     ip
 }
@@ -107,7 +112,21 @@ pub fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec
 }
 
 pub fn eth_ipv4_tcp_seq(src: [u8; 4], sport: u16, dport: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
-    eth(0x0800, &ipv4(src, 6, &tcp_seq(sport, dport, seq, payload)))
+    eth_ipv4_tcp_flow(src, PEER, sport, dport, seq, payload)
+}
+
+pub fn eth_ipv4_tcp_flow(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    eth(
+        0x0800,
+        &ipv4_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+    )
 }
 
 pub fn eth_ipv4_udp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
@@ -146,6 +165,14 @@ pub fn client_hello_host(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
 
 pub fn ccs() -> Vec<u8> {
     vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
+}
+
+pub fn alert() -> Vec<u8> {
+    vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]
+}
+
+pub fn app_data() -> Vec<u8> {
+    vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01]
 }
 
 pub fn handshake_record(body: &[u8]) -> Vec<u8> {

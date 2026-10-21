@@ -462,7 +462,38 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             "clienthello-then-grease",
             client_hello_then_grease_next_frame(),
         ),
+        ("peer-ccs-443", peer_then_grease(443, 50000, &ccs())),
+        ("peer-alert-443", peer_then_grease(443, 50000, &alert())),
+        ("peer-app-443", peer_then_grease(443, 50000, &app_data())),
+        (
+            "peer-serverhello-443",
+            peer_then_grease(443, 50000, &handshake_type_record(2, 0x0303)),
+        ),
+        ("peer-ccs-unnamed", peer_then_grease(40002, 40001, &ccs())),
+        (
+            "peer-alert-unnamed",
+            peer_then_grease(40002, 40001, &alert()),
+        ),
+        (
+            "peer-app-unnamed",
+            peer_then_grease(40002, 40001, &app_data()),
+        ),
+        (
+            "peer-serverhello-unnamed",
+            peer_then_grease(40002, 40001, &handshake_type_record(2, 0x0303)),
+        ),
     ]
+}
+
+fn peer_then_grease(server_port: u16, client_port: u16, first: &[u8]) -> Vec<u8> {
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, server_port, client_port, 1, first),
+            eth_ipv4_tcp_flow(OUTER, PEER, client_port, server_port, 1, &grease),
+        ],
+    )
 }
 
 fn handshake_then_hello(msg_type: u8) -> Vec<u8> {
