@@ -667,6 +667,8 @@ impl Walk<'_> {
             }
             if outcome.known {
                 self.tls_known.insert(conv);
+            } else {
+                self.tls_known.remove(&conv);
             }
         }
         match outcome.kind {
@@ -1954,6 +1956,22 @@ mod tests {
         vec![0x16, 0x03, 0x03, 0, 4, msg_type, 0, 0, 0]
     }
 
+    fn tls13_server_hello() -> Vec<u8> {
+        let mut hello = Vec::from(0x0303u16.to_be_bytes());
+        hello.extend_from_slice(&[0x22u8; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0x13, 0x01]);
+        hello.push(0);
+        hello.extend_from_slice(&[0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        let hs_len = hello.len() as u32;
+        let mut hs = vec![2, (hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8];
+        hs.extend_from_slice(&hello);
+        let mut rec = vec![0x16, 0x03, 0x03];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
     fn grease_hello() -> Vec<u8> {
         let mut hello = sni_hello("www.example.com");
         hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
@@ -2176,6 +2194,73 @@ mod tests {
         assert_eq!(start.counted, None);
         assert_eq!(rest.tls_sni, ["www.example.com"]);
         assert_eq!(rest.counted, None);
+    }
+
+    #[test]
+    fn tls13_server_hello_then_grease_stays_blank() {
+        let mut payload = tls13_server_hello();
+        payload.extend_from_slice(&grease_hello());
+        let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload);
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+        let cells = next_seq_frames(&tls13_server_hello(), &grease_hello());
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn tls13_server_hello_then_tls10_hello_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        let cells = next_seq_frames(&tls13_server_hello(), &hello);
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn complete_prefix_then_split_hello_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        let prefixes = [ccs(), alert(), app_data(), handshake_type(0)];
+        for prefix in &prefixes {
+            for cut in [1usize, 5, 7] {
+                let mut first = prefix.clone();
+                first.extend_from_slice(&hello[..cut]);
+                let cells = next_seq_frames(&first, &hello[cut..]);
+                assert_eq!(
+                    cells[0].tls_sni,
+                    [] as [&str; 0],
+                    "prefix {} cut {cut}",
+                    prefix[0]
+                );
+                assert_eq!(
+                    cells[0].counted,
+                    Some("tls-handshake"),
+                    "prefix {} cut {cut}",
+                    prefix[0]
+                );
+                assert_eq!(
+                    cells[1].tls_sni,
+                    ["www.example.com"],
+                    "prefix {} cut {cut}",
+                    prefix[0]
+                );
+                assert_eq!(cells[1].counted, None, "prefix {} cut {cut}", prefix[0]);
+            }
+            let mut first = prefix.clone();
+            first.extend_from_slice(&grease[..1]);
+            let cells = next_seq_frames(&first, &grease[1..]);
+            assert_eq!(
+                cells[1].tls_sni,
+                ["www.example.com"],
+                "grease {}",
+                prefix[0]
+            );
+        }
     }
 
     #[test]

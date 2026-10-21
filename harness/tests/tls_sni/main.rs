@@ -499,7 +499,103 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             "peer-hs1-then-grease",
             peer_then_grease(443, 50000, &[0x16, 0x03, 0x03, 0x00, 0x01, 0x02]),
         ),
+        (
+            "tls13-sh-grease",
+            tls13_server_hello_then_hello(0x0a0a, true),
+        ),
+        (
+            "tls13-sh-then-grease",
+            tls13_server_hello_then_hello(0x0a0a, false),
+        ),
+        ("tls13-sh-0301", tls13_server_hello_then_hello(0x0301, true)),
+        (
+            "tls13-sh-then-0301",
+            tls13_server_hello_then_hello(0x0301, false),
+        ),
+        ("ccs-split-1", prefix_then_split_hello(&ccs(), 1, 0x0301)),
+        ("ccs-split-5", prefix_then_split_hello(&ccs(), 5, 0x0301)),
+        ("ccs-split-7", prefix_then_split_hello(&ccs(), 7, 0x0301)),
+        (
+            "alert-split-1",
+            prefix_then_split_hello(&alert(), 1, 0x0301),
+        ),
+        (
+            "alert-split-5",
+            prefix_then_split_hello(&alert(), 5, 0x0301),
+        ),
+        (
+            "alert-split-7",
+            prefix_then_split_hello(&alert(), 7, 0x0301),
+        ),
+        (
+            "app-split-1",
+            prefix_then_split_hello(&app_data(), 1, 0x0301),
+        ),
+        (
+            "app-split-5",
+            prefix_then_split_hello(&app_data(), 5, 0x0301),
+        ),
+        (
+            "app-split-7",
+            prefix_then_split_hello(&app_data(), 7, 0x0301),
+        ),
+        (
+            "hs0-split-1",
+            prefix_then_split_hello(&handshake_type_record(0, 0x0303), 1, 0x0301),
+        ),
+        (
+            "hs0-split-5",
+            prefix_then_split_hello(&handshake_type_record(0, 0x0303), 5, 0x0301),
+        ),
+        (
+            "hs0-split-7",
+            prefix_then_split_hello(&handshake_type_record(0, 0x0303), 7, 0x0301),
+        ),
+        (
+            "ccs-grease-split-1",
+            prefix_then_split_hello(&ccs(), 1, 0x0a0a),
+        ),
+        (
+            "ccs-grease-split-5",
+            prefix_then_split_hello(&ccs(), 5, 0x0a0a),
+        ),
+        (
+            "ccs-grease-split-7",
+            prefix_then_split_hello(&ccs(), 7, 0x0a0a),
+        ),
+        ("split-hello-40", split_hello_at(40)),
     ]
+}
+
+fn tls13_server_hello_then_hello(version: u16, same_payload: bool) -> Vec<u8> {
+    let first = tls13_server_hello();
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    if same_payload {
+        let mut payload = first;
+        payload.extend_from_slice(&hello);
+        pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+    } else {
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+                eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello),
+            ],
+        )
+    }
+}
+
+fn prefix_then_split_hello(prefix: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    let mut first = prefix.to_vec();
+    first.extend_from_slice(&hello[..cut]);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello[cut..]),
+        ],
+    )
 }
 
 fn short_handshake_then_grease(body: &[u8]) -> Vec<u8> {

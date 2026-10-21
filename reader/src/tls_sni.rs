@@ -14,7 +14,9 @@ pub enum TlsParse {
 
 const CONTENT_HANDSHAKE: u8 = 0x16;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
+const HANDSHAKE_SERVER_HELLO: u8 = 2;
 const EXT_SERVER_NAME: u16 = 0;
+const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const RECORD_HEADER: usize = 5;
 const TLS_MAX_RECORD: usize = 16384 + 2048;
 
@@ -74,9 +76,7 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
                 version,
                 content,
             } => {
-                if sets_known(content, version, None) {
-                    *known = true;
-                }
+                apply_session_version(known, content, version, None);
                 offset = next;
             }
             Record::Unproved => {
@@ -88,9 +88,7 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
                 next,
                 version,
             } => {
-                if sets_known(CONTENT_HANDSHAKE, version, body.first().copied()) {
-                    *known = true;
-                }
+                apply_session_version(known, CONTENT_HANDSHAKE, version, Some(body));
                 match parse_handshake_messages(body) {
                     Hello::None => {}
                     Hello::Names(found) => {
@@ -257,6 +255,86 @@ fn sets_known(content: u8, version: u16, handshake_type: Option<u8>) -> bool {
     }
 }
 
+/// Record-level `ssl_try_set_version`, then ServerHello `tls_scan_server_hello`.
+/// TLS 1.3 (`supported_versions` 0x0304) takes `dissect_ssl`'s default arm.
+fn apply_session_version(
+    known: &mut bool,
+    content: u8,
+    record_version: u16,
+    handshake: Option<&[u8]>,
+) {
+    let hs_type = handshake.and_then(|body| body.first().copied());
+    if !*known && sets_known(content, record_version, hs_type) {
+        *known = true;
+    }
+    let Some(version) = server_hello_session_version(handshake) else {
+        return;
+    };
+    let version = normalize_tls_version(version);
+    if is_sticky_version(version) {
+        *known = true;
+    } else if version == 0x0304 {
+        *known = false;
+    }
+}
+
+/// tshark 4.6.9 `tls_try_get_version` for TLS: drafts become 0x0304.
+fn normalize_tls_version(version: u16) -> u16 {
+    if (version & 0xff00) == 0x7f00 || version == 0xfb17 || version == 0xfb1a {
+        0x0304
+    } else {
+        version
+    }
+}
+
+/// Scanned ServerHello version when tshark calls `ssl_try_set_version` again.
+fn server_hello_session_version(handshake: Option<&[u8]>) -> Option<u16> {
+    let body = handshake?;
+    if body.first() != Some(&HANDSHAKE_SERVER_HELLO) || body.len() < 4 {
+        return None;
+    }
+    let msg_len = u24(&body[1..4]);
+    if msg_len <= 2 {
+        return None;
+    }
+    let end = 4 + msg_len;
+    if end > body.len() {
+        return None;
+    }
+    Some(scan_server_hello_version(&body[4..end]))
+}
+
+/// tshark 4.6.9 `tls_scan_server_hello`: legacy_version, then
+/// `supported_versions` when legacy is TLS 1.2 or DTLS 1.2.
+fn scan_server_hello_version(hello: &[u8]) -> u16 {
+    let mut version = u16::from_be_bytes([hello[0], hello[1]]);
+    if !matches!(version, 0x0303 | 0xfefd) || hello.len() < 46 {
+        return version;
+    }
+    let mut offset = 34;
+    let sid_len = hello[offset] as usize;
+    offset += 1;
+    if hello.len().saturating_sub(offset) < sid_len + 5 {
+        return version;
+    }
+    offset += sid_len + 5;
+    while hello.len().saturating_sub(offset) >= 6 {
+        let ext_type = u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+        let ext_len = u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+        if hello.len().saturating_sub(offset) < 4 + ext_len {
+            break;
+        }
+        if ext_type == EXT_SUPPORTED_VERSIONS {
+            if ext_len == 2 {
+                version = u16::from_be_bytes([hello[offset + 4], hello[offset + 5]]);
+            }
+            return version;
+        }
+        offset += 4 + ext_len;
+    }
+    version
+}
+
 /// tshark 4.6.9 `ssl_is_valid_handshake_type` with `is_dtls == false`.
 fn is_valid_tls_handshake_type(hs_type: u8) -> bool {
     matches!(hs_type, 0 | 1 | 2 | 4..=6 | 8 | 11..=16 | 20..=25 | 67)
@@ -289,29 +367,43 @@ pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
 }
 
 /// Like [`truncated_handshake_need`], but a sticky session accepts any record
-/// version the way `dissect_ssl3_record` does.
+/// version the way `dissect_ssl3_record` does. Complete CCS/alert/app-data/
+/// HelloRequest records are skipped so a following truncated handshake is
+/// buffered, matching tshark 4.6.9 `dissect_ssl`.
 pub fn truncated_handshake_need_known(payload: &[u8], known: bool) -> Option<usize> {
-    if payload.is_empty() {
-        return None;
+    let mut offset = 0;
+    let mut known = known;
+    while offset < payload.len() {
+        let rest = &payload[offset..];
+        if rest.len() < RECORD_HEADER {
+            return (rest[0] == CONTENT_HANDSHAKE).then_some(RECORD_HEADER - rest.len());
+        }
+        let (content, version, length) = tls_record_header(rest)?;
+        if !known && !is_record_version(version) {
+            return None;
+        }
+        if length == 0 || length >= TLS_MAX_RECORD {
+            return None;
+        }
+        let need = RECORD_HEADER + length;
+        if need > rest.len() {
+            return (content == CONTENT_HANDSHAKE).then_some(need - rest.len());
+        }
+        let body = &rest[RECORD_HEADER..need];
+        if content == CONTENT_HANDSHAKE {
+            if let Some(more) = handshake_need(body) {
+                return Some(more);
+            }
+        }
+        apply_session_version(
+            &mut known,
+            content,
+            version,
+            (content == CONTENT_HANDSHAKE).then_some(body),
+        );
+        offset += need;
     }
-    if payload.len() < RECORD_HEADER {
-        return (payload[0] == CONTENT_HANDSHAKE).then_some(RECORD_HEADER - payload.len());
-    }
-    let (content, version, length) = tls_record_header(payload)?;
-    if content != CONTENT_HANDSHAKE {
-        return None;
-    }
-    if !known && !is_record_version(version) {
-        return None;
-    }
-    if length == 0 || length >= TLS_MAX_RECORD {
-        return None;
-    }
-    let need = RECORD_HEADER + length;
-    if need > payload.len() {
-        return Some(need - payload.len());
-    }
-    handshake_need(&payload[RECORD_HEADER..need])
+    None
 }
 
 /// Missing handshake bytes inside a complete record. A 4-byte header whose
@@ -600,6 +692,30 @@ mod tests {
         client_hello_bytes(Some(b"www.example.com"), 0x0a0a)
     }
 
+    fn tls13_server_hello() -> Vec<u8> {
+        let mut hello = Vec::from(0x0303u16.to_be_bytes());
+        hello.extend_from_slice(&[0x22u8; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0x13, 0x01]);
+        hello.push(0);
+        hello.extend_from_slice(&[0x00, 0x06]);
+        hello.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+        hello.extend_from_slice(&[0x00, 0x02, 0x03, 0x04]);
+        record(
+            CONTENT_HANDSHAKE,
+            0x0303,
+            &handshake(HANDSHAKE_SERVER_HELLO, &hello),
+        )
+    }
+
+    fn alert() -> Vec<u8> {
+        record(0x15, 0x0303, &[0x02, 0x28])
+    }
+
+    fn app_data() -> Vec<u8> {
+        record(0x17, 0x0303, &[0x01])
+    }
+
     #[test]
     fn sni_name_is_proved() {
         assert_eq!(
@@ -810,6 +926,73 @@ mod tests {
                 "handshake type {msg_type}"
             );
         }
+    }
+
+    #[test]
+    fn tls13_server_hello_does_not_stick_a_later_grease_hello() {
+        let mut payload = tls13_server_hello();
+        payload.extend_from_slice(&grease_hello());
+        assert_eq!(parse_tcp_tls_on_tls_port(&payload), TlsParse::Other);
+        let first = parse_tls(&tls13_server_hello(), false, false);
+        assert!(!first.known);
+        let after = parse_tls(&grease_hello(), first.known, false);
+        assert_eq!(after.kind, TlsParse::Other);
+    }
+
+    #[test]
+    fn tls13_server_hello_then_tls10_hello_prints_sni() {
+        let hello = client_hello(Some("www.example.com"));
+        let mut payload = tls13_server_hello();
+        payload.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&payload),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let first = parse_tls(&tls13_server_hello(), false, false);
+        assert!(!first.known);
+        let after = parse_tls(&hello, first.known, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn tls13_server_hello_unsticks_a_prior_session() {
+        let after = parse_tls(&tls13_server_hello(), true, false);
+        assert!(!after.known);
+        let grease = parse_tls(&grease_hello(), after.known, false);
+        assert_eq!(grease.kind, TlsParse::Other);
+    }
+
+    #[test]
+    fn truncated_handshake_need_after_complete_prefix() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        let prefixes = [ccs(), alert(), app_data(), handshake_type_record(0)];
+        for prefix in &prefixes {
+            for cut in [1usize, 5, 7] {
+                let mut payload = prefix.clone();
+                payload.extend_from_slice(&hello[..cut]);
+                assert!(
+                    truncated_handshake_need_known(&payload, false).is_some(),
+                    "prefix {} cut {cut}",
+                    prefix[0]
+                );
+            }
+            let mut grease_payload = prefix.clone();
+            grease_payload.extend_from_slice(&grease[..1]);
+            assert!(
+                truncated_handshake_need_known(&grease_payload, false).is_some(),
+                "grease after {}",
+                prefix[0]
+            );
+        }
+        assert_eq!(truncated_handshake_need(&hello[..1]), Some(4));
+        assert_eq!(
+            truncated_handshake_need(&hello[..40]),
+            Some(hello.len() - 40)
+        );
     }
 
     #[test]

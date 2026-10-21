@@ -188,6 +188,18 @@ pub fn handshake_type_record(msg_type: u8, version: u16) -> Vec<u8> {
     rec
 }
 
+pub fn tls13_server_hello() -> Vec<u8> {
+    let mut hello = Vec::from(0x0303u16.to_be_bytes());
+    hello.extend_from_slice(&[0x22u8; 32]);
+    hello.push(0);
+    hello.extend_from_slice(&[0x13, 0x01]);
+    hello.push(0);
+    hello.extend_from_slice(&[0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+    let mut rec = handshake_record(&handshake(2, &hello));
+    rec[1..3].copy_from_slice(&0x0303u16.to_be_bytes());
+    rec
+}
+
 fn handshake(msg_type: u8, body: &[u8]) -> Vec<u8> {
     let len = body.len() as u32;
     let mut out = vec![msg_type, (len >> 16) as u8, (len >> 8) as u8, len as u8];
