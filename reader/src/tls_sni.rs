@@ -504,6 +504,19 @@ fn is_valid_tls_handshake_type(hs_type: u8) -> bool {
     matches!(hs_type, 0 | 1 | 2 | 4..=6 | 8 | 11..=16 | 20..=25 | 67)
 }
 
+/// tshark 4.6.9 `ssl_31_handshake_type`. `try_val_to_str` is NULL otherwise.
+/// Hello Verify Request (3) is named here even though it is DTLS-only in
+/// `ssl_is_valid_handshake_type`. Message Hash (254) is not named.
+fn is_named_handshake_type(hs_type: u8) -> bool {
+    matches!(hs_type, 0..=6 | 8 | 11..=16 | 20..=25 | 67)
+}
+
+/// tshark 4.6.9 `is_encrypted_handshake_message` on the first message of a
+/// new record: remaining record ≥ 16 bytes and the type is unnamed.
+fn is_encrypted_handshake_record(body: &[u8]) -> bool {
+    body.len() >= 16 && !is_named_handshake_type(body[0])
+}
+
 /// tshark 4.6.9 `is_sslv3_or_tls`: Handshake or Application Data, SSLv3/TLS 1.0–1.2
 /// or TLCP, nonzero length below `TLS_MAX_RECORD_LENGTH+2048`. TLS 1.3 (0x0304)
 /// and CCS/alert/heartbeat are not TLS on an unnamed port.
@@ -856,6 +869,11 @@ fn handshake_need(body: &[u8]) -> Option<usize> {
 fn parse_handshake_messages(body: &[u8], leftover: &[u8], version: u16) -> (Hello, bool) {
     if body.is_empty() {
         return (Hello::Unproved, false);
+    }
+    if is_encrypted_handshake_record(body) {
+        // dissect_tls_handshake treats the rest of this record as Encrypted
+        // Handshake Message. Later ClientHellos in this record are not printed.
+        return (Hello::None, false);
     }
     let mut offset = 0;
     let mut names = Vec::new();
@@ -2162,6 +2180,83 @@ mod tests {
             TlsParse::Other,
             "empty CertificateURL then CH as a second record"
         );
+    }
+
+    #[test]
+    fn unnamed_first_handshake_type_hides_a_later_hello_in_the_same_record() {
+        let hello_hs = client_hello_hs("www.example.com");
+        let other_hs = client_hello_hs("other.example");
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let both = TlsParse::ClientHello(vec![
+            "www.example.com".to_string(),
+            "other.example".to_string(),
+        ]);
+        let rec = handshake_record_messages(&[handshake(7, &[]), hello_hs.clone()]);
+        assert!(rec.len() - RECORD_HEADER >= 16, "type 7 then CH is 16+");
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&rec),
+            TlsParse::Other,
+            "type 7 then CH same record"
+        );
+        assert_eq!(
+            parse_tcp_tls(&rec),
+            TlsParse::Other,
+            "unnamed 40001→40002 type 7 then CH"
+        );
+        for msg_type in [9u8, 10, 17, 26, 64, 66, 68, 99, 254, 255] {
+            let rec = handshake_record_messages(&[handshake(msg_type, &[0x00]), hello_hs.clone()]);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&rec),
+                TlsParse::Other,
+                "type {msg_type} body 00 then CH"
+            );
+        }
+        let mut ccs_same = ccs();
+        ccs_same.extend_from_slice(&handshake_record_messages(&[
+            handshake(7, &[]),
+            hello_hs.clone(),
+        ]));
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&ccs_same),
+            TlsParse::Other,
+            "CCS then type 7 then CH same payload"
+        );
+        let encrypted = handshake_record_messages(&[handshake(7, &[]), hello_hs.clone()]);
+        let first = parse_tls(&ccs(), TlsSession::Unknown, false);
+        assert_eq!(
+            parse_tls(&encrypted, first.session, false).kind,
+            TlsParse::Other,
+            "CCS then type 7 then CH next frame"
+        );
+        let mut short = handshake_type_record(7);
+        short.extend_from_slice(&client_hello(Some("www.example.com")));
+        assert_eq!(
+            handshake_type_record(7).len() - RECORD_HEADER,
+            4,
+            "empty type 7 record is 4 bytes"
+        );
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&short),
+            named.clone(),
+            "empty type 7 as its own record then CH"
+        );
+        let later =
+            handshake_record_messages(&[hello_hs.clone(), handshake(7, &[]), other_hs.clone()]);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&later),
+            both,
+            "CH then type 7 then CH same record"
+        );
+        for msg_type in [
+            2u8, 4, 6, 3, 8, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 67,
+        ] {
+            let rec = handshake_record_messages(&[handshake(msg_type, &[]), hello_hs.clone()]);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&rec),
+                named.clone(),
+                "empty named type {msg_type} then CH same record"
+            );
+        }
     }
 
     #[test]

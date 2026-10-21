@@ -2745,6 +2745,82 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_first_handshake_type_hides_a_later_hello_in_the_same_record() {
+        let hello = sni_hello("www.example.com");
+        let hello_hs = hello[5..].to_vec();
+        let other_hs = sni_hello("other.example")[5..].to_vec();
+        let mut rec_body = handshake_msg(7, &[]);
+        rec_body.extend_from_slice(&hello_hs);
+        let rec = handshake_record_body(&rec_body);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &rec));
+        assert_eq!(cell.tls_sni, [] as [&str; 0], "type 7 then CH");
+        assert_eq!(cell.counted, None, "type 7 then CH");
+        let unnamed = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &rec));
+        assert_eq!(unnamed.tls_sni, [] as [&str; 0], "unnamed 40001→40002");
+        assert_eq!(unnamed.counted, None, "unnamed 40001→40002");
+        for msg_type in [9u8, 10, 17, 26, 64, 66, 68, 99, 254, 255] {
+            let mut body = handshake_msg(msg_type, &[0x00]);
+            body.extend_from_slice(&hello_hs);
+            let cell = walk_tls(&eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                443,
+                &handshake_record_body(&body),
+            ));
+            assert_eq!(cell.tls_sni, [] as [&str; 0], "type {msg_type} body 00");
+            assert_eq!(cell.counted, None, "type {msg_type} body 00");
+        }
+        let mut ccs_same = ccs();
+        ccs_same.extend_from_slice(&rec);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &ccs_same));
+        assert_eq!(cell.tls_sni, [] as [&str; 0], "CCS then type 7 same");
+        assert_eq!(cell.counted, None, "CCS then type 7 same");
+        let cells = next_seq_frames(&ccs(), &rec);
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0], "CCS then type 7 next");
+        assert_eq!(cells[1].counted, None, "CCS then type 7 next");
+        let mut short = handshake_record_body(&handshake_msg(7, &[]));
+        short.extend_from_slice(&hello);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &short));
+        assert_eq!(
+            cell.tls_sni,
+            ["www.example.com"],
+            "empty type 7 as its own record then CH"
+        );
+        let mut both = hello_hs.clone();
+        both.extend_from_slice(&handshake_msg(7, &[]));
+        both.extend_from_slice(&other_hs);
+        let cell = walk_tls(&eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            &handshake_record_body(&both),
+        ));
+        assert_eq!(
+            cell.tls_sni,
+            ["www.example.com", "other.example"],
+            "CH then type 7 then CH"
+        );
+        for msg_type in [
+            2u8, 4, 6, 3, 8, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 67,
+        ] {
+            let mut body = handshake_msg(msg_type, &[]);
+            body.extend_from_slice(&hello_hs);
+            let cell = walk_tls(&eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                443,
+                &handshake_record_body(&body),
+            ));
+            assert_eq!(
+                cell.tls_sni,
+                ["www.example.com"],
+                "empty named type {msg_type} then CH"
+            );
+            assert_eq!(cell.counted, None, "empty named type {msg_type} then CH");
+        }
+    }
+
+    #[test]
     fn leftover_shorter_than_header_is_continuation_while_unknown() {
         let hello = sni_hello("www.example.com");
         let grease = grease_hello();

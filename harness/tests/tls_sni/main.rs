@@ -990,7 +990,50 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .into_iter()
     .chain(tls13_session_cases())
     .chain(throwing_leftover_cases())
+    .chain(encrypted_handshake_cases())
     .collect()
+}
+
+fn encrypted_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let mut cases = vec![
+        (
+            "hs7-then-ch-same-rec",
+            handshake_then_hello_same_record(7, &[]),
+        ),
+        (
+            "hs7-then-ch-same-rec-unnamed",
+            handshake_then_hello_same_record_ports(40001, 40002, 7, &[]),
+        ),
+        (
+            "ccs-hs7-ch-same",
+            ccs_then_handshake_hello_same_record(7, &[]),
+        ),
+        (
+            "ccs-then-hs7-ch",
+            ccs_then_handshake_hello_next_frame(7, &[]),
+        ),
+        (
+            "empty-hs7-then-ch-next-rec",
+            prefix_then_hello_same(&handshake_type_record(7, 0x0303), 0x0301),
+        ),
+        (
+            "ch-hs7-ch-same-rec",
+            hello_unnamed_hello_same_record(7, &[]),
+        ),
+    ];
+    for msg_type in [9u8, 10, 17, 26, 64, 66, 68, 99, 254, 255] {
+        cases.push((
+            leak(format!("hs{msg_type}-body00-then-ch-same-rec")),
+            handshake_then_hello_same_record(msg_type, &[0x00]),
+        ));
+    }
+    for msg_type in [3u8, 11, 12, 13, 14, 16, 20, 21, 22, 23, 24] {
+        cases.push((
+            leak(format!("empty-hs{msg_type}-same-rec-0301")),
+            handshake_then_hello_same_record(msg_type, &[]),
+        ));
+    }
+    cases
 }
 
 fn throwing_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
@@ -1550,15 +1593,61 @@ fn hello_inner(sni: &str) -> Vec<u8> {
 }
 
 fn handshake_then_hello_same_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    handshake_then_hello_same_record_ports(50000, 443, msg_type, body)
+}
+
+fn handshake_then_hello_same_record_ports(
+    sport: u16,
+    dport: u16,
+    msg_type: u8,
+    body: &[u8],
+) -> Vec<u8> {
     let hello = hello_inner("www.example.com");
+    pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(
+            OUTER,
+            sport,
+            dport,
+            &handshake_messages_record(0x0303, &[(msg_type, body), (1, &hello)]),
+        )],
+    )
+}
+
+fn hello_unnamed_hello_same_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let first = hello_inner("www.example.com");
+    let second = hello_inner("other.example");
     pcap(
         LINK_ETHERNET,
         &[eth_ipv4_tcp(
             OUTER,
             50000,
             443,
-            &handshake_messages_record(0x0303, &[(msg_type, body), (1, &hello)]),
+            &handshake_messages_record(0x0303, &[(1, &first), (msg_type, body), (1, &second)]),
         )],
+    )
+}
+
+fn ccs_then_handshake_hello_same_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let hello = hello_inner("www.example.com");
+    let mut payload = ccs();
+    payload.extend_from_slice(&handshake_messages_record(
+        0x0303,
+        &[(msg_type, body), (1, &hello)],
+    ));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn ccs_then_handshake_hello_next_frame(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let hello = hello_inner("www.example.com");
+    let rec = handshake_messages_record(0x0303, &[(msg_type, body), (1, &hello)]);
+    let first = ccs();
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &rec),
+        ],
     )
 }
 
