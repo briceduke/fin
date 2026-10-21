@@ -641,6 +641,106 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             empty_then_complete_hello_same(0x16, 0x0301),
         ),
         (
+            "empty-ccs-leftover-00-grease",
+            leftover_then_hello(&empty_record(0x14), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-ccs-leftover-00-0301",
+            leftover_then_hello(&empty_record(0x14), &[0x00], 0x0301),
+        ),
+        (
+            "empty-ccs-leftover-01-grease",
+            leftover_then_hello(&empty_record(0x14), &[0x01], 0x0a0a),
+        ),
+        (
+            "empty-ccs-leftover-ff-grease",
+            leftover_then_hello(&empty_record(0x14), &[0xff], 0x0a0a),
+        ),
+        (
+            "empty-alert-leftover-00-grease",
+            leftover_then_hello(&empty_record(0x15), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-alert-leftover-01-grease",
+            leftover_then_hello(&empty_record(0x15), &[0x01], 0x0a0a),
+        ),
+        (
+            "empty-alert-leftover-ff-grease",
+            leftover_then_hello(&empty_record(0x15), &[0xff], 0x0a0a),
+        ),
+        (
+            "empty-app-leftover-00-grease",
+            leftover_then_hello(&empty_record(0x17), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-app-leftover-00-0301",
+            leftover_then_hello(&empty_record(0x17), &[0x00], 0x0301),
+        ),
+        (
+            "empty-cid-leftover-00-grease",
+            leftover_then_hello(&empty_record(0x19), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-ack-leftover-00-grease",
+            leftover_then_hello(&empty_record(0x1A), &[0x00], 0x0a0a),
+        ),
+        (
+            "empty-ccs-leftover-ct14-grease",
+            leftover_then_hello(&empty_record(0x14), &[0x14], 0x0a0a),
+        ),
+        (
+            "empty-ccs-leftover-ct16-grease",
+            leftover_then_hello(&empty_record(0x14), &[0x16], 0x0a0a),
+        ),
+        (
+            "empty-ccs-leftover-ct1a-grease",
+            leftover_then_hello(&empty_record(0x14), &[0x1A], 0x0a0a),
+        ),
+        (
+            "complete-ccs-leftover-00-grease",
+            leftover_then_hello(&ccs(), &[0x00], 0x0a0a),
+        ),
+        (
+            "complete-ccs-leftover-00-0301",
+            leftover_then_hello(&ccs(), &[0x00], 0x0301),
+        ),
+        (
+            "empty-ccs-complete-ccs-grease-same",
+            empty_then_record_then_hello_same(0x14, &ccs(), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-empty-ccs-grease",
+            empty_hs_then_record_then_hello(&empty_record(0x14), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-empty-alert-grease",
+            empty_hs_then_record_then_hello(&empty_record(0x15), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-empty-app-grease",
+            empty_hs_then_record_then_hello(&empty_record(0x17), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-empty-hb-grease",
+            empty_hs_then_record_then_hello(&empty_record(0x18), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-empty-cid-grease",
+            empty_hs_then_record_then_hello(&empty_record(0x19), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-complete-ccs-grease",
+            empty_hs_then_record_then_hello(&ccs(), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-complete-alert-grease",
+            empty_hs_then_record_then_hello(&alert(), 0x0a0a),
+        ),
+        (
+            "empty-hs-then-complete-app-grease",
+            empty_hs_then_record_then_hello(&app_data(), 0x0a0a),
+        ),
+        (
             "ccs-byte-then-rest-then-grease",
             split_record_then_later_hello(&ccs(), 1, 0x0a0a),
         ),
@@ -854,6 +954,39 @@ fn empty_then_complete_hello_same(content: u8, version: u16) -> Vec<u8> {
     let mut payload = empty_record(content);
     payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
     pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn leftover_then_hello(prefix: &[u8], leftover: &[u8], version: u16) -> Vec<u8> {
+    let mut first = prefix.to_vec();
+    first.extend_from_slice(leftover);
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello),
+        ],
+    )
+}
+
+fn empty_then_record_then_hello_same(content: u8, following: &[u8], version: u16) -> Vec<u8> {
+    let mut payload = empty_record(content);
+    payload.extend_from_slice(following);
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn empty_hs_then_record_then_hello(following: &[u8], version: u16) -> Vec<u8> {
+    let mut first = empty_record(0x16);
+    first.extend_from_slice(following);
+    let hello = client_hello_host(Some(b"www.example.com"), version);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 443, 1 + first.len() as u32, &hello),
+        ],
+    )
 }
 
 fn two_empty_then_complete_hello_same(content: u8, version: u16) -> Vec<u8> {

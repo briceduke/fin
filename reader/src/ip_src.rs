@@ -2401,6 +2401,14 @@ mod tests {
                     [] as [&str; 0],
                     "empty {content} cut {cut}"
                 );
+                if content == 0x18 && cut < 3 {
+                    assert_eq!(
+                        cells[1].tls_sni,
+                        [] as [&str; 0],
+                        "empty heartbeat cut {cut}"
+                    );
+                    continue;
+                }
                 assert_eq!(
                     cells[0].counted,
                     Some("tls-handshake"),
@@ -2477,6 +2485,126 @@ mod tests {
         let complete = next_seq_frames(&ccs(), &grease);
         assert_eq!(complete[1].tls_sni, ["www.example.com"]);
         assert_eq!(complete[1].counted, None);
+    }
+
+    #[test]
+    fn leftover_garbage_after_empty_record_swallows_the_next_hello() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        for content in [0x14u8, 0x15, 0x17, 0x19, 0x1A] {
+            for leftover in [0x00u8, 0x01, 0xff] {
+                let mut first = empty_record(content);
+                first.push(leftover);
+                let cells = next_seq_frames(&first, &grease);
+                assert_eq!(
+                    cells[0].tls_sni,
+                    [] as [&str; 0],
+                    "empty {content}+{leftover:#04x}"
+                );
+                assert_eq!(cells[0].counted, None, "empty {content}+{leftover:#04x}");
+                assert_eq!(
+                    cells[1].tls_sni,
+                    [] as [&str; 0],
+                    "empty {content}+{leftover:#04x} grease"
+                );
+                assert_eq!(
+                    cells[1].counted, None,
+                    "empty {content}+{leftover:#04x} grease"
+                );
+                let named = next_seq_frames(&first, &hello);
+                assert_eq!(
+                    named[1].tls_sni,
+                    [] as [&str; 0],
+                    "empty {content}+{leftover:#04x} 0x0301"
+                );
+            }
+            for leftover in [0x14u8, 0x16, 0x1A] {
+                let mut first = empty_record(content);
+                first.push(leftover);
+                let cells = next_seq_frames(&first, &grease);
+                assert_eq!(
+                    cells[1].tls_sni,
+                    [] as [&str; 0],
+                    "empty {content}+ct{leftover:#04x}"
+                );
+            }
+            let mut same = empty_record(content);
+            same.extend_from_slice(&ccs());
+            same.extend_from_slice(&grease);
+            let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &same));
+            assert_eq!(
+                cell.tls_sni,
+                ["www.example.com"],
+                "empty {content} complete CCS grease same"
+            );
+        }
+        let mut ccs_leftover = ccs();
+        ccs_leftover.push(0x00);
+        let cells = next_seq_frames(&ccs_leftover, &grease);
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        let named = next_seq_frames(&ccs_leftover, &hello);
+        assert_eq!(named[1].tls_sni, [] as [&str; 0]);
+        let mut hb = empty_record(0x18);
+        hb.push(0x00);
+        let cells = next_seq_frames(&hb, &grease);
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn empty_handshake_then_following_record_sticks_later_grease() {
+        let hello = sni_hello("www.example.com");
+        let grease = grease_hello();
+        for following in [
+            empty_record(0x14),
+            empty_record(0x15),
+            empty_record(0x17),
+            empty_record(0x18),
+            empty_record(0x19),
+            ccs(),
+            alert(),
+            app_data(),
+        ] {
+            let mut first = empty_record(0x16);
+            first.extend_from_slice(&following);
+            let cells = next_seq_frames(&first, &grease);
+            assert_eq!(
+                cells[0].tls_sni,
+                [] as [&str; 0],
+                "empty HS then {}",
+                following[0]
+            );
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-handshake"),
+                "empty HS then {}",
+                following[0]
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                ["www.example.com"],
+                "empty HS then {} grease",
+                following[0]
+            );
+            assert_eq!(
+                cells[1].counted, None,
+                "empty HS then {} grease",
+                following[0]
+            );
+            let named = next_seq_frames(&first, &hello);
+            assert_eq!(
+                named[1].tls_sni,
+                ["www.example.com"],
+                "empty HS then {} 0x0301",
+                following[0]
+            );
+        }
+        let mut same = empty_record(0x16);
+        same.extend_from_slice(&hello);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &same));
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("tls-handshake"));
     }
 
     #[test]

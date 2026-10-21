@@ -91,7 +91,7 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
     let mut saw_hello = false;
     let mut unproved = false;
     while offset < payload.len() {
-        match take_record(payload, offset, *session) {
+        match take_record(payload, offset, session) {
             Record::Done => break,
             Record::Other {
                 next,
@@ -101,8 +101,8 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                 // tshark 4.6.9 ssl_try_set_version reads the first body byte.
                 // A length-0 record at the end of the payload throws (Info
                 // [Malformed Packet]), so the session stays unknown. A following
-                // byte in this payload is readable, so an in-record GREASE hello
-                // still prints.
+                // byte is readable, so the session sticks; leftover that is not
+                // a content type is then desegmented (Ignored Unknown Record).
                 if next > offset + RECORD_HEADER || next < payload.len() {
                     apply_session_version(session, content, version, None);
                 }
@@ -194,7 +194,7 @@ enum Hello {
     Unproved,
 }
 
-fn take_record(payload: &[u8], offset: usize, session: TlsSession) -> Record<'_> {
+fn take_record<'a>(payload: &'a [u8], offset: usize, session: &mut TlsSession) -> Record<'a> {
     let rest = &payload[offset..];
     if rest.is_empty() {
         return Record::Done;
@@ -218,16 +218,25 @@ fn take_record(payload: &[u8], offset: usize, session: TlsSession) -> Record<'_>
     }
     // tshark 4.6.9 dissect_ssl3_record consumes a length-0 CCS/alert/app-data/
     // heartbeat and continues. An empty handshake is still Unproved: a following
-    // complete ClientHello in this payload is a counted miss.
+    // complete ClientHello in this payload is a counted miss. ssl_try_set_version
+    // still reads next_byte (0x14 = Finished is authoritative).
     if length == 0 {
-        return if content == CONTENT_HANDSHAKE {
-            Record::Unproved
-        } else {
-            Record::Other {
-                next: offset + RECORD_HEADER,
-                version,
-                content,
+        if content == CONTENT_HANDSHAKE {
+            let next = offset + RECORD_HEADER;
+            if next < payload.len() {
+                apply_session_version(
+                    session,
+                    CONTENT_HANDSHAKE,
+                    version,
+                    Some(&payload[next..next + 1]),
+                );
             }
+            return Record::Unproved;
+        }
+        return Record::Other {
+            next: offset + RECORD_HEADER,
+            version,
+            content,
         };
     }
     let start = offset + RECORD_HEADER;
@@ -522,10 +531,16 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
     while offset < payload.len() {
         let rest = &payload[offset..];
         if rest.len() < RECORD_HEADER {
-            return is_content_type(rest[0]).then_some(RecordTail {
-                start: offset,
-                more: RECORD_HEADER - rest.len(),
-            });
+            // tshark 4.6.9 dissect_ssl desegments remaining < 5 after a sticky
+            // version even when leftover is not a content type, so the next
+            // TCP segment is Ignored Unknown Record.
+            if is_content_type(rest[0]) || session.skips_looks_like() {
+                return Some(RecordTail {
+                    start: offset,
+                    more: RECORD_HEADER - rest.len(),
+                });
+            }
+            return None;
         }
         let (content, version, length) = tls_record_header(rest)?;
         if !session.skips_looks_like() && !is_record_version(version) {
@@ -536,6 +551,11 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
         }
         if length == 0 {
             apply_session_version(&mut session, content, version, None);
+            // dissect_ssl3_heartbeat reads type + payload_length (3 bytes) even
+            // when record_length is 0. That throw leaves leftover unprocessed.
+            if content == 0x18 && rest.len() < RECORD_HEADER + 3 {
+                return None;
+            }
             offset += RECORD_HEADER;
             continue;
         }
@@ -1207,6 +1227,15 @@ mod tests {
             for cut in [1usize, 5, 7] {
                 let mut payload = empty.clone();
                 payload.extend_from_slice(&hello[..cut]);
+                if content == 0x18 && cut < 3 {
+                    // dissect_ssl3_heartbeat throws before leftover is desegmented.
+                    assert_eq!(
+                        truncated_handshake_need_known(&payload, TlsSession::Unknown),
+                        None,
+                        "empty heartbeat cut {cut}"
+                    );
+                    continue;
+                }
                 assert!(
                     truncated_handshake_need_known(&payload, TlsSession::Unknown).is_some(),
                     "empty {content} cut {cut}"
@@ -1247,6 +1276,153 @@ mod tests {
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+    }
+
+    fn stitch_leftover(first: &[u8], next: &[u8]) -> TlsParse {
+        let outcome = parse_tls(first, TlsSession::Unknown, false);
+        match truncated_handshake_prefix(first, TlsSession::Unknown) {
+            Some(prefix) => {
+                let mut buf = prefix.to_vec();
+                buf.extend_from_slice(next);
+                parse_tls(&buf, outcome.session, false).kind
+            }
+            None => parse_tls(next, outcome.session, false).kind,
+        }
+    }
+
+    #[test]
+    fn leftover_garbage_after_empty_record_swallows_the_next_hello() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        for content in [0x14u8, 0x15, 0x17, 0x19, 0x1A] {
+            for leftover in [0x00u8, 0x01, 0xff] {
+                let mut first = empty_record(content);
+                first.push(leftover);
+                let outcome = parse_tls(&first, TlsSession::Unknown, false);
+                assert_eq!(
+                    outcome.kind,
+                    TlsParse::Other,
+                    "empty {content}+{leftover:#04x}"
+                );
+                assert_eq!(
+                    outcome.session,
+                    TlsSession::Sticky,
+                    "empty {content}+{leftover:#04x}"
+                );
+                let prefix = truncated_handshake_prefix(&first, TlsSession::Unknown).unwrap();
+                assert_eq!(prefix, &[leftover], "empty {content}+{leftover:#04x}");
+                assert_eq!(
+                    stitch_leftover(&first, &grease),
+                    TlsParse::Other,
+                    "empty {content}+{leftover:#04x} grease"
+                );
+                assert_eq!(
+                    stitch_leftover(&first, &hello),
+                    TlsParse::Other,
+                    "empty {content}+{leftover:#04x} 0x0301"
+                );
+            }
+            for leftover in [0x14u8, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A] {
+                let mut first = empty_record(content);
+                first.push(leftover);
+                assert!(
+                    !matches!(stitch_leftover(&first, &grease), TlsParse::ClientHello(_)),
+                    "empty {content}+ct{leftover:#04x} grease"
+                );
+            }
+            let mut same = empty_record(content);
+            same.extend_from_slice(&ccs());
+            same.extend_from_slice(&grease);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "empty {content} complete CCS grease same"
+            );
+        }
+        let mut ccs_leftover = ccs();
+        ccs_leftover.push(0x00);
+        assert_eq!(
+            stitch_leftover(&ccs_leftover, &grease),
+            TlsParse::Other,
+            "complete CCS+00 grease"
+        );
+        assert_eq!(
+            stitch_leftover(&ccs_leftover, &hello),
+            TlsParse::Other,
+            "complete CCS+00 0x0301"
+        );
+        let mut five = empty_record(0x14);
+        five.extend_from_slice(&[0x00; 5]);
+        assert_eq!(
+            stitch_leftover(&five, &grease),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+            "empty CCS+5 zeros is IUR in this frame"
+        );
+        let mut hb_leftover = empty_record(0x18);
+        hb_leftover.push(0x00);
+        assert_eq!(
+            stitch_leftover(&hb_leftover, &grease),
+            TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+            "empty heartbeat leftover throws, next GREASE prints"
+        );
+    }
+
+    #[test]
+    fn empty_handshake_next_byte_sticks_a_later_grease_hello() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        for following in [
+            empty_record(0x14),
+            empty_record(0x15),
+            empty_record(0x17),
+            empty_record(0x18),
+            empty_record(0x19),
+            ccs(),
+            alert(),
+            app_data(),
+        ] {
+            let mut first = empty_record(CONTENT_HANDSHAKE);
+            first.extend_from_slice(&following);
+            let outcome = parse_tls(&first, TlsSession::Unknown, false);
+            assert_eq!(
+                outcome.kind,
+                TlsParse::Unproved,
+                "empty HS then {}",
+                following[0]
+            );
+            assert_eq!(
+                outcome.session,
+                TlsSession::Sticky,
+                "empty HS then {}",
+                following[0]
+            );
+            assert_eq!(
+                parse_tls(&grease, outcome.session, false).kind,
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "empty HS then {} grease",
+                following[0]
+            );
+            assert_eq!(
+                parse_tls(&hello, outcome.session, false).kind,
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "empty HS then {} 0x0301",
+                following[0]
+            );
+        }
+        let mut same = empty_record(CONTENT_HANDSHAKE);
+        same.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&same),
+            TlsParse::Unproved,
+            "empty HS then complete hello same payload stays a counted miss"
+        );
+        let lone = parse_tls(&empty_record(CONTENT_HANDSHAKE), TlsSession::Unknown, false);
+        assert_eq!(lone.kind, TlsParse::Unproved);
+        assert_eq!(lone.session, TlsSession::Unknown);
+        assert_eq!(
+            parse_tls(&grease, lone.session, false).kind,
+            TlsParse::Other
         );
     }
 
