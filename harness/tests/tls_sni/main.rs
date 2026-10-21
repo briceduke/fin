@@ -992,6 +992,7 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(throwing_leftover_cases())
     .chain(encrypted_handshake_cases())
     .chain(empty_ccs_encrypted_cases())
+    .chain(ccs_role_cases())
     .collect()
 }
 
@@ -1050,13 +1051,127 @@ fn empty_ccs_encrypted_cases() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn sequential_payloads(sport: u16, dport: u16, payloads: &[&[u8]]) -> Vec<u8> {
+    sequential_ipv4_flow(OUTER, PEER, sport, dport, payloads)
+}
+
+fn sequential_ipv4_flow(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    payloads: &[&[u8]],
+) -> Vec<u8> {
     let mut frames = Vec::new();
     let mut seq = 1u32;
     for payload in payloads {
-        frames.push(eth_ipv4_tcp_seq(OUTER, sport, dport, seq, payload));
+        frames.push(eth_ipv4_tcp_flow(src, dst, sport, dport, seq, payload));
         seq += payload.len() as u32;
     }
     pcap(LINK_ETHERNET, &frames)
+}
+
+fn two_way_ipv4(
+    first: ([u8; 4], [u8; 4], u16, u16, &[u8]),
+    second: ([u8; 4], [u8; 4], u16, u16, &[u8]),
+) -> Vec<u8> {
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(first.0, first.1, first.2, first.3, 1, first.4),
+            eth_ipv4_tcp_flow(second.0, second.1, second.2, second.3, 1, second.4),
+        ],
+    )
+}
+
+fn sequential_ipv6_flow(
+    src: [u8; 16],
+    dst: [u8; 16],
+    sport: u16,
+    dport: u16,
+    payloads: &[&[u8]],
+) -> Vec<u8> {
+    let mut frames = Vec::new();
+    let mut seq = 1u32;
+    for payload in payloads {
+        frames.push(eth_ipv6_tcp_flow(src, dst, sport, dport, seq, payload));
+        seq += payload.len() as u32;
+    }
+    pcap(LINK_ETHERNET, &frames)
+}
+
+fn two_way_ipv6(
+    first: ([u8; 16], [u8; 16], u16, u16, &[u8]),
+    second: ([u8; 16], [u8; 16], u16, u16, &[u8]),
+) -> Vec<u8> {
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv6_tcp_flow(first.0, first.1, first.2, first.3, 1, first.4),
+            eth_ipv6_tcp_flow(second.0, second.1, second.2, second.3, 1, second.4),
+        ],
+    )
+}
+
+/// CCS on a TLS src port is `server_ccs_frame` until ClientHello calls
+/// `ssl_set_server(dst)`. Same-direction later frames then use the client
+/// slot; the reverse 5-tuple uses the armed server slot.
+fn ccs_role_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let empty = empty_record(0x14);
+    let nonempty = ccs();
+    let no_sni = client_hello(None);
+    let hr_ch =
+        handshake_messages_record(0x0303, &[(0, &[]), (1, &hello_inner("www.example.com"))]);
+    let leftovers = [
+        ("sh", server_hello()),
+        ("app", app_data()),
+        ("alert", alert()),
+        ("hr", handshake_type_record(0, 0x0303)),
+    ];
+    let mut cases = Vec::new();
+    for (ccs_name, ccs_rec) in [
+        ("empty", empty.as_slice()),
+        ("nonempty", nonempty.as_slice()),
+    ] {
+        let mut first = ccs_rec.to_vec();
+        first.extend_from_slice(&no_sni);
+        for port in [443u16, 465, 636, 853, 993, 995] {
+            cases.push((
+                leak(format!("{ccs_name}-ccs-nosni-{port}-then-hr-ch")),
+                sequential_ipv4_flow(PEER, OUTER, port, 50000, &[&first, &hr_ch]),
+            ));
+            cases.push((
+                leak(format!("{ccs_name}-ccs-nosni-{port}-then-peer-hr-ch")),
+                two_way_ipv4(
+                    (PEER, OUTER, port, 50000, &first),
+                    (OUTER, PEER, 50000, port, &hr_ch),
+                ),
+            ));
+        }
+        cases.push((
+            leak(format!("{ccs_name}-ccs-nosni-443-then-hr-ch-ipv6")),
+            sequential_ipv6_flow(PEER_V6, OUTER_V6, 443, 50000, &[&first, &hr_ch]),
+        ));
+        cases.push((
+            leak(format!("{ccs_name}-ccs-nosni-443-then-peer-hr-ch-ipv6")),
+            two_way_ipv6(
+                (PEER_V6, OUTER_V6, 443, 50000, &first),
+                (OUTER_V6, PEER_V6, 50000, 443, &hr_ch),
+            ),
+        ));
+    }
+    for (name, leftover) in leftovers {
+        let mut first = empty.clone();
+        first.extend_from_slice(&leftover);
+        cases.push((
+            leak(format!("empty-ccs-{name}-443-then-hr-ch")),
+            sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&first, &hr_ch]),
+        ));
+    }
+    cases.push((
+        "empty-ccs-443-then-hr-ch",
+        sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&empty, &hr_ch]),
+    ));
+    cases
 }
 
 fn encrypted_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {

@@ -59,8 +59,9 @@ pub struct TlsOutcome {
     pub kind: TlsParse,
     pub claimed: bool,
     pub session: TlsSession,
-    /// tshark `SslSession` CCS frame is set for this TCP direction.
-    /// A later frame uses it in `is_encrypted_handshake_message`.
+    /// tshark `client_ccs_frame` / `server_ccs_frame` for this packet's
+    /// `ssl_packet_from_server` role. A later frame uses it in
+    /// `is_encrypted_handshake_message`.
     pub after_ccs: bool,
 }
 
@@ -84,8 +85,8 @@ pub fn parse_tls(payload: &[u8], session: TlsSession, heuristic: bool) -> TlsOut
     parse_tls_after_ccs(payload, session, heuristic, false)
 }
 
-/// Like [`parse_tls`], with tshark's per-direction CCS frame already set
-/// from an earlier packet (`pinfo->num > ccs_frame`).
+/// Like [`parse_tls`], with this packet's `ssl_packet_from_server` CCS
+/// frame already set from an earlier packet (`pinfo->num > ccs_frame`).
 pub fn parse_tls_after_ccs(
     payload: &[u8],
     session: TlsSession,

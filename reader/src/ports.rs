@@ -169,6 +169,13 @@ impl PortTables {
         self.pick(&self.tcp, src, dst)
     }
 
+    /// tshark 4.6.9 `ssl_packet_from_server` before `ssl_set_server`:
+    /// `dissector_get_uint_handle(ssl_associations, srcport) != 0`.
+    /// Ports registered with `ssl_association_add` are `tls` on `tcp.port`.
+    pub fn is_tls_port(&self, port: u16) -> bool {
+        first_named(&self.tcp, port) == Some("tls")
+    }
+
     fn pick(&self, map: &HashMap<u16, &'static str>, src: u16, dst: u16) -> PortPick {
         let (low, high) = if src <= dst { (src, dst) } else { (dst, src) };
         let name = first_named(map, low).or_else(|| {
@@ -273,5 +280,16 @@ mod tests {
         assert_eq!(pick.name, Some("tls"));
         assert!(pick.is_tls());
         assert!(!pick.is_vxlan());
+    }
+
+    #[test]
+    fn tls_port_is_the_source_port_not_the_pair() {
+        let tables = snapshot();
+        for port in [443u16, 465, 636, 853, 993, 995] {
+            assert!(tables.is_tls_port(port), "{port}");
+        }
+        assert!(!tables.is_tls_port(50000));
+        assert!(!tables.is_tls_port(40001));
+        assert!(!tables.is_tls_port(0));
     }
 }

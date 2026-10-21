@@ -8,6 +8,8 @@ pub const LINK_ETHERNET: u32 = 1;
 pub const LINK_SLL: u32 = 113;
 pub const OUTER: [u8; 4] = [10, 0, 0, 1];
 pub const PEER: [u8; 4] = [10, 255, 255, 1];
+pub const OUTER_V6: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+pub const PEER_V6: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
 pub fn pcap(link: u32, frames: &[Vec<u8>]) -> Vec<u8> {
     let mut file = Vec::new();
@@ -77,10 +79,14 @@ pub fn ipv4_to(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8>
 }
 
 pub fn ipv6(next: u8, payload: &[u8]) -> Vec<u8> {
+    ipv6_to(OUTER_V6, PEER_V6, next, payload)
+}
+
+pub fn ipv6_to(src: [u8; 16], dst: [u8; 16], next: u8, payload: &[u8]) -> Vec<u8> {
     let mut ip = vec![0x60, 0, 0, 0, 0, 0, next, 64];
     ip[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    ip.extend_from_slice(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-    ip.extend_from_slice(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    ip.extend_from_slice(&src);
+    ip.extend_from_slice(&dst);
     ip.extend_from_slice(payload);
     ip
 }
@@ -131,6 +137,20 @@ pub fn eth_ipv4_tcp_flow(
 
 pub fn eth_ipv4_udp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
     eth(0x0800, &ipv4(src, 17, &udp(sport, dport, payload)))
+}
+
+pub fn eth_ipv6_tcp_flow(
+    src: [u8; 16],
+    dst: [u8; 16],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    eth(
+        0x86dd,
+        &ipv6_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+    )
 }
 
 pub fn client_hello(sni: Option<&str>) -> Vec<u8> {

@@ -118,10 +118,19 @@ pub struct IpSrc {
     /// Conversation keys. tshark keeps TLS version on the TCP 4-tuple.
     tls_claimed: HashSet<TcpFlow>,
     tls_session: HashMap<TcpFlow, TlsSession>,
-    /// Per-direction CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
-    tls_ccs: HashSet<TcpFlow>,
+    /// Conversation CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
+    tls_ccs: HashMap<TcpFlow, TlsCcs>,
     want_ip: bool,
     want_tls: bool,
+}
+
+/// tshark 4.6.9 `SslSession` CCS and server role on one TCP conversation.
+#[derive(Debug, Clone, Copy, Default)]
+struct TlsCcs {
+    /// `ssl_set_server(dst)` after a dissected ClientHello.
+    server: Option<(FlowHost, u16)>,
+    client_ccs: bool,
+    server_ccs: bool,
 }
 
 impl Default for IpSrc {
@@ -144,7 +153,7 @@ impl IpSrc {
             tls_need: HashMap::new(),
             tls_claimed: HashSet::new(),
             tls_session: HashMap::new(),
-            tls_ccs: HashSet::new(),
+            tls_ccs: HashMap::new(),
             want_ip: ip_src || !tls_sni,
             want_tls: tls_sni,
         }
@@ -192,7 +201,7 @@ struct Walk<'a> {
     tls_need: &'a mut HashMap<TcpFlow, TlsNeed>,
     tls_claimed: &'a mut HashSet<TcpFlow>,
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
-    tls_ccs: &'a mut HashSet<TcpFlow>,
+    tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
     want_ip: bool,
     want_tls: bool,
     flow_src: Option<FlowHost>,
@@ -639,8 +648,11 @@ impl Walk<'_> {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        let from_server = flow
+            .map(|flow| self.tls_packet_from_server(flow))
+            .unwrap_or(false);
         let after_ccs = flow
-            .map(|flow| self.tls_ccs.contains(&flow))
+            .map(|flow| self.tls_ccs_for(flow, from_server))
             .unwrap_or(false);
         if let Some(flow) = flow {
             if let Some((outcome, parsed)) =
@@ -667,6 +679,28 @@ impl Walk<'_> {
         }
     }
 
+    /// tshark 4.6.9 `ssl_packet_from_server` at the start of `dissect_ssl`.
+    fn tls_packet_from_server(&self, flow: TcpFlow) -> bool {
+        match self
+            .tls_ccs
+            .get(&flow.conversation())
+            .and_then(|ccs| ccs.server)
+        {
+            Some((addr, port)) => flow.src == addr && flow.sport == port,
+            None => self.tables.is_tls_port(flow.sport),
+        }
+    }
+
+    fn tls_ccs_for(&self, flow: TcpFlow, from_server: bool) -> bool {
+        self.tls_ccs.get(&flow.conversation()).is_some_and(|ccs| {
+            if from_server {
+                ccs.server_ccs
+            } else {
+                ccs.client_ccs
+            }
+        })
+    }
+
     fn apply_tls_outcome(
         &mut self,
         flow: Option<TcpFlow>,
@@ -689,10 +723,18 @@ impl Walk<'_> {
                     self.tls_session.insert(conv, next);
                 }
             }
-            if outcome.after_ccs {
-                self.tls_ccs.insert(flow);
+            // CCS is stored with the start-of-packet `ssl_packet_from_server`
+            // flag. ClientHello then calls `ssl_set_server(dst)` for later
+            // frames.
+            let from_server = self.tls_packet_from_server(flow);
+            let ccs = self.tls_ccs.entry(conv).or_default();
+            if from_server {
+                ccs.server_ccs = outcome.after_ccs;
             } else {
-                self.tls_ccs.remove(&flow);
+                ccs.client_ccs = outcome.after_ccs;
+            }
+            if matches!(outcome.kind, TlsParse::ClientHello(_)) {
+                ccs.server = Some((flow.dst, flow.dport));
             }
             // Heuristic TLS (unnamed, unclaimed) never entered dissect_ssl, so
             // leftover that is not a record start is not desegmented.
@@ -3209,5 +3251,140 @@ mod tests {
             assert_eq!(got, want, "{label} grease");
             assert_eq!(cells[1].counted, None, "{label} grease");
         }
+    }
+
+    fn no_sni_hello() -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.extend_from_slice(&[0, 0, 2, 0x00, 0x2f, 1, 0, 0, 0]);
+        let hs_len = body.len() as u32;
+        let mut hs = vec![1, (hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8];
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    fn hello_request_then_sni() -> Vec<u8> {
+        let hello = sni_hello("www.example.com");
+        let mut body = handshake_msg(0, &[]);
+        body.extend_from_slice(&hello[5..]);
+        handshake_record_body(&body)
+    }
+
+    fn next_seq_flow(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        first: &[u8],
+        second: &[u8],
+    ) -> Vec<Cell> {
+        let start = eth_ipv4_tcp_flow(src, dst, sport, dport, 1, first);
+        let rest = eth_ipv4_tcp_flow(src, dst, sport, dport, 1 + first.len() as u32, second);
+        walk_tls_frames(&[&start, &rest])
+    }
+
+    fn eth_ipv6_tcp_flow(
+        src: [u8; 16],
+        dst: [u8; 16],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut tcp = Vec::from(sport.to_be_bytes());
+        tcp.extend_from_slice(&dport.to_be_bytes());
+        tcp.extend_from_slice(&seq.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(payload);
+        let mut frame = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60, 0, 0, 0,
+        ];
+        frame.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        frame.push(6);
+        frame.push(64);
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst);
+        frame.extend_from_slice(&tcp);
+        frame
+    }
+
+    #[test]
+    fn tls_ccs_follows_ssl_packet_from_server() {
+        let empty = empty_record(0x14);
+        let nonempty = ccs();
+        let no_sni = no_sni_hello();
+        let hr_ch = hello_request_then_sni();
+        let named = ["www.example.com"];
+        let blank: [&str; 0] = [];
+        const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for (ccs_label, ccs_rec) in [
+            ("empty", empty.as_slice()),
+            ("nonempty", nonempty.as_slice()),
+        ] {
+            let mut first = ccs_rec.to_vec();
+            first.extend_from_slice(&no_sni);
+            for port in [443u16, 465, 636, 853, 993, 995] {
+                let same = next_seq_flow(SERVER, CLIENT, port, 50000, &first, &hr_ch);
+                assert_eq!(same[0].tls_sni, blank, "{ccs_label} {port} same first");
+                assert_eq!(same[0].counted, None, "{ccs_label} {port} same first");
+                assert_eq!(same[1].tls_sni, named, "{ccs_label} {port} dropped SNI");
+                assert_eq!(same[1].counted, None, "{ccs_label} {port} dropped SNI");
+                let extra = server_then_client(port, 50000, &first, &hr_ch);
+                assert_eq!(extra[0].tls_sni, blank, "{ccs_label} {port} extra first");
+                assert_eq!(extra[1].tls_sni, blank, "{ccs_label} {port} extra SNI");
+                assert_eq!(extra[1].counted, None, "{ccs_label} {port} extra SNI");
+            }
+            let v6_first = eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 443, 50000, 1, &first);
+            let v6_same = eth_ipv6_tcp_flow(
+                V6_SERVER,
+                V6_CLIENT,
+                443,
+                50000,
+                1 + first.len() as u32,
+                &hr_ch,
+            );
+            let cells = walk_tls_frames(&[&v6_first, &v6_same]);
+            assert_eq!(cells[1].tls_sni, named, "{ccs_label} ipv6 dropped SNI");
+            let v6_peer = eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 443, 1, &hr_ch);
+            let cells = walk_tls_frames(&[&v6_first, &v6_peer]);
+            assert_eq!(cells[1].tls_sni, blank, "{ccs_label} ipv6 extra SNI");
+            assert_eq!(cells[1].counted, None, "{ccs_label} ipv6 extra SNI");
+        }
+        for (label, leftover) in [
+            ("server-hello", handshake_type(2)),
+            ("app-data", app_data()),
+            ("alert", alert()),
+            ("hello-request", handshake_type(0)),
+        ] {
+            let mut first = empty.clone();
+            first.extend_from_slice(&leftover);
+            let cells = next_seq_flow(SERVER, CLIENT, 443, 50000, &first, &hr_ch);
+            assert_eq!(cells[1].tls_sni, blank, "{label} leftover from 443");
+            assert_eq!(cells[1].counted, None, "{label} leftover from 443");
+        }
+        let trail = next_seq_flow(SERVER, CLIENT, 443, 50000, &empty, &hr_ch);
+        assert_eq!(trail[1].tls_sni, named, "trailing empty CCS from 443");
+        assert_eq!(trail[1].counted, None, "trailing empty CCS from 443");
+        let mut first = empty.clone();
+        first.extend_from_slice(&no_sni);
+        let client = next_seq_on(50000, 443, &first, &hr_ch);
+        assert_eq!(client[1].tls_sni, blank, "50000→443");
+        assert_eq!(client[1].counted, None, "50000→443");
+        let claim = eth_ipv4_tcp_seq(CLIENT, 40001, 40002, 1, &no_sni);
+        let ccs_hello = eth_ipv4_tcp_seq(CLIENT, 40001, 40002, 1 + no_sni.len() as u32, &first);
+        let unnamed_hr = eth_ipv4_tcp_seq(
+            CLIENT,
+            40001,
+            40002,
+            1 + no_sni.len() as u32 + first.len() as u32,
+            &hr_ch,
+        );
+        let cells = walk_tls_frames(&[&claim, &ccs_hello, &unnamed_hr]);
+        assert_eq!(cells[2].tls_sni, blank, "unnamed 40001→40002");
+        assert_eq!(cells[2].counted, None, "unnamed 40001→40002");
     }
 }
