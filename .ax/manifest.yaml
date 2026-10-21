@@ -1,15 +1,15 @@
-core_hash: 1df1e3f52becac80c187f166610b06342f4894144006381c3b7f6894e684009f
+core_hash: bf646e5e443aaadef4428be224536fcde61c5d9925ee47caf9932932eff537b8
 ax_version: 0.7.1
 adapters:
   .claude/settings.json: 8c559e7fafa3d83b9f9f80b74c6d2e131177db02823ca72e11429ea3747c2cdd
-  .claude/skills/log-friction/SKILL.md: f6ca7251171c7bb6e6cb3e38c2f258829a1324563f9e8641cb97177ae0f63598
-  .claude/skills/record-decision/SKILL.md: 3c1a8f1c116661364b5352b696f348d04e1ab720839a5ab1001e83e05f12a385
-  .claude/skills/sync-harness/SKILL.md: ed19f36f566b49f336df0e549b1869dbe61438f1acffd9ef2244510972a757e7
+  .claude/skills/log-friction/SKILL.md: 06588b51489c0cb28edd025c89c22ba6500ac9cab55c8019586288a33b0946ca
+  .claude/skills/record-decision/SKILL.md: 89e35d6fde61bccd205a4420684442702818e6bc93504a1a35692a7fe200be3b
+  .claude/skills/sync-harness/SKILL.md: e630089b3c303dfc7e5bfb888c192c78b6c3330b74678ef1ef52c5311218a364
   .cursor/hooks.json: de91e4967f7ce780e71049064fe7ad810b2660ccac2a2a555614d434845136ae
   .cursor/mcp.json: d8e397af03b5b032f21d0aa967086f0c78b33c87b76f2e9898ae0a144df7de02
-  .cursor/skills/log-friction/SKILL.md: f6ca7251171c7bb6e6cb3e38c2f258829a1324563f9e8641cb97177ae0f63598
-  .cursor/skills/record-decision/SKILL.md: 3c1a8f1c116661364b5352b696f348d04e1ab720839a5ab1001e83e05f12a385
-  .cursor/skills/sync-harness/SKILL.md: ed19f36f566b49f336df0e549b1869dbe61438f1acffd9ef2244510972a757e7
+  .cursor/skills/log-friction/SKILL.md: 06588b51489c0cb28edd025c89c22ba6500ac9cab55c8019586288a33b0946ca
+  .cursor/skills/record-decision/SKILL.md: 89e35d6fde61bccd205a4420684442702818e6bc93504a1a35692a7fe200be3b
+  .cursor/skills/sync-harness/SKILL.md: e630089b3c303dfc7e5bfb888c192c78b6c3330b74678ef1ef52c5311218a364
   .mcp.json: d8e397af03b5b032f21d0aa967086f0c78b33c87b76f2e9898ae0a144df7de02
-  AGENTS.md: 01d0530c50c9eb56890b51e2fc3ca172315c3c0f3cde407d57c948c6ab1d4f47
-  CLAUDE.md: 01d0530c50c9eb56890b51e2fc3ca172315c3c0f3cde407d57c948c6ab1d4f47
+  AGENTS.md: 663abeebc851bf198dbe507937ff553d667b9238ec33f7a347f12360154e1e5c
+  CLAUDE.md: 663abeebc851bf198dbe507937ff553d667b9238ec33f7a347f12360154e1e5c

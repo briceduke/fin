@@ -1090,6 +1090,157 @@ fn throwing_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
         "tls13-empty-hb-left1-0301",
         leftover_after_prefix(&tls13_server_hello(), &empty_record(0x18), &[0x00], 0x0301),
     ));
+    for (len, body) in [
+        (1usize, &[0x01u8][..]),
+        (2, &[0x01, 0x00][..]),
+        (2, &[0x01, 0x01][..]),
+        (1, &[0x02][..]),
+        (2, &[0x02, 0x00][..]),
+    ] {
+        let rec = tls_record(0x18, 0x0303, body);
+        let tag = format!("hb-len{len}-t{:02x}", body[0]);
+        cases.push((
+            leak(format!("{tag}-same-0301")),
+            prefix_then_hello_same(&rec, 0x0301),
+        ));
+        cases.push((
+            leak(format!("{tag}-same-grease")),
+            prefix_then_hello_same(&rec, 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("{tag}-noleftover-grease")),
+            leftover_then_hello(&rec, &[], 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("{tag}-noleftover-0301")),
+            leftover_then_hello(&rec, &[], 0x0301),
+        ));
+        cases.push((
+            leak(format!("{tag}-left5-grease")),
+            leftover_then_hello(&rec, &[0x00; 5], 0x0a0a),
+        ));
+        for leftover in [0x01u8, 0x13, 0x14, 0x1b, 0xff] {
+            cases.push((
+                leak(format!("{tag}-left{leftover:02x}-grease")),
+                leftover_then_hello(&rec, &[leftover], 0x0a0a),
+            ));
+        }
+        for version in [0x0300u16, 0x0301, 0x0302, 0x0303, 0x0101] {
+            let ver_rec = tls_record(0x18, version, body);
+            cases.push((
+                leak(format!("{tag}-ver{version:04x}-left1-grease")),
+                leftover_then_hello(&ver_rec, &[0x00], 0x0a0a),
+            ));
+            cases.push((
+                leak(format!("{tag}-ver{version:04x}-same-grease")),
+                prefix_then_hello_same(&ver_rec, 0x0a0a),
+            ));
+        }
+        cases.push((
+            leak(format!("{tag}-left1-grease-ipv6")),
+            leftover_then_hello_ipv6_prefix(&rec, &[0x00], 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("{tag}-left1-grease-src443")),
+            leftover_then_hello_ports(443, 50000, &rec, &[0x00], 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("{tag}-left1-grease-unnamed")),
+            leftover_then_hello_ports(40001, 40002, &rec, &[0x00], 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("{tag}-left1-peer-grease")),
+            peer_then_grease(443, 50000, &{
+                let mut first = rec.clone();
+                first.push(0x00);
+                first
+            }),
+        ));
+        cases.push((
+            leak(format!("{tag}-ccs-left1-grease")),
+            leftover_then_hello(
+                &{
+                    let mut prefix = ccs();
+                    prefix.extend_from_slice(&rec);
+                    prefix
+                },
+                &[0x00],
+                0x0a0a,
+            ),
+        ));
+        cases.push((
+            leak(format!("{tag}-ccs-same-0301")),
+            prefix_then_hello_same(
+                &{
+                    let mut prefix = ccs();
+                    prefix.extend_from_slice(&rec);
+                    prefix
+                },
+                0x0301,
+            ),
+        ));
+        cases.push((
+            leak(format!("{tag}-ccs-same-grease")),
+            prefix_then_hello_same(
+                &{
+                    let mut prefix = ccs();
+                    prefix.extend_from_slice(&rec);
+                    prefix
+                },
+                0x0a0a,
+            ),
+        ));
+        cases.push((
+            leak(format!("{tag}-tls13-left1-grease")),
+            leftover_after_prefix(&tls13_server_hello(), &rec, &[0x00], 0x0a0a),
+        ));
+        cases.push((
+            leak(format!("{tag}-tls13-same-0301")),
+            prefix_then_hello_same(
+                &{
+                    let mut prefix = tls13_server_hello();
+                    prefix.extend_from_slice(&rec);
+                    prefix
+                },
+                0x0301,
+            ),
+        ));
+        cases.push((
+            leak(format!("{tag}-tls13-same-grease")),
+            prefix_then_hello_same(
+                &{
+                    let mut prefix = tls13_server_hello();
+                    prefix.extend_from_slice(&rec);
+                    prefix
+                },
+                0x0a0a,
+            ),
+        ));
+    }
+    cases.push((
+        "empty-hb-same-0301",
+        prefix_then_hello_same(&empty_record(0x18), 0x0301),
+    ));
+    cases.push((
+        "empty-hb-same-grease",
+        prefix_then_hello_same(&empty_record(0x18), 0x0a0a),
+    ));
+    cases.push((
+        "hb-len3-same-0301",
+        prefix_then_hello_same(&heartbeat(), 0x0301),
+    ));
+    cases.push((
+        "empty-sh-same-0301",
+        prefix_then_hello_same(&handshake_type_record(2, 0x0303), 0x0301),
+    ));
+    cases.push((
+        "empty-sh-same-grease",
+        prefix_then_hello_same(&handshake_type_record(2, 0x0303), 0x0a0a),
+    ));
+    cases.push((
+        "hb-len1-type00-same-0301",
+        prefix_then_hello_same(&tls_record(0x18, 0x0303, &[0x00]), 0x0301),
+    ));
     cases
 }
 
@@ -1270,17 +1421,29 @@ fn leftover_then_hello_ports(
 }
 
 fn leftover_then_hello_ipv6(leftover: &[u8], version: u16) -> Vec<u8> {
+    leftover_then_hello_ipv6_prefix(&[], leftover, version)
+}
+
+fn leftover_then_hello_ipv6_prefix(prefix: &[u8], leftover: &[u8], version: u16) -> Vec<u8> {
+    let mut first = prefix.to_vec();
+    first.extend_from_slice(leftover);
     let hello = client_hello_host(Some(b"www.example.com"), version);
     pcap(
         LINK_ETHERNET,
         &[
-            eth(0x86dd, &ipv6(6, &tcp_seq(50000, 443, 1, leftover))),
+            eth(0x86dd, &ipv6(6, &tcp_seq(50000, 443, 1, &first))),
             eth(
                 0x86dd,
-                &ipv6(6, &tcp_seq(50000, 443, 1 + leftover.len() as u32, &hello)),
+                &ipv6(6, &tcp_seq(50000, 443, 1 + first.len() as u32, &hello)),
             ),
         ],
     )
+}
+
+fn prefix_then_hello_same(prefix: &[u8], version: u16) -> Vec<u8> {
+    let mut payload = prefix.to_vec();
+    payload.extend_from_slice(&client_hello_host(Some(b"www.example.com"), version));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
 }
 
 fn empty_then_record_then_hello_same(content: u8, following: &[u8], version: u16) -> Vec<u8> {

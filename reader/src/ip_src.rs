@@ -2590,6 +2590,32 @@ mod tests {
                 );
             }
         }
+        for body in [vec![0x01u8], vec![0x01, 0x00], vec![0x01, 0x01]] {
+            for following in [grease.as_slice(), hello.as_slice()] {
+                let mut payload = vec![0x18, 0x03, 0x03];
+                payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                payload.extend_from_slice(&body);
+                payload.extend_from_slice(following);
+                let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &payload));
+                assert_eq!(
+                    cell.tls_sni,
+                    [] as [&str; 0],
+                    "hb {} same payload",
+                    body.len()
+                );
+                assert_eq!(cell.counted, None, "hb {} same payload", body.len());
+            }
+        }
+        let mut keep = heartbeat();
+        keep.extend_from_slice(&hello);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &keep));
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+        let mut empty_sh = handshake_type(2);
+        empty_sh.extend_from_slice(&hello);
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &empty_sh));
+        assert_eq!(cell.tls_sni, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
     }
 
     #[test]

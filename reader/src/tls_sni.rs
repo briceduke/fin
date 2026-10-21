@@ -116,6 +116,14 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                 if next > offset + RECORD_HEADER || next < payload.len() {
                     apply_session_version(session, content, version, None);
                 }
+                let body = &payload[offset + RECORD_HEADER..next];
+                if content == 0x18
+                    && heartbeat_throws(body, &payload[next..], session.tls_version())
+                {
+                    // THROW(ReportedBoundsError) aborts dissect_ssl. Later
+                    // records in this payload are not walked.
+                    break;
+                }
                 offset = next;
             }
             Record::Unproved => {
@@ -138,6 +146,9 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                         unproved = true;
                         break;
                     }
+                }
+                if handshake_throws(body, &payload[next..], session.tls_version()) {
+                    break;
                 }
                 offset = next;
             }
@@ -763,9 +774,10 @@ fn npn_encrypted_exts_throws(parent: &[u8], leftover: &[u8]) -> bool {
 }
 
 /// tshark 4.6.9 `dissect_ssl3_heartbeat`. TLS 1.3 skips it. Otherwise it always
-/// reads type + payload_length (3 bytes). A Request/Response on a record
-/// shorter than 3 bytes then adds a payload of `record_length - 3`, which
-/// throws. Leftover after a throw is not desegmented.
+/// reads type + payload_length (3 bytes) from the parent tvb. A Request/Response
+/// on a record shorter than 3 bytes then adds a payload of `record_length - 3`,
+/// which throws. A throw aborts `dissect_ssl`: leftover is not desegmented, and
+/// later records in this payload are not walked.
 fn heartbeat_throws(body: &[u8], leftover: &[u8], version: u16) -> bool {
     if version == 0x0304 {
         return false;
@@ -1863,6 +1875,93 @@ mod tests {
             Some(&[0x00][..]),
             "TLS 1.3 length-1 heartbeat leftover desegments"
         );
+    }
+
+    #[test]
+    fn throwing_heartbeat_does_not_walk_a_following_hello_in_the_same_payload() {
+        let hello = client_hello(Some("www.example.com"));
+        let grease = grease_hello();
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        for body in [vec![0x01u8], vec![0x01, 0x00], vec![0x01, 0x01], vec![0x02]] {
+            for following in [&hello, &grease] {
+                let mut payload = short_heartbeat(&body);
+                payload.extend_from_slice(following);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&payload),
+                    TlsParse::Other,
+                    "hb {} type {} same",
+                    body.len(),
+                    body[0]
+                );
+            }
+        }
+        for prefix in [empty_record(0x18), heartbeat()] {
+            for following in [&hello, &grease] {
+                let mut payload = prefix.clone();
+                payload.extend_from_slice(following);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&payload),
+                    named.clone(),
+                    "keep {} then {}",
+                    prefix.len(),
+                    following[1]
+                );
+            }
+        }
+        for following in [&hello, &grease] {
+            let mut empty_sh = handshake_type_record(2);
+            empty_sh.extend_from_slice(following);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&empty_sh),
+                named.clone(),
+                "empty ServerHello leftover satisfies parent read"
+            );
+            let mut encrypted = short_heartbeat(&[0x00]);
+            encrypted.extend_from_slice(following);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&encrypted),
+                named.clone(),
+                "heartbeat type 0 does not throw"
+            );
+            let mut ccs_then = ccs();
+            ccs_then.extend_from_slice(&short_heartbeat(&[0x01]));
+            ccs_then.extend_from_slice(following);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&ccs_then),
+                TlsParse::Other,
+                "CCS then throwing heartbeat aborts"
+            );
+        }
+        let mut hello_then = hello.clone();
+        hello_then.extend_from_slice(&short_heartbeat(&[0x01]));
+        assert_eq!(parse_tcp_tls_on_tls_port(&hello_then), named);
+        let tls13 = parse_tls(&tls13_server_hello(), TlsSession::Unknown, false);
+        assert_eq!(tls13.session, TlsSession::Tls13);
+        let mut tls13_payload = tls13_server_hello();
+        tls13_payload.extend_from_slice(&short_heartbeat(&[0x01]));
+        tls13_payload.extend_from_slice(&hello);
+        assert_eq!(
+            parse_tls(&tls13_payload, TlsSession::Unknown, false).kind,
+            named,
+            "TLS 1.3 skips dissect_ssl3_heartbeat, later 0x0301 prints"
+        );
+        let mut tls13_grease = tls13_server_hello();
+        tls13_grease.extend_from_slice(&short_heartbeat(&[0x01]));
+        tls13_grease.extend_from_slice(&grease);
+        assert_eq!(
+            parse_tls(&tls13_grease, TlsSession::Unknown, false).kind,
+            TlsParse::Other,
+            "TLS 1.3 then GREASE is continuation"
+        );
+        for version in [0x0300u16, 0x0301, 0x0302, 0x0303, 0x0101] {
+            let mut payload = record(0x18, version, &[0x01]);
+            payload.extend_from_slice(&grease);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&payload),
+                TlsParse::Other,
+                "hb ver {version:#06x} same GREASE"
+            );
+        }
     }
 
     #[test]
