@@ -994,7 +994,48 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(empty_ccs_encrypted_cases())
     .chain(ccs_role_cases())
     .chain(tls_port_association_cases())
+    .chain(client_hello_sets_server_cases())
     .collect()
+}
+
+/// Empty or short ClientHello still calls `ssl_set_server` at arm entry.
+fn client_hello_sets_server_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let ccs = ccs();
+    let empty_ch = handshake_type_record(1, 0x0303);
+    let short_ch = handshake_body_record(1, 0x0303, &[0x00]);
+    let hr_ch =
+        handshake_messages_record(0x0303, &[(0, &[]), (1, &hello_inner("www.example.com"))]);
+    let mut cases = Vec::new();
+    for (name, hello) in [
+        ("empty", empty_ch.as_slice()),
+        ("1byte", short_ch.as_slice()),
+    ] {
+        cases.push((
+            leak(format!("ccs-{name}-ch-then-hr-ch")),
+            sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&ccs, hello, &hr_ch]),
+        ));
+        cases.push((
+            leak(format!("ccs-{name}-ch-then-peer-hr-ch")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs),
+                    eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1 + ccs.len() as u32, hello),
+                    eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &hr_ch),
+                ],
+            ),
+        ));
+    }
+    let mut combined = ccs.clone();
+    combined.extend_from_slice(&empty_ch);
+    cases.push((
+        "ccs-empty-ch-same-then-peer-hr-ch",
+        two_way_ipv4(
+            (PEER, OUTER, 443, 50000, &combined),
+            (OUTER, PEER, 50000, 443, &hr_ch),
+        ),
+    ));
+    cases
 }
 
 /// CCS from a `tls.port` that is not first-named `tls` on `tcp.port`.

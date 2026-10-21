@@ -127,7 +127,7 @@ pub struct IpSrc {
 /// tshark 4.6.9 `SslSession` CCS and server role on one TCP conversation.
 #[derive(Debug, Clone, Copy, Default)]
 struct TlsCcs {
-    /// `ssl_set_server(dst)` after a dissected ClientHello.
+    /// `ssl_set_server(dst)` at entry of `SSL_HND_CLIENT_HELLO`.
     server: Option<(FlowHost, u16)>,
     client_ccs: bool,
     server_ccs: bool,
@@ -724,8 +724,8 @@ impl Walk<'_> {
                 }
             }
             // CCS is stored with the start-of-packet `ssl_packet_from_server`
-            // flag. ClientHello then calls `ssl_set_server(dst)` for later
-            // frames.
+            // flag. Entering the ClientHello arm then calls `ssl_set_server(dst)`
+            // for later frames, even when the hello is empty or short.
             let from_server = self.tls_packet_from_server(flow);
             let ccs = self.tls_ccs.entry(conv).or_default();
             if from_server {
@@ -733,7 +733,7 @@ impl Walk<'_> {
             } else {
                 ccs.client_ccs = outcome.after_ccs;
             }
-            if matches!(outcome.kind, TlsParse::ClientHello(_)) {
+            if outcome.set_server {
                 ccs.server = Some((flow.dst, flow.dport));
             }
             // Heuristic TLS (unnamed, unclaimed) never entered dissect_ssl, so
@@ -3423,5 +3423,59 @@ mod tests {
         let cells = server_then_client(443, 3389, &nonempty, &hr_ch);
         assert_eq!(cells[1].tls_sni, blank, "inverse 443→3389 extra SNI");
         assert_eq!(cells[1].counted, None, "inverse 443→3389 extra SNI");
+    }
+
+    #[test]
+    fn empty_client_hello_sets_server_role() {
+        let nonempty = ccs();
+        let empty_ch = handshake_type(1);
+        let short_ch = vec![0x16, 0x03, 0x03, 0, 5, 1, 0, 0, 1, 0];
+        let hr_ch = hello_request_then_sni();
+        let named = ["www.example.com"];
+        let blank: [&str; 0] = [];
+        for (label, hello) in [
+            ("empty", empty_ch.as_slice()),
+            ("1-byte", short_ch.as_slice()),
+        ] {
+            let same = seq_flow(SERVER, CLIENT, 443, 50000, &[&nonempty, hello, &hr_ch]);
+            assert_eq!(same[0].tls_sni, blank, "{label} same CCS");
+            assert_eq!(same[0].counted, None, "{label} same CCS");
+            assert_eq!(same[2].tls_sni, named, "{label} same dropped SNI");
+            assert_eq!(same[2].counted, None, "{label} same dropped SNI");
+            let extra = walk_tls_frames(&[
+                &eth_ipv4_tcp_flow(SERVER, CLIENT, 443, 50000, 1, &nonempty),
+                &eth_ipv4_tcp_flow(SERVER, CLIENT, 443, 50000, 1 + nonempty.len() as u32, hello),
+                &eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 443, 1, &hr_ch),
+            ]);
+            assert_eq!(extra[2].tls_sni, blank, "{label} extra SNI");
+            assert_eq!(extra[2].counted, None, "{label} extra SNI");
+        }
+        let mut combined = nonempty.clone();
+        combined.extend_from_slice(&empty_ch);
+        let extra = server_then_client(443, 50000, &combined, &hr_ch);
+        assert_eq!(extra[1].tls_sni, blank, "combined extra SNI");
+        assert_eq!(extra[1].counted, None, "combined extra SNI");
+        let mut nosni = nonempty.clone();
+        nosni.extend_from_slice(&no_sni_hello());
+        let same = next_seq_flow(SERVER, CLIENT, 443, 50000, &nosni, &hr_ch);
+        assert_eq!(same[1].tls_sni, named, "no-SNI leftover still prints");
+        assert_eq!(same[1].counted, None, "no-SNI leftover still prints");
+    }
+
+    fn seq_flow(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        payloads: &[&[u8]],
+    ) -> Vec<Cell> {
+        let mut frames = Vec::new();
+        let mut seq = 1u32;
+        for payload in payloads {
+            frames.push(eth_ipv4_tcp_flow(src, dst, sport, dport, seq, payload));
+            seq += payload.len() as u32;
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+        walk_tls_frames(&refs)
     }
 }

@@ -63,6 +63,8 @@ pub struct TlsOutcome {
     /// `ssl_packet_from_server` role. A later frame uses it in
     /// `is_encrypted_handshake_message`.
     pub after_ccs: bool,
+    /// tshark `ssl_set_server(dst)` at entry of `SSL_HND_CLIENT_HELLO`.
+    pub set_server: bool,
 }
 
 /// Parse SNI from one TCP payload on an unnamed port. The first record must
@@ -99,19 +101,27 @@ pub fn parse_tls_after_ccs(
             claimed: false,
             session,
             after_ccs,
+            set_server: false,
         };
     }
     let mut session = session;
     let mut after_ccs = after_ccs;
+    let mut set_server = false;
     TlsOutcome {
-        kind: parse_records(payload, &mut session, &mut after_ccs),
+        kind: parse_records(payload, &mut session, &mut after_ccs, &mut set_server),
         claimed: true,
         session,
         after_ccs,
+        set_server,
     }
 }
 
-fn parse_records(payload: &[u8], session: &mut TlsSession, after_ccs: &mut bool) -> TlsParse {
+fn parse_records(
+    payload: &[u8],
+    session: &mut TlsSession,
+    after_ccs: &mut bool,
+    set_server: &mut bool,
+) -> TlsParse {
     if payload.is_empty() {
         return TlsParse::Other;
     }
@@ -170,8 +180,13 @@ fn parse_records(payload: &[u8], session: &mut TlsSession, after_ccs: &mut bool)
             } => {
                 apply_session_version(session, CONTENT_HANDSHAKE, version, Some(body));
                 let leftover = &payload[next..];
-                let (hello, threw, reset_ccs) =
-                    parse_handshake_messages(body, leftover, session.tls_version(), armed);
+                let (hello, threw, reset_ccs) = parse_handshake_messages(
+                    body,
+                    leftover,
+                    session.tls_version(),
+                    armed,
+                    set_server,
+                );
                 if reset_ccs {
                     armed = false;
                 }
@@ -972,6 +987,7 @@ fn parse_handshake_messages(
     leftover: &[u8],
     version: u16,
     after_ccs: bool,
+    set_server: &mut bool,
 ) -> (Hello, bool, bool) {
     if body.is_empty() {
         return (Hello::Unproved, false, false);
@@ -998,6 +1014,9 @@ fn parse_handshake_messages(
             return (Hello::Unproved, false, reset_ccs);
         }
         if msg_type == HANDSHAKE_CLIENT_HELLO {
+            // tshark 4.6.9 calls ssl_set_server at the start of the
+            // SSL_HND_CLIENT_HELLO arm, before ssl_dissect_hnd_cli_hello.
+            *set_server = true;
             match parse_client_hello(&body[start..end]) {
                 Some(found) => {
                     saw_hello = true;
@@ -1355,6 +1374,22 @@ mod tests {
             parse_tcp_tls(&client_hello(None)),
             TlsParse::ClientHello(Vec::new())
         );
+    }
+
+    #[test]
+    fn empty_or_short_client_hello_sets_server() {
+        let empty = handshake_type_record(HANDSHAKE_CLIENT_HELLO);
+        let short = handshake_type_record_at(HANDSHAKE_CLIENT_HELLO, 0x0303, &[0x00]);
+        for (label, rec) in [("empty", empty.as_slice()), ("1-byte", short.as_slice())] {
+            let out = parse_tls(rec, TlsSession::Unknown, false);
+            assert!(out.set_server, "{label}");
+            assert_eq!(out.kind, TlsParse::Unproved, "{label}");
+        }
+        let out = parse_tls(&client_hello(None), TlsSession::Unknown, false);
+        assert!(out.set_server);
+        assert_eq!(out.kind, TlsParse::ClientHello(Vec::new()));
+        let out = parse_tls(&handshake_type_record(0), TlsSession::Unknown, false);
+        assert!(!out.set_server);
     }
 
     #[test]
