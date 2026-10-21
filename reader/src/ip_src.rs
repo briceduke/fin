@@ -5,8 +5,8 @@ use std::net::Ipv4Addr;
 
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
-    looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tls,
-    truncated_handshake_prefix, TlsOutcome, TlsParse, TlsSession,
+    looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake,
+    parse_tls_after_ccs, truncated_handshake_prefix, TlsOutcome, TlsParse, TlsSession,
 };
 use crate::Frame;
 
@@ -118,6 +118,8 @@ pub struct IpSrc {
     /// Conversation keys. tshark keeps TLS version on the TCP 4-tuple.
     tls_claimed: HashSet<TcpFlow>,
     tls_session: HashMap<TcpFlow, TlsSession>,
+    /// Per-direction CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
+    tls_ccs: HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
 }
@@ -142,6 +144,7 @@ impl IpSrc {
             tls_need: HashMap::new(),
             tls_claimed: HashSet::new(),
             tls_session: HashMap::new(),
+            tls_ccs: HashSet::new(),
             want_ip: ip_src || !tls_sni,
             want_tls: tls_sni,
         }
@@ -164,6 +167,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tls_need: &mut session.tls_need,
         tls_claimed: &mut session.tls_claimed,
         tls_session: &mut session.tls_session,
+        tls_ccs: &mut session.tls_ccs,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
         flow_src: None,
@@ -188,6 +192,7 @@ struct Walk<'a> {
     tls_need: &'a mut HashMap<TcpFlow, TlsNeed>,
     tls_claimed: &'a mut HashSet<TcpFlow>,
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
+    tls_ccs: &'a mut HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
     flow_src: Option<FlowHost>,
@@ -634,8 +639,13 @@ impl Walk<'_> {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        let after_ccs = flow
+            .map(|flow| self.tls_ccs.contains(&flow))
+            .unwrap_or(false);
         if let Some(flow) = flow {
-            if let Some((outcome, parsed)) = self.take_tls_need(flow, seq, payload, session) {
+            if let Some((outcome, parsed)) =
+                self.take_tls_need(flow, seq, payload, session, after_ccs)
+            {
                 if let Some(key) = key {
                     self.tls_seen.insert(key);
                 }
@@ -648,7 +658,7 @@ impl Walk<'_> {
                 || flow
                     .map(|flow| self.tls_claimed.contains(&flow.conversation()))
                     .unwrap_or(false);
-            let outcome = parse_tls(payload, session, !claimed);
+            let outcome = parse_tls_after_ccs(payload, session, !claimed, after_ccs);
             self.apply_tls_outcome(flow, seq, payload, payload.len(), session, outcome);
             return;
         }
@@ -678,6 +688,11 @@ impl Walk<'_> {
                 next => {
                     self.tls_session.insert(conv, next);
                 }
+            }
+            if outcome.after_ccs {
+                self.tls_ccs.insert(flow);
+            } else {
+                self.tls_ccs.remove(&flow);
             }
             // Heuristic TLS (unnamed, unclaimed) never entered dissect_ssl, so
             // leftover that is not a record start is not desegmented.
@@ -744,6 +759,7 @@ impl Walk<'_> {
         seq: u32,
         payload: &[u8],
         session: TlsSession,
+        after_ccs: bool,
     ) -> Option<(TlsOutcome, Vec<u8>)> {
         let need = self.tls_need.get(&flow)?;
         if seq != need.next_seq {
@@ -751,7 +767,7 @@ impl Walk<'_> {
         }
         let mut buf = need.prefix.clone();
         buf.extend_from_slice(payload);
-        let outcome = parse_tls(&buf, session, false);
+        let outcome = parse_tls_after_ccs(&buf, session, false, after_ccs);
         Some((outcome, buf))
     }
 
@@ -2758,17 +2774,25 @@ mod tests {
         let unnamed = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &rec));
         assert_eq!(unnamed.tls_sni, [] as [&str; 0], "unnamed 40001→40002");
         assert_eq!(unnamed.counted, None, "unnamed 40001→40002");
-        for msg_type in [9u8, 10, 17, 26, 64, 66, 68, 99, 254, 255] {
-            let mut body = handshake_msg(msg_type, &[0x00]);
-            body.extend_from_slice(&hello_hs);
-            let cell = walk_tls(&eth_ipv4_tcp(
-                [10, 0, 0, 1],
-                50000,
-                443,
-                &handshake_record_body(&body),
-            ));
-            assert_eq!(cell.tls_sni, [] as [&str; 0], "type {msg_type} body 00");
-            assert_eq!(cell.counted, None, "type {msg_type} body 00");
+        for msg_type in [
+            9u8, 10, 17, 18, 19, 26, 27, 28, 29, 64, 66, 68, 99, 254, 255,
+        ] {
+            for extra in [&[][..], &[0x00][..]] {
+                let mut body = handshake_msg(msg_type, extra);
+                body.extend_from_slice(&hello_hs);
+                let cell = walk_tls(&eth_ipv4_tcp(
+                    [10, 0, 0, 1],
+                    50000,
+                    443,
+                    &handshake_record_body(&body),
+                ));
+                assert_eq!(
+                    cell.tls_sni,
+                    [] as [&str; 0],
+                    "type {msg_type} body {extra:?}"
+                );
+                assert_eq!(cell.counted, None, "type {msg_type} body {extra:?}");
+            }
         }
         let mut ccs_same = ccs();
         ccs_same.extend_from_slice(&rec);
@@ -2801,7 +2825,7 @@ mod tests {
             "CH then type 7 then CH"
         );
         for msg_type in [
-            2u8, 4, 6, 3, 8, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 67,
+            0u8, 2, 4, 6, 3, 8, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 67,
         ] {
             let mut body = handshake_msg(msg_type, &[]);
             body.extend_from_slice(&hello_hs);
@@ -2818,6 +2842,58 @@ mod tests {
             );
             assert_eq!(cell.counted, None, "empty named type {msg_type} then CH");
         }
+        let mut two_hr = handshake_msg(0, &[]);
+        two_hr.extend_from_slice(&handshake_msg(0, &[]));
+        two_hr.extend_from_slice(&hello_hs);
+        let cell = walk_tls(&eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            &handshake_record_body(&two_hr),
+        ));
+        assert_eq!(cell.tls_sni, [] as [&str; 0], "two Hello Requests then CH");
+        assert_eq!(cell.counted, None, "two Hello Requests then CH");
+        let mut second = rec.clone();
+        second.extend_from_slice(&sni_hello("other.example"));
+        let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &second));
+        assert_eq!(
+            cell.tls_sni,
+            ["other.example"],
+            "type 7 then CH then a second record"
+        );
+        assert_eq!(cell.counted, None, "type 7 then CH then a second record");
+        let mut huge = vec![0, 0x01, 0x00, 0x00];
+        huge.extend_from_slice(&hello_hs);
+        let cell = walk_tls(&eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            &handshake_record_body(&huge),
+        ));
+        assert_eq!(
+            cell.tls_sni,
+            [] as [&str; 0],
+            "64K-length named type then CH"
+        );
+        assert_eq!(cell.counted, None, "64K-length named type then CH");
+        let mut hr_ch = handshake_msg(0, &[]);
+        hr_ch.extend_from_slice(&hello_hs);
+        let cells = next_seq_frames(&ccs(), &handshake_record_body(&hr_ch));
+        assert_eq!(
+            cells[1].tls_sni,
+            [] as [&str; 0],
+            "CCS then Hello Request then CH next"
+        );
+        assert_eq!(
+            cells[1].counted, None,
+            "CCS then Hello Request then CH next"
+        );
+        let cells = next_seq_frames(&ccs(), &hello);
+        assert_eq!(
+            cells[1].tls_sni,
+            ["www.example.com"],
+            "CCS then ClientHello next"
+        );
     }
 
     #[test]

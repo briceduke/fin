@@ -1020,8 +1020,34 @@ fn encrypted_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
             "ch-hs7-ch-same-rec",
             hello_unnamed_hello_same_record(7, &[]),
         ),
+        (
+            "two-hello-requests-then-ch",
+            two_hello_requests_then_hello_same_record(),
+        ),
+        (
+            "hs7-ch-then-other-rec",
+            handshake_hello_then_other_record(7, &[]),
+        ),
+        (
+            "ccs-then-hr-ch",
+            ccs_then_handshake_hello_next_frame(0, &[]),
+        ),
+        (
+            "empty-hs0-same-rec-0301",
+            handshake_then_hello_same_record(0, &[]),
+        ),
+        (
+            "hs-len64k-then-ch-same-rec",
+            huge_len_then_hello_same_record(),
+        ),
     ];
-    for msg_type in [9u8, 10, 17, 26, 64, 66, 68, 99, 254, 255] {
+    for msg_type in [
+        9u8, 10, 17, 18, 19, 26, 27, 28, 29, 64, 66, 68, 99, 254, 255,
+    ] {
+        cases.push((
+            leak(format!("hs{msg_type}-empty-then-ch-same-rec")),
+            handshake_then_hello_same_record(msg_type, &[]),
+        ));
         cases.push((
             leak(format!("hs{msg_type}-body00-then-ch-same-rec")),
             handshake_then_hello_same_record(msg_type, &[0x00]),
@@ -1594,6 +1620,41 @@ fn hello_inner(sni: &str) -> Vec<u8> {
 
 fn handshake_then_hello_same_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
     handshake_then_hello_same_record_ports(50000, 443, msg_type, body)
+}
+
+fn two_hello_requests_then_hello_same_record() -> Vec<u8> {
+    let hello = hello_inner("www.example.com");
+    pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(
+            OUTER,
+            50000,
+            443,
+            &handshake_messages_record(0x0303, &[(0, &[]), (0, &[]), (1, &hello)]),
+        )],
+    )
+}
+
+fn handshake_hello_then_other_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let hello = hello_inner("www.example.com");
+    let mut payload = handshake_messages_record(0x0303, &[(msg_type, body), (1, &hello)]);
+    payload.extend_from_slice(&client_hello(Some("other.example")));
+    pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+}
+
+fn huge_len_then_hello_same_record() -> Vec<u8> {
+    let hello = hello_inner("www.example.com");
+    let mut body = vec![0, 0x01, 0x00, 0x00];
+    body.extend_from_slice(&hello);
+    pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(
+            OUTER,
+            50000,
+            443,
+            &tls_record(0x16, 0x0303, &body),
+        )],
+    )
 }
 
 fn handshake_then_hello_same_record_ports(

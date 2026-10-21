@@ -13,6 +13,7 @@ pub enum TlsParse {
 }
 
 const CONTENT_HANDSHAKE: u8 = 0x16;
+const CONTENT_CCS: u8 = 0x14;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_SERVER_HELLO: u8 = 2;
 const EXT_SERVER_NAME: u16 = 0;
@@ -58,6 +59,9 @@ pub struct TlsOutcome {
     pub kind: TlsParse,
     pub claimed: bool,
     pub session: TlsSession,
+    /// tshark `SslSession` CCS frame is set for this TCP direction.
+    /// A later frame uses it in `is_encrypted_handshake_message`.
+    pub after_ccs: bool,
 }
 
 /// Parse SNI from one TCP payload on an unnamed port. The first record must
@@ -77,22 +81,36 @@ pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
 /// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate. `session` is
 /// `SslSession.version`: unknown, sticky pre-1.3, or TLS 1.3.
 pub fn parse_tls(payload: &[u8], session: TlsSession, heuristic: bool) -> TlsOutcome {
+    parse_tls_after_ccs(payload, session, heuristic, false)
+}
+
+/// Like [`parse_tls`], with tshark's per-direction CCS frame already set
+/// from an earlier packet (`pinfo->num > ccs_frame`).
+pub fn parse_tls_after_ccs(
+    payload: &[u8],
+    session: TlsSession,
+    heuristic: bool,
+    after_ccs: bool,
+) -> TlsOutcome {
     if heuristic && !is_sslv3_or_tls(payload) {
         return TlsOutcome {
             kind: TlsParse::Other,
             claimed: false,
             session,
+            after_ccs,
         };
     }
     let mut session = session;
+    let mut after_ccs = after_ccs;
     TlsOutcome {
-        kind: parse_records(payload, &mut session),
+        kind: parse_records(payload, &mut session, &mut after_ccs),
         claimed: true,
         session,
+        after_ccs,
     }
 }
 
-fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
+fn parse_records(payload: &[u8], session: &mut TlsSession, after_ccs: &mut bool) -> TlsParse {
     if payload.is_empty() {
         return TlsParse::Other;
     }
@@ -100,6 +118,10 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
     let mut names = Vec::new();
     let mut saw_hello = false;
     let mut unproved = false;
+    // tshark only treats CCS as already seen when `pinfo->num > ccs_frame`.
+    // A CCS in this payload arms later frames, not later records here.
+    let mut armed = *after_ccs;
+    let mut saw_ccs = false;
     while offset < payload.len() {
         match take_record(payload, offset, session) {
             Record::Done => break,
@@ -117,6 +139,13 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
                     apply_session_version(session, content, version, None);
                 }
                 let body = &payload[offset + RECORD_HEADER..next];
+                if content == CONTENT_CCS
+                    && !body.is_empty()
+                    && *session != TlsSession::Tls13
+                    && !armed
+                {
+                    saw_ccs = true;
+                }
                 if content == 0x18
                     && heartbeat_throws(body, &payload[next..], session.tls_version())
                 {
@@ -137,8 +166,11 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
             } => {
                 apply_session_version(session, CONTENT_HANDSHAKE, version, Some(body));
                 let leftover = &payload[next..];
-                let (hello, threw) =
-                    parse_handshake_messages(body, leftover, session.tls_version());
+                let (hello, threw, reset_ccs) =
+                    parse_handshake_messages(body, leftover, session.tls_version(), armed);
+                if reset_ccs {
+                    armed = false;
+                }
                 match hello {
                     Hello::None => {}
                     Hello::Names(found) => {
@@ -160,6 +192,7 @@ fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
             }
         }
     }
+    *after_ccs = armed || saw_ccs;
     if saw_hello {
         TlsParse::ClientHello(names)
     } else if unproved {
@@ -512,9 +545,70 @@ fn is_named_handshake_type(hs_type: u8) -> bool {
 }
 
 /// tshark 4.6.9 `is_encrypted_handshake_message` on the first message of a
-/// new record: remaining record ≥ 16 bytes and the type is unnamed.
-fn is_encrypted_handshake_record(body: &[u8]) -> bool {
-    body.len() >= 16 && !is_named_handshake_type(body[0])
+/// new record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncryptedCheck {
+    Clear,
+    Encrypted,
+    /// Cleartext ClientHello or ServerHello after CCS; tshark resets `ccs_frame`.
+    ResetCcs,
+}
+
+impl EncryptedCheck {
+    fn hides(self) -> bool {
+        matches!(self, Self::Encrypted)
+    }
+}
+
+fn is_encrypted_handshake_message(body: &[u8], after_ccs: bool) -> EncryptedCheck {
+    if body.len() < 16 {
+        return EncryptedCheck::Clear;
+    }
+    // tvb_get_ntoh40 == 0: two Hello Requests (type=0 length=0, type=0).
+    if u40(body) == 0 {
+        return EncryptedCheck::Encrypted;
+    }
+    let msg_type = body[0];
+    if !is_named_handshake_type(msg_type) {
+        return EncryptedCheck::Encrypted;
+    }
+    let msg_length = u24(&body[1..4]);
+    if msg_length >= 0x010000 {
+        return EncryptedCheck::Encrypted;
+    }
+    if !after_ccs {
+        return EncryptedCheck::Clear;
+    }
+    if msg_type != HANDSHAKE_CLIENT_HELLO && msg_type != HANDSHAKE_SERVER_HELLO {
+        return EncryptedCheck::Encrypted;
+    }
+    let version = u16::from_be_bytes([body[4], body[5]]);
+    if !is_named_ssl_version(version) || msg_length >= 0x400 {
+        EncryptedCheck::Encrypted
+    } else {
+        EncryptedCheck::ResetCcs
+    }
+}
+
+/// tshark 4.6.9 `ssl_is_valid_ssl_version`: `try_val_to_str(ssl_versions)`.
+fn is_named_ssl_version(version: u16) -> bool {
+    matches!(
+        version,
+        0x0002
+            | 0x0100
+            | 0x0101
+            | 0x0300..=0x0304
+            | 0x7f0e..=0x7f1c
+            | 0xfb17
+            | 0xfb1a
+            | 0xfefc
+            | 0xfefd
+            | 0xfeff
+    ) || is_grease_version(version)
+}
+
+fn is_grease_version(version: u16) -> bool {
+    version & 0x0f0f == 0x0a0a && version & 0xff == version >> 8
 }
 
 /// tshark 4.6.9 `is_sslv3_or_tls`: Handshake or Application Data, SSLv3/TLS 1.0–1.2
@@ -605,7 +699,9 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
             });
         }
         let body = &rest[RECORD_HEADER..need];
-        if content == CONTENT_HANDSHAKE {
+        let encrypted =
+            content == CONTENT_HANDSHAKE && is_encrypted_handshake_message(body, false).hides();
+        if content == CONTENT_HANDSHAKE && !encrypted {
             if let Some(more) = handshake_need(body) {
                 return Some(RecordTail {
                     start: offset,
@@ -620,6 +716,7 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
             (content == CONTENT_HANDSHAKE).then_some(body),
         );
         if content == CONTENT_HANDSHAKE
+            && !encrypted
             && handshake_throws(body, &rest[need..], session.tls_version())
         {
             // tshark 4.6.9 THROW(ReportedBoundsError) aborts dissect_ssl.
@@ -866,28 +963,35 @@ fn handshake_need(body: &[u8]) -> Option<usize> {
     None
 }
 
-fn parse_handshake_messages(body: &[u8], leftover: &[u8], version: u16) -> (Hello, bool) {
+fn parse_handshake_messages(
+    body: &[u8],
+    leftover: &[u8],
+    version: u16,
+    after_ccs: bool,
+) -> (Hello, bool, bool) {
     if body.is_empty() {
-        return (Hello::Unproved, false);
+        return (Hello::Unproved, false, false);
     }
-    if is_encrypted_handshake_record(body) {
+    let encrypted = is_encrypted_handshake_message(body, after_ccs);
+    if encrypted.hides() {
         // dissect_tls_handshake treats the rest of this record as Encrypted
         // Handshake Message. Later ClientHellos in this record are not printed.
-        return (Hello::None, false);
+        return (Hello::None, false, false);
     }
+    let reset_ccs = encrypted == EncryptedCheck::ResetCcs;
     let mut offset = 0;
     let mut names = Vec::new();
     let mut saw_hello = false;
     while offset < body.len() {
         if body.len() - offset < 4 {
-            return (Hello::Unproved, false);
+            return (Hello::Unproved, false, reset_ccs);
         }
         let msg_type = body[offset];
         let msg_len = u24(&body[offset + 1..offset + 4]);
         let start = offset + 4;
         let end = start.saturating_add(msg_len);
         if end > body.len() {
-            return (Hello::Unproved, false);
+            return (Hello::Unproved, false, reset_ccs);
         }
         if msg_type == HANDSHAKE_CLIENT_HELLO {
             match parse_client_hello(&body[start..end]) {
@@ -895,7 +999,7 @@ fn parse_handshake_messages(body: &[u8], leftover: &[u8], version: u16) -> (Hell
                     saw_hello = true;
                     names.extend(found);
                 }
-                None => return (Hello::Unproved, false),
+                None => return (Hello::Unproved, false, reset_ccs),
             }
         }
         let msg_body = &body[start..end];
@@ -903,11 +1007,11 @@ fn parse_handshake_messages(body: &[u8], leftover: &[u8], version: u16) -> (Hell
         if message_throws(msg_type, msg_body, parent, leftover, version) {
             // THROW(ReportedBoundsError) aborts dissect_ssl at this message.
             // Later handshake messages in this record are not walked.
-            return (hello_names(saw_hello, names), true);
+            return (hello_names(saw_hello, names), true, reset_ccs);
         }
         offset = end;
     }
-    (hello_names(saw_hello, names), false)
+    (hello_names(saw_hello, names), false, reset_ccs)
 }
 
 fn hello_names(saw_hello: bool, names: Vec<String>) -> Hello {
@@ -1015,6 +1119,14 @@ fn ascii_name(bytes: &[u8]) -> String {
 
 fn u24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize
+}
+
+fn u40(bytes: &[u8]) -> u64 {
+    ((bytes[0] as u64) << 32)
+        | ((bytes[1] as u64) << 24)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 8)
+        | bytes[4] as u64
 }
 
 fn quic_initial_at(bytes: &[u8]) -> bool {
@@ -2203,13 +2315,17 @@ mod tests {
             TlsParse::Other,
             "unnamed 40001→40002 type 7 then CH"
         );
-        for msg_type in [9u8, 10, 17, 26, 64, 66, 68, 99, 254, 255] {
-            let rec = handshake_record_messages(&[handshake(msg_type, &[0x00]), hello_hs.clone()]);
-            assert_eq!(
-                parse_tcp_tls_on_tls_port(&rec),
-                TlsParse::Other,
-                "type {msg_type} body 00 then CH"
-            );
+        for msg_type in [
+            9u8, 10, 17, 18, 19, 26, 27, 28, 29, 64, 66, 68, 99, 254, 255,
+        ] {
+            for body in [&[][..], &[0x00][..]] {
+                let rec = handshake_record_messages(&[handshake(msg_type, body), hello_hs.clone()]);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&rec),
+                    TlsParse::Other,
+                    "type {msg_type} body {body:?} then CH"
+                );
+            }
         }
         let mut ccs_same = ccs();
         ccs_same.extend_from_slice(&handshake_record_messages(&[
@@ -2248,7 +2364,7 @@ mod tests {
             "CH then type 7 then CH same record"
         );
         for msg_type in [
-            2u8, 4, 6, 3, 8, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 67,
+            0u8, 2, 4, 6, 3, 8, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 67,
         ] {
             let rec = handshake_record_messages(&[handshake(msg_type, &[]), hello_hs.clone()]);
             assert_eq!(
@@ -2257,6 +2373,52 @@ mod tests {
                 "empty named type {msg_type} then CH same record"
             );
         }
+        let two_hr =
+            handshake_record_messages(&[handshake(0, &[]), handshake(0, &[]), hello_hs.clone()]);
+        assert_eq!(
+            &two_hr[RECORD_HEADER..RECORD_HEADER + 8],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+            "two Hello Requests then CH"
+        );
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&two_hr),
+            TlsParse::Other,
+            "two Hello Requests then CH"
+        );
+        let mut second = handshake_record_messages(&[handshake(7, &[]), hello_hs.clone()]);
+        second.extend_from_slice(&client_hello(Some("other.example")));
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&second),
+            TlsParse::ClientHello(vec!["other.example".to_string()]),
+            "type 7 then CH then a second record"
+        );
+        let mut huge = vec![0, 0x01, 0x00, 0x00];
+        huge.extend_from_slice(&hello_hs);
+        let huge = record(CONTENT_HANDSHAKE, 0x0303, &huge);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&huge),
+            TlsParse::Other,
+            "named type with 64K length then CH"
+        );
+        let hr_ch = handshake_record_messages(&[handshake(0, &[]), hello_hs.clone()]);
+        let first = parse_tls_after_ccs(&ccs(), TlsSession::Unknown, false, false);
+        assert!(first.after_ccs, "CCS arms the next frame");
+        assert_eq!(
+            parse_tls_after_ccs(&hr_ch, first.session, false, first.after_ccs).kind,
+            TlsParse::Other,
+            "CCS then Hello Request then CH next frame"
+        );
+        assert_eq!(
+            parse_tls_after_ccs(
+                &client_hello(Some("www.example.com")),
+                first.session,
+                false,
+                first.after_ccs
+            )
+            .kind,
+            named.clone(),
+            "CCS then ClientHello next frame still prints"
+        );
     }
 
     #[test]
