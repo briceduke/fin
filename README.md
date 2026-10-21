@@ -34,7 +34,7 @@ flowchart LR
 
 A capture file becomes frames: link type and the captured bytes. A classic pcap is mapped and split across cores. Each core proves that its chunk starts where the previous one stopped. A seam that does not prove is reread by the sequential reader, front to back on one core. pcapng, stdin, and live capture use that reader too.
 
-Header fields are read from the packet in hand. A field that spans packets, such as a TLS server name, is reassembled on the connection and written on the packet that completes it. Rows from every core merge back into file order.
+Header fields are read from the packet in hand. A TLS server name is proved from one TCP payload and one TLS record; a handshake that spans packets is counted. Rows from every core merge back into file order.
 
 Those rows are the product. The CLI prints them as `-T fields`. The index answers the same query over an archive of captures. Parquet is the export. The desktop app is the Wireshark replacement, and it decodes only the packets on screen.
 
@@ -87,7 +87,7 @@ TShark 4.6.9 (`v4.6.9-0-g2d548b197c75`). Intel Core i9-14900HX, 32 GB RAM, Windo
 
 The prototype's `ip.src` output matched tshark on both million-packet files. The TLS names matched too, including tshark's blank line for a retransmitted ClientHello.
 
-The prototype did not reassemble split TLS handshakes. bigFlows.pcap is older traffic, where every handshake fits in one packet. Modern browsers often split them, and the real reader handles that, so its numbers will differ.
+The prototype did not reassemble split TLS handshakes. The v1 reader does not either: a split ClientHello is counted. bigFlows.pcap is older traffic, where every handshake fits in one packet. Modern browsers often split them, so those files will show counted misses.
 
 Inside tshark, the `ip.src` query costs about the same as printing the packet number. Disabling UDP, TCP, DNS, HTTP, TLS, and data dissection in tshark saves only 22%. The cost is tshark's per-packet engine itself.
 
