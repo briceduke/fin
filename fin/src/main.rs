@@ -1,4 +1,4 @@
-//! `fin -r <file> [-n] -T fields -e ip.src`
+//! `fin -r <file> [-n] -T fields -e ip.src` / `-e tls.handshake.extensions_server_name`
 
 use std::env;
 use std::ffi::OsString;
@@ -29,7 +29,7 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
         io::stdin()
             .read_to_end(&mut bytes)
             .map_err(|error| format!("stdin: {error}"))?;
-        return emit("stdin", read_capture(&bytes));
+        return emit("stdin", read_capture(&bytes), &args.fields);
     }
     let file = File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let is_file = file.metadata().map(|m| m.is_file()).unwrap_or(false);
@@ -40,7 +40,11 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        return emit(&path.display().to_string(), read_capture(&bytes));
+        return emit(
+            &path.display().to_string(),
+            read_capture(&bytes),
+            &args.fields,
+        );
     }
     // Regular files are mapped. They are not written while fin reads them; on
     // Linux a concurrent truncation can SIGBUS instead of reporting a fault.
@@ -52,15 +56,25 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
     emit(
         &path.display().to_string(),
         read_capture_chunked(&mapped, threads),
+        &args.fields,
     )
 }
 
-fn emit(name: &str, capture: reader::Capture<'_>) -> Result<i32, String> {
-    let mut ip_src = IpSrc::new();
+fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i32, String> {
+    let want_ip = fields.iter().any(|field| *field == Field::IpSrc);
+    let want_tls = fields.iter().any(|field| *field == Field::TlsSni);
+    let mut session = IpSrc::query(want_ip, want_tls);
     let mut counted = Vec::new();
     for (index, frame) in capture.frames.iter().enumerate() {
-        let cell = ip_src.walk(frame);
-        println!("{}", cell.values.join(","));
+        let cell = session.walk(frame);
+        let mut columns = Vec::with_capacity(fields.len());
+        for field in fields {
+            match field {
+                Field::IpSrc => columns.push(cell.values.join(",")),
+                Field::TlsSni => columns.push(cell.tls_sni.join(",")),
+            }
+        }
+        println!("{}", columns.join("\t"));
         if let Some(reason) = cell.counted {
             counted.push((index as u64 + 1, reason));
         }
@@ -82,12 +96,19 @@ fn emit(name: &str, capture: reader::Capture<'_>) -> Result<i32, String> {
 
 struct Args {
     file: Option<PathBuf>,
+    fields: Vec<Field>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    IpSrc,
+    TlsSni,
 }
 
 fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
     let mut file = None;
-    let mut fields = false;
-    let mut ip_src = false;
+    let mut fields_flag = false;
+    let mut fields = Vec::new();
     let mut args = raw.peekable();
     while let Some(arg) = args.next() {
         let Some(flag) = arg.to_str() else {
@@ -104,14 +125,15 @@ fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
                 if value != "fields" {
                     return Err(format!("unsupported -T {value}"));
                 }
-                fields = true;
+                fields_flag = true;
             }
             "-e" => {
                 let value = next_str(&mut args, "-e")?;
-                if value != "ip.src" {
-                    return Err(format!("unsupported field {value}"));
+                match value.as_str() {
+                    "ip.src" => fields.push(Field::IpSrc),
+                    "tls.handshake.extensions_server_name" => fields.push(Field::TlsSni),
+                    other => return Err(format!("unsupported field {other}")),
                 }
-                ip_src = true;
             }
             "-o" => {
                 let value = next_str(&mut args, "-o")?;
@@ -122,13 +144,13 @@ fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
             _ => return Err(format!("unrecognized flag {flag}")),
         }
     }
-    if !fields {
+    if !fields_flag {
         return Err("missing -T fields".to_string());
     }
-    if !ip_src {
-        return Err("missing -e ip.src".to_string());
+    if fields.is_empty() {
+        return Err("missing -e".to_string());
     }
-    Ok(Args { file })
+    Ok(Args { file, fields })
 }
 
 fn next_str(
