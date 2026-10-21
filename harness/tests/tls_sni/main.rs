@@ -602,6 +602,116 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
         ),
         ("hello-grease-split-1", hello_then_split_grease(1)),
     ]
+    .into_iter()
+    .chain(tls13_session_cases())
+    .collect()
+}
+
+fn tls13_session_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let grease = client_hello_host(Some(b"www.example.com"), 0x0a0a);
+    let hello_0301 = client_hello(Some("www.example.com"));
+    let middles = [
+        (
+            "tls13-sh-ccs-grease",
+            "tls13-sh-then-ccs-then-grease",
+            ccs(),
+        ),
+        (
+            "tls13-sh-alert-grease",
+            "tls13-sh-then-alert-then-grease",
+            alert(),
+        ),
+        (
+            "tls13-sh-app-grease",
+            "tls13-sh-then-app-then-grease",
+            app_data(),
+        ),
+        (
+            "tls13-sh-heartbeat-grease",
+            "tls13-sh-then-heartbeat-then-grease",
+            heartbeat(),
+        ),
+        (
+            "tls13-sh-cert-grease",
+            "tls13-sh-then-cert-then-grease",
+            handshake_type_record(11, 0x0303),
+        ),
+        (
+            "tls13-sh-ee-grease",
+            "tls13-sh-then-ee-then-grease",
+            handshake_type_record(8, 0x0303),
+        ),
+        (
+            "tls13-sh-finished-grease",
+            "tls13-sh-then-finished-then-grease",
+            handshake_type_record(20, 0x0303),
+        ),
+        (
+            "tls13-sh-hs0-grease",
+            "tls13-sh-then-hs0-then-grease",
+            handshake_type_record(0, 0x0303),
+        ),
+    ];
+    let mut cases = Vec::new();
+    for (same, frames, middle) in middles {
+        cases.push((
+            same,
+            three_records(&tls13_server_hello(), &middle, &grease, true),
+        ));
+        cases.push((
+            frames,
+            three_records(&tls13_server_hello(), &middle, &grease, false),
+        ));
+    }
+    cases.push((
+        "tls13-sh-then-ccs-then-0301",
+        three_records(&tls13_server_hello(), &ccs(), &hello_0301, false),
+    ));
+    cases.push((
+        "ccs-0304-ccs-0303-grease",
+        three_records(&ccs_version(0x0304), &ccs(), &grease, true),
+    ));
+    cases.push((
+        "ccs-0304-then-ccs-then-grease",
+        three_records(&ccs_version(0x0304), &ccs(), &grease, false),
+    ));
+    cases.push((
+        "ccs-0304-then-ccs-then-0301",
+        three_records(&ccs_version(0x0304), &ccs(), &hello_0301, false),
+    ));
+    cases.push((
+        "early-data-ccs-grease",
+        three_records(&client_hello_early_data(), &ccs(), &grease, true),
+    ));
+    cases.push((
+        "early-data-then-ccs-then-grease",
+        three_records(&client_hello_early_data(), &ccs(), &grease, false),
+    ));
+    cases.push((
+        "early-data-then-ccs-then-0301",
+        three_records(&client_hello_early_data(), &ccs(), &hello_0301, false),
+    ));
+    cases
+}
+
+fn three_records(first: &[u8], second: &[u8], third: &[u8], same_payload: bool) -> Vec<u8> {
+    if same_payload {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(second);
+        payload.extend_from_slice(third);
+        pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &payload)])
+    } else {
+        let second_seq = 1 + first.len() as u32;
+        let third_seq = second_seq + second.len() as u32;
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_seq(OUTER, 50000, 443, 1, first),
+                eth_ipv4_tcp_seq(OUTER, 50000, 443, second_seq, second),
+                eth_ipv4_tcp_seq(OUTER, 50000, 443, third_seq, third),
+            ],
+        )
+    }
 }
 
 fn empty_then_split_hello(content: u8, cut: usize) -> Vec<u8> {

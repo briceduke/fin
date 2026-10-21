@@ -16,51 +16,73 @@ const CONTENT_HANDSHAKE: u8 = 0x16;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_SERVER_HELLO: u8 = 2;
 const EXT_SERVER_NAME: u16 = 0;
+const EXT_EARLY_DATA: u16 = 42;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
+const EXT_TICKET_EARLY_DATA_INFO: u16 = 46;
 const RECORD_HEADER: usize = 5;
 const TLS_MAX_RECORD: usize = 16384 + 2048;
 
+/// tshark 4.6.9 `SslSession.version` as it affects later records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsSession {
+    /// `SSL_VER_UNKNOWN`. Later records need `ssl_looks_like_sslv3`.
+    #[default]
+    Unknown,
+    /// SSLv3 / TLS 1.0–1.2 / TLCP. `dissect_ssl3_record` without `ssl_looks_like_sslv3`.
+    Sticky,
+    /// TLS 1.3. `dissect_ssl`'s default arm still needs `ssl_looks_like_sslv3`,
+    /// and record-level `ssl_try_set_version` does not run.
+    Tls13,
+}
+
+impl TlsSession {
+    fn skips_looks_like(self) -> bool {
+        matches!(self, Self::Sticky)
+    }
+}
+
 /// Result of one TCP payload, plus whether tshark would keep this conversation
-/// as TLS and whether a later record may skip `ssl_looks_like_sslv3`.
+/// as TLS and the session version for later records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsOutcome {
     pub kind: TlsParse,
     pub claimed: bool,
-    pub known: bool,
+    pub session: TlsSession,
 }
 
 /// Parse SNI from one TCP payload on an unnamed port. The first record must
 /// pass tshark 4.6.9 `is_sslv3_or_tls`.
 pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
-    parse_tls(payload, false, true).kind
+    parse_tls(payload, TlsSession::Unknown, true).kind
 }
 
 /// Port 443 (and the other `tls` ports) force the TLS dissector. An unknown
 /// session uses `ssl_looks_like_sslv3`; after an authoritative SSLv3/TLS 1.0–1.2
-/// or TLCP record, later records follow `dissect_ssl3_record`.
+/// or TLCP record, later records follow `dissect_ssl3_record`. TLS 1.3 stays
+/// on the default arm.
 pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
-    parse_tls(payload, false, false).kind
+    parse_tls(payload, TlsSession::Unknown, false).kind
 }
 
-/// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate. `known` is a
-/// conversation whose version already stuck as SSLv3/TLS 1.0–1.2/TLCP.
-pub fn parse_tls(payload: &[u8], known: bool, heuristic: bool) -> TlsOutcome {
+/// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate. `session` is
+/// `SslSession.version`: unknown, sticky pre-1.3, or TLS 1.3.
+pub fn parse_tls(payload: &[u8], session: TlsSession, heuristic: bool) -> TlsOutcome {
     if heuristic && !is_sslv3_or_tls(payload) {
         return TlsOutcome {
             kind: TlsParse::Other,
             claimed: false,
-            known,
+            session,
         };
     }
-    let mut known = known;
+    let mut session = session;
     TlsOutcome {
-        kind: parse_records(payload, &mut known),
+        kind: parse_records(payload, &mut session),
         claimed: true,
-        known,
+        session,
     }
 }
 
-fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
+fn parse_records(payload: &[u8], session: &mut TlsSession) -> TlsParse {
     if payload.is_empty() {
         return TlsParse::Other;
     }
@@ -69,14 +91,14 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
     let mut saw_hello = false;
     let mut unproved = false;
     while offset < payload.len() {
-        match take_record(payload, offset, *known) {
+        match take_record(payload, offset, *session) {
             Record::Done => break,
             Record::Other {
                 next,
                 version,
                 content,
             } => {
-                apply_session_version(known, content, version, None);
+                apply_session_version(session, content, version, None);
                 offset = next;
             }
             Record::Unproved => {
@@ -88,7 +110,7 @@ fn parse_records(payload: &[u8], known: &mut bool) -> TlsParse {
                 next,
                 version,
             } => {
-                apply_session_version(known, CONTENT_HANDSHAKE, version, Some(body));
+                apply_session_version(session, CONTENT_HANDSHAKE, version, Some(body));
                 match parse_handshake_messages(body) {
                     Hello::None => {}
                     Hello::Names(found) => {
@@ -165,7 +187,7 @@ enum Hello {
     Unproved,
 }
 
-fn take_record(payload: &[u8], offset: usize, known: bool) -> Record<'_> {
+fn take_record(payload: &[u8], offset: usize, session: TlsSession) -> Record<'_> {
     let rest = &payload[offset..];
     if rest.is_empty() {
         return Record::Done;
@@ -177,7 +199,7 @@ fn take_record(payload: &[u8], offset: usize, known: bool) -> Record<'_> {
             Record::Done
         };
     };
-    if !known && !is_record_version(version) {
+    if !session.skips_looks_like() && !is_record_version(version) {
         return Record::Done;
     }
     if length == 0 || length >= TLS_MAX_RECORD {
@@ -242,13 +264,8 @@ fn is_sticky_version(version: u16) -> bool {
 }
 
 /// tshark 4.6.9 `ssl_is_authoritative_version_message`: a valid handshake
-/// except ClientHello, or any other valid content type. Combined with
-/// [`is_sticky_version`], this is when `dissect_ssl` later skips
-/// `ssl_looks_like_sslv3` and calls `dissect_ssl3_record`.
-fn sets_known(content: u8, version: u16, handshake_type: Option<u8>) -> bool {
-    if !is_sticky_version(version) {
-        return false;
-    }
+/// except ClientHello, or any other valid content type.
+fn is_authoritative(content: u8, handshake_type: Option<u8>) -> bool {
     if content == CONTENT_HANDSHAKE {
         handshake_type
             .is_some_and(|hs| is_valid_tls_handshake_type(hs) && hs != HANDSHAKE_CLIENT_HELLO)
@@ -257,27 +274,115 @@ fn sets_known(content: u8, version: u16, handshake_type: Option<u8>) -> bool {
     }
 }
 
-/// Record-level `ssl_try_set_version`, then ServerHello `tls_scan_server_hello`.
-/// TLS 1.3 (`supported_versions` 0x0304) takes `dissect_ssl`'s default arm.
+/// tshark 4.6.9 `tls_try_get_version` mapped onto [`TlsSession`].
+fn session_from_version(version: u16) -> Option<TlsSession> {
+    let version = normalize_tls_version(version);
+    if is_sticky_version(version) {
+        Some(TlsSession::Sticky)
+    } else if version == 0x0304 {
+        Some(TlsSession::Tls13)
+    } else {
+        None
+    }
+}
+
+/// Record-level `ssl_try_set_version` only when `SSL_VER_UNKNOWN`, then
+/// ServerHello `tls_scan_server_hello` (always), then ClientHello `early_data`.
 fn apply_session_version(
-    known: &mut bool,
+    session: &mut TlsSession,
     content: u8,
     record_version: u16,
     handshake: Option<&[u8]>,
 ) {
     let hs_type = handshake.and_then(|body| body.first().copied());
-    if !*known && sets_known(content, record_version, hs_type) {
-        *known = true;
+    if *session == TlsSession::Unknown && is_authoritative(content, hs_type) {
+        if let Some(next) = session_from_version(record_version) {
+            *session = next;
+        }
     }
-    let Some(version) = server_hello_session_version(handshake) else {
-        return;
+    if let Some(version) = server_hello_session_version(handshake) {
+        if let Some(next) = session_from_version(version) {
+            *session = next;
+        }
+    }
+    if handshake_has_early_data(handshake) {
+        *session = TlsSession::Tls13;
+    }
+}
+
+/// tshark 4.6.9 ClientHello `early_data` (or draft `ticket_early_data_info`)
+/// forces `session->version = TLSV1DOT3_VERSION`.
+fn handshake_has_early_data(handshake: Option<&[u8]>) -> bool {
+    let Some(mut body) = handshake else {
+        return false;
     };
-    let version = normalize_tls_version(version);
-    if is_sticky_version(version) {
-        *known = true;
-    } else if version == 0x0304 {
-        *known = false;
+    while body.len() >= 4 {
+        let msg_type = body[0];
+        let msg_len = u24(&body[1..4]);
+        let start: usize = 4;
+        let end = start.saturating_add(msg_len);
+        if end > body.len() {
+            return false;
+        }
+        if msg_type == HANDSHAKE_CLIENT_HELLO && client_hello_has_early_data(&body[start..end]) {
+            return true;
+        }
+        body = &body[end..];
     }
+    false
+}
+
+fn client_hello_has_early_data(hello: &[u8]) -> bool {
+    let Some(exts) = client_hello_extensions(hello) else {
+        return false;
+    };
+    let mut offset = 0;
+    while offset + 4 <= exts.len() {
+        let typ = u16::from_be_bytes([exts[offset], exts[offset + 1]]);
+        let len = u16::from_be_bytes([exts[offset + 2], exts[offset + 3]]) as usize;
+        offset += 4;
+        let end = match offset.checked_add(len) {
+            Some(end) if end <= exts.len() => end,
+            _ => return false,
+        };
+        if typ == EXT_EARLY_DATA || typ == EXT_TICKET_EARLY_DATA_INFO {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn client_hello_extensions(hello: &[u8]) -> Option<&[u8]> {
+    if hello.len() < 34 {
+        return None;
+    }
+    let mut offset = 34;
+    let sid_len = *hello.get(offset)? as usize;
+    offset += 1;
+    offset = offset.checked_add(sid_len)?;
+    if offset + 2 > hello.len() {
+        return None;
+    }
+    let cipher_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+    offset += 2;
+    offset = offset.checked_add(cipher_len)?;
+    let comp_len = *hello.get(offset)? as usize;
+    offset += 1;
+    offset = offset.checked_add(comp_len)?;
+    if offset == hello.len() {
+        return Some(&[]);
+    }
+    if offset + 2 > hello.len() {
+        return None;
+    }
+    let ext_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+    offset += 2;
+    let ext_end = offset.checked_add(ext_len)?;
+    if ext_end > hello.len() {
+        return None;
+    }
+    Some(&hello[offset..ext_end])
 }
 
 /// tshark 4.6.9 `tls_try_get_version` for TLS: drafts become 0x0304.
@@ -365,23 +470,23 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 /// record. The next in-order payload on that flow is continuation, not a new
 /// ClientHello.
 pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
-    truncated_handshake_need_known(payload, false)
+    truncated_handshake_need_known(payload, TlsSession::Unknown)
 }
 
 /// Like [`truncated_handshake_need`], but a sticky session accepts any record
 /// version the way `dissect_ssl3_record` does. Complete CCS/alert/app-data/
 /// HelloRequest records, including length-0 records, are skipped so a following
 /// truncated handshake is buffered, matching tshark 4.6.9 `dissect_ssl`.
-pub fn truncated_handshake_need_known(payload: &[u8], known: bool) -> Option<usize> {
-    handshake_tail(payload, known).map(|tail| tail.more)
+pub fn truncated_handshake_need_known(payload: &[u8], session: TlsSession) -> Option<usize> {
+    handshake_tail(payload, session).map(|tail| tail.more)
 }
 
 /// Bytes of `payload` from the incomplete handshake record onward.
 ///
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
-pub fn truncated_handshake_prefix(payload: &[u8], known: bool) -> Option<&[u8]> {
-    let tail = handshake_tail(payload, known)?;
+pub fn truncated_handshake_prefix(payload: &[u8], session: TlsSession) -> Option<&[u8]> {
+    let tail = handshake_tail(payload, session)?;
     Some(&payload[tail.start..])
 }
 
@@ -390,9 +495,8 @@ struct HandshakeTail {
     more: usize,
 }
 
-fn handshake_tail(payload: &[u8], known: bool) -> Option<HandshakeTail> {
+fn handshake_tail(payload: &[u8], mut session: TlsSession) -> Option<HandshakeTail> {
     let mut offset = 0;
-    let mut known = known;
     while offset < payload.len() {
         let rest = &payload[offset..];
         if rest.len() < RECORD_HEADER {
@@ -402,14 +506,14 @@ fn handshake_tail(payload: &[u8], known: bool) -> Option<HandshakeTail> {
             });
         }
         let (content, version, length) = tls_record_header(rest)?;
-        if !known && !is_record_version(version) {
+        if !session.skips_looks_like() && !is_record_version(version) {
             return None;
         }
         if length >= TLS_MAX_RECORD {
             return None;
         }
         if length == 0 {
-            apply_session_version(&mut known, content, version, None);
+            apply_session_version(&mut session, content, version, None);
             offset += RECORD_HEADER;
             continue;
         }
@@ -430,7 +534,7 @@ fn handshake_tail(payload: &[u8], known: bool) -> Option<HandshakeTail> {
             }
         }
         apply_session_version(
-            &mut known,
+            &mut session,
             content,
             version,
             (content == CONTENT_HANDSHAKE).then_some(body),
@@ -754,6 +858,41 @@ mod tests {
         vec![content, 0x03, 0x03, 0x00, 0x00]
     }
 
+    fn heartbeat() -> Vec<u8> {
+        record(0x18, 0x0303, &[0x01, 0x00, 0x00])
+    }
+
+    fn ccs_at(version: u16) -> Vec<u8> {
+        record(0x14, version, &[0x01])
+    }
+
+    fn client_hello_early_data() -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0, 2, 0x00, 0x2f]);
+        body.extend_from_slice(&[1, 0]);
+        body.extend_from_slice(&[0, 4, 0, 42, 0, 0]);
+        record(
+            CONTENT_HANDSHAKE,
+            0x0301,
+            &handshake(HANDSHAKE_CLIENT_HELLO, &body),
+        )
+    }
+
+    fn tls13_middle_records() -> [(&'static str, Vec<u8>); 8] {
+        [
+            ("ccs", ccs()),
+            ("alert", alert()),
+            ("app-data", app_data()),
+            ("heartbeat", heartbeat()),
+            ("certificate", handshake_type_record(11)),
+            ("encrypted-extensions", handshake_type_record(8)),
+            ("finished", handshake_type_record(20)),
+            ("hello-request", handshake_type_record(0)),
+        ]
+    }
+
     #[test]
     fn sni_name_is_proved() {
         assert_eq!(
@@ -929,7 +1068,7 @@ mod tests {
         );
         let lone = grease_hello();
         assert_eq!(parse_tcp_tls_on_tls_port(&lone), TlsParse::Other);
-        let after = parse_tls(&lone, true, false);
+        let after = parse_tls(&lone, TlsSession::Sticky, false);
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
@@ -944,9 +1083,9 @@ mod tests {
             parse_tcp_tls_on_tls_port(&payload),
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
-        let first = parse_tls(&handshake_type_record(2), false, false);
-        assert!(first.known);
-        let after = parse_tls(&grease_hello(), true, false);
+        let first = parse_tls(&handshake_type_record(2), TlsSession::Unknown, false);
+        assert_eq!(first.session, TlsSession::Sticky);
+        let after = parse_tls(&grease_hello(), TlsSession::Sticky, false);
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
@@ -971,9 +1110,9 @@ mod tests {
         let mut payload = tls13_server_hello();
         payload.extend_from_slice(&grease_hello());
         assert_eq!(parse_tcp_tls_on_tls_port(&payload), TlsParse::Other);
-        let first = parse_tls(&tls13_server_hello(), false, false);
-        assert!(!first.known);
-        let after = parse_tls(&grease_hello(), first.known, false);
+        let first = parse_tls(&tls13_server_hello(), TlsSession::Unknown, false);
+        assert_eq!(first.session, TlsSession::Tls13);
+        let after = parse_tls(&grease_hello(), first.session, false);
         assert_eq!(after.kind, TlsParse::Other);
     }
 
@@ -986,9 +1125,9 @@ mod tests {
             parse_tcp_tls_on_tls_port(&payload),
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
-        let first = parse_tls(&tls13_server_hello(), false, false);
-        assert!(!first.known);
-        let after = parse_tls(&hello, first.known, false);
+        let first = parse_tls(&tls13_server_hello(), TlsSession::Unknown, false);
+        assert_eq!(first.session, TlsSession::Tls13);
+        let after = parse_tls(&hello, first.session, false);
         assert_eq!(
             after.kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
@@ -997,9 +1136,9 @@ mod tests {
 
     #[test]
     fn tls13_server_hello_unsticks_a_prior_session() {
-        let after = parse_tls(&tls13_server_hello(), true, false);
-        assert!(!after.known);
-        let grease = parse_tls(&grease_hello(), after.known, false);
+        let after = parse_tls(&tls13_server_hello(), TlsSession::Sticky, false);
+        assert_eq!(after.session, TlsSession::Tls13);
+        let grease = parse_tls(&grease_hello(), after.session, false);
         assert_eq!(grease.kind, TlsParse::Other);
     }
 
@@ -1013,7 +1152,7 @@ mod tests {
                 let mut payload = prefix.clone();
                 payload.extend_from_slice(&hello[..cut]);
                 assert!(
-                    truncated_handshake_need_known(&payload, false).is_some(),
+                    truncated_handshake_need_known(&payload, TlsSession::Unknown).is_some(),
                     "prefix {} cut {cut}",
                     prefix[0]
                 );
@@ -1021,7 +1160,7 @@ mod tests {
             let mut grease_payload = prefix.clone();
             grease_payload.extend_from_slice(&grease[..1]);
             assert!(
-                truncated_handshake_need_known(&grease_payload, false).is_some(),
+                truncated_handshake_need_known(&grease_payload, TlsSession::Unknown).is_some(),
                 "grease after {}",
                 prefix[0]
             );
@@ -1039,7 +1178,7 @@ mod tests {
         for content in [CONTENT_HANDSHAKE, 0x14, 0x15, 0x17] {
             let empty = empty_record(content);
             assert_eq!(
-                truncated_handshake_need_known(&empty, false),
+                truncated_handshake_need_known(&empty, TlsSession::Unknown),
                 None,
                 "empty {content}"
             );
@@ -1047,10 +1186,10 @@ mod tests {
                 let mut payload = empty.clone();
                 payload.extend_from_slice(&hello[..cut]);
                 assert!(
-                    truncated_handshake_need_known(&payload, false).is_some(),
+                    truncated_handshake_need_known(&payload, TlsSession::Unknown).is_some(),
                     "empty {content} cut {cut}"
                 );
-                let prefix = truncated_handshake_prefix(&payload, false).unwrap();
+                let prefix = truncated_handshake_prefix(&payload, TlsSession::Unknown).unwrap();
                 assert_eq!(prefix, &hello[..cut], "empty {content} cut {cut}");
             }
         }
@@ -1068,7 +1207,7 @@ mod tests {
                 TlsParse::ClientHello(vec!["www.example.com".to_string()]),
                 "cut {cut}"
             );
-            let prefix = truncated_handshake_prefix(&payload, false).unwrap();
+            let prefix = truncated_handshake_prefix(&payload, TlsSession::Unknown).unwrap();
             assert_eq!(prefix, &second[..cut], "cut {cut}");
         }
         let mut same = first.clone();
@@ -1086,9 +1225,79 @@ mod tests {
     }
 
     #[test]
+    fn tls13_session_blocks_later_sticky_record_from_grease() {
+        let hello = client_hello(Some("www.example.com"));
+        for (label, middle) in tls13_middle_records() {
+            let mut same = tls13_server_hello();
+            same.extend_from_slice(&middle);
+            same.extend_from_slice(&grease_hello());
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                TlsParse::Other,
+                "{label} same payload"
+            );
+            let first = parse_tls(&tls13_server_hello(), TlsSession::Unknown, false);
+            assert_eq!(first.session, TlsSession::Tls13, "{label} sh");
+            let second = parse_tls(&middle, first.session, false);
+            assert_eq!(second.session, TlsSession::Tls13, "{label} middle");
+            let grease = parse_tls(&grease_hello(), second.session, false);
+            assert_eq!(grease.kind, TlsParse::Other, "{label} grease");
+            let after = parse_tls(&hello, second.session, false);
+            assert_eq!(
+                after.kind,
+                TlsParse::ClientHello(vec!["www.example.com".to_string()]),
+                "{label} 0x0301"
+            );
+        }
+    }
+
+    #[test]
+    fn ccs_0304_then_ccs_0303_does_not_stick_grease() {
+        let first = parse_tls(&ccs_at(0x0304), TlsSession::Unknown, false);
+        assert_eq!(first.session, TlsSession::Tls13);
+        let second = parse_tls(&ccs(), first.session, false);
+        assert_eq!(second.session, TlsSession::Tls13);
+        let grease = parse_tls(&grease_hello(), second.session, false);
+        assert_eq!(grease.kind, TlsParse::Other);
+        let hello = client_hello(Some("www.example.com"));
+        let after = parse_tls(&hello, second.session, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let mut same = ccs_at(0x0304);
+        same.extend_from_slice(&ccs());
+        same.extend_from_slice(&grease_hello());
+        assert_eq!(parse_tcp_tls_on_tls_port(&same), TlsParse::Other);
+    }
+
+    #[test]
+    fn early_data_forces_tls13_so_later_ccs_does_not_stick_grease() {
+        let first = parse_tls(&client_hello_early_data(), TlsSession::Unknown, false);
+        assert_eq!(first.session, TlsSession::Tls13);
+        let second = parse_tls(&ccs(), first.session, false);
+        assert_eq!(second.session, TlsSession::Tls13);
+        let grease = parse_tls(&grease_hello(), second.session, false);
+        assert_eq!(grease.kind, TlsParse::Other);
+        let hello = client_hello(Some("www.example.com"));
+        let after = parse_tls(&hello, second.session, false);
+        assert_eq!(
+            after.kind,
+            TlsParse::ClientHello(vec!["www.example.com".to_string()])
+        );
+        let mut same = client_hello_early_data();
+        same.extend_from_slice(&ccs());
+        same.extend_from_slice(&grease_hello());
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&same),
+            TlsParse::ClientHello(Vec::new())
+        );
+    }
+
+    #[test]
     fn client_hello_does_not_stick_a_later_grease_hello() {
-        let first = parse_tls(&client_hello(None), false, false);
-        assert!(!first.known);
+        let first = parse_tls(&client_hello(None), TlsSession::Unknown, false);
+        assert_eq!(first.session, TlsSession::Unknown);
         let mut payload = client_hello(None);
         payload.extend_from_slice(&grease_hello());
         assert_eq!(

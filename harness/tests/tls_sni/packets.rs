@@ -164,7 +164,14 @@ pub fn client_hello_host(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
 }
 
 pub fn ccs() -> Vec<u8> {
-    vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
+    ccs_version(0x0303)
+}
+
+pub fn ccs_version(version: u16) -> Vec<u8> {
+    let mut rec = vec![0x14];
+    rec.extend_from_slice(&version.to_be_bytes());
+    rec.extend_from_slice(&[0x00, 0x01, 0x01]);
+    rec
 }
 
 pub fn alert() -> Vec<u8> {
@@ -173,6 +180,20 @@ pub fn alert() -> Vec<u8> {
 
 pub fn app_data() -> Vec<u8> {
     vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01]
+}
+
+pub fn heartbeat() -> Vec<u8> {
+    vec![0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00]
+}
+
+pub fn client_hello_early_data() -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0x11u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0, 2, 0x00, 0x2f]);
+    body.extend_from_slice(&[1, 0]);
+    body.extend_from_slice(&[0, 4, 0, 42, 0, 0]);
+    handshake_record(&handshake(1, &body))
 }
 
 pub fn empty_record(content: u8) -> Vec<u8> {
