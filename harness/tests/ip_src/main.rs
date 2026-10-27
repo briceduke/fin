@@ -212,6 +212,99 @@ fn broken_stdout_pipe_is_not_a_panic() {
     assert_ne!(status.code(), Some(101), "{stderr}");
 }
 
+#[test]
+fn closed_stdout_still_prints_counted_gre() {
+    let path = work_dir().join("closed-stdout-gre.pcap");
+    let mut packets = vec![eth_ipv4_udp(OUTER, 12345, 9, PAYLOAD); 8192];
+    packets.push(eth(0x0800, &ipv4(OUTER, [10, 255, 255, 1], 47, PAYLOAD)));
+    fs::write(&path, pcap(LINK_ETHERNET, &packets)).unwrap();
+    let complete = fin_ip_src(&path);
+    let stderr = String::from_utf8_lossy(&complete.stderr);
+    assert_eq!(complete.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        complete.stdout.iter().filter(|b| **b == b'\n').count(),
+        8193
+    );
+    assert_eq!(stderr, "counted 8193 gre\ntotal 1\n");
+    let (code, err) = fin_ip_src_close_stdout_after_byte(&path);
+    let err = String::from_utf8_lossy(&err);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(err, "counted 8193 gre\ntotal 1\n");
+}
+
+#[test]
+fn closed_stdout_still_prints_pcapng_shb_fault() {
+    let path = work_dir().join("closed-stdout-shb11.pcapng");
+    let udp = eth_ipv4_udp(OUTER, 12345, 9, PAYLOAD);
+    let mut file = pcapng_shb(1, 0);
+    file.extend_from_slice(&pcapng_idb_ethernet());
+    for _ in 0..8192 {
+        file.extend_from_slice(&pcapng_epb(&udp));
+    }
+    file.extend_from_slice(&pcapng_shb(1, 1));
+    fs::write(&path, &file).unwrap();
+    let complete = fin_ip_src(&path);
+    let stderr = String::from_utf8_lossy(&complete.stderr);
+    let fault = format!(
+        "total 0\nfin: {}: pcapng: unknown SHB version 1.1\n",
+        path.display()
+    );
+    assert_eq!(complete.status.code(), Some(14), "{stderr}");
+    assert_eq!(stderr, fault);
+    let (code, err) = fin_ip_src_close_stdout_after_byte(&path);
+    let err = String::from_utf8_lossy(&err);
+    assert_eq!(code, Some(14), "{err}");
+    assert_eq!(err, fault);
+}
+
+#[test]
+fn closed_stdout_still_prints_truncated_pcap_fault() {
+    let path = work_dir().join("closed-stdout-trunc.pcap");
+    let packets = vec![eth_ipv4_udp(OUTER, 12345, 9, PAYLOAD); 8192];
+    let mut file = pcap(LINK_ETHERNET, &packets);
+    file.extend_from_slice(&[0u8; 8]);
+    fs::write(&path, &file).unwrap();
+    let complete = fin_ip_src(&path);
+    let stderr = String::from_utf8_lossy(&complete.stderr);
+    let fault = format!(
+        "total 0\nfin: {}: appears to have been cut short in the middle of a packet\n",
+        path.display()
+    );
+    assert_eq!(complete.status.code(), Some(14), "{stderr}");
+    assert_eq!(stderr, fault);
+    let (code, err) = fin_ip_src_close_stdout_after_byte(&path);
+    let err = String::from_utf8_lossy(&err);
+    assert_eq!(code, Some(14), "{err}");
+    assert_eq!(err, fault);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_keeps_counted_exit() {
+    use std::os::unix::net::UnixStream;
+
+    let path = work_dir().join("closed-stderr-gre.pcap");
+    fs::write(
+        &path,
+        pcap(
+            LINK_ETHERNET,
+            &[eth(0x0800, &ipv4(OUTER, [10, 255, 255, 1], 47, PAYLOAD))],
+        ),
+    )
+    .unwrap();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let status = Command::new(fin_bin())
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .status()
+        .expect("fin");
+    assert_eq!(status.code(), Some(1));
+}
+
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
     let mut files = fixed();
     files.extend(truncations());
@@ -1517,6 +1610,77 @@ fn tools() -> Option<(PathBuf, PathBuf)> {
         Err(error) => panic!("{error}"),
     }
     Some((tshark, fin_bin()))
+}
+
+fn fin_ip_src(path: &Path) -> std::process::Output {
+    Command::new(fin_bin())
+        .arg("-r")
+        .arg(path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .output()
+        .expect("fin")
+}
+
+fn fin_ip_src_close_stdout_after_byte(path: &Path) -> (Option<i32>, Vec<u8>) {
+    let mut child = Command::new(fin_bin())
+        .arg("-r")
+        .arg(path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("fin");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut byte = [0u8; 1];
+    let n = stdout.read(&mut byte).expect("read stdout");
+    assert_eq!(n, 1, "expected a stdout byte before close");
+    drop(stdout);
+    let mut stderr = child.stderr.take().expect("stderr");
+    let status = child.wait().expect("wait");
+    let mut err = Vec::new();
+    stderr.read_to_end(&mut err).expect("stderr");
+    (status.code(), err)
+}
+
+fn pcapng_shb(major: u16, minor: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x1A2B3C4Du32.to_le_bytes());
+    body.extend_from_slice(&major.to_le_bytes());
+    body.extend_from_slice(&minor.to_le_bytes());
+    body.extend_from_slice(&(-1i64).to_le_bytes());
+    pcapng_block(0x0A0D0D0A, &body)
+}
+
+fn pcapng_idb_ethernet() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&65535u32.to_le_bytes());
+    pcapng_block(1, &body)
+}
+
+fn pcapng_epb(packet: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+    body.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+    body.extend_from_slice(packet);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    pcapng_block(6, &body)
+}
+
+fn pcapng_block(kind: u32, body: &[u8]) -> Vec<u8> {
+    let total = (12 + body.len()) as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(body);
+    out.extend_from_slice(&total.to_le_bytes());
+    out
 }
 
 fn fin_bin() -> PathBuf {

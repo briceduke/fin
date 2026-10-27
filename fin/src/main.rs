@@ -64,11 +64,7 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
 }
 
 fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i32, String> {
-    match write_rows(name, capture, fields) {
-        Ok(code) => Ok(code),
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
-        Err(error) => Err(error.to_string()),
-    }
+    write_rows(name, capture, fields).map_err(|error| error.to_string())
 }
 
 fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io::Result<i32> {
@@ -80,6 +76,7 @@ fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io:
     let want_tls = fields.contains(&Field::TlsSni);
     let mut session = IpSrc::query(want_ip, want_tls);
     let mut counted = Vec::new();
+    let mut stdout_open = true;
     for (index, frame) in capture.frames.iter().enumerate() {
         let cell = session.walk(frame);
         let mut columns = Vec::with_capacity(fields.len());
@@ -89,26 +86,46 @@ fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io:
                 Field::TlsSni => columns.push(escape_field(&cell.tls_sni.join(","))),
             }
         }
-        writeln!(out, "{}", columns.join("\t"))?;
+        if stdout_open {
+            stdout_open = pipe_open(writeln!(out, "{}", columns.join("\t")))?;
+        }
         if let Some(reason) = cell.counted {
             counted.push((index as u64 + 1, reason));
         }
     }
-    out.flush()?;
+    if stdout_open {
+        pipe_open(out.flush())?;
+    }
+    let mut stderr_open = true;
     for (frame, reason) in &counted {
-        writeln!(err, "counted {frame} {reason}")?;
+        if stderr_open {
+            stderr_open = pipe_open(writeln!(err, "counted {frame} {reason}"))?;
+        }
     }
-    writeln!(err, "total {}", counted.len())?;
-    if let Some(fault) = capture.fault {
-        writeln!(err, "fin: {name}: {}", fault.phrase())?;
-        err.flush()?;
-        return Ok(capture.exit_code());
+    if stderr_open {
+        stderr_open = pipe_open(writeln!(err, "total {}", counted.len()))?;
     }
-    err.flush()?;
-    if counted.is_empty() {
-        Ok(0)
+    let code = if let Some(fault) = capture.fault {
+        if stderr_open {
+            stderr_open = pipe_open(writeln!(err, "fin: {name}: {}", fault.phrase()))?;
+        }
+        capture.exit_code()
+    } else if counted.is_empty() {
+        0
     } else {
-        Ok(1)
+        1
+    };
+    if stderr_open {
+        pipe_open(err.flush())?;
+    }
+    Ok(code)
+}
+
+fn pipe_open(result: io::Result<()>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
