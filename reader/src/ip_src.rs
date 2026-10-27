@@ -1814,6 +1814,42 @@ mod tests {
         sni_hello_host(name.as_bytes())
     }
 
+    fn sni_hello_exts(sni: Option<&str>, extra: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0, 2, 0x00, 0x2f, 1, 0]);
+        let mut exts = Vec::new();
+        if let Some(host) = sni {
+            let host = host.as_bytes();
+            let entry_len = 1 + 2 + host.len();
+            let sni_data_len = 2 + entry_len;
+            exts.extend_from_slice(&[0, 0]);
+            exts.extend_from_slice(&(sni_data_len as u16).to_be_bytes());
+            exts.extend_from_slice(&(entry_len as u16).to_be_bytes());
+            exts.push(0);
+            exts.extend_from_slice(&(host.len() as u16).to_be_bytes());
+            exts.extend_from_slice(host);
+        }
+        for &(typ, data) in extra {
+            exts.extend_from_slice(&typ.to_be_bytes());
+            exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            exts.extend_from_slice(data);
+        }
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let hs_len = body.len() as u32;
+        let mut hs = vec![1, (hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8];
+        hs.extend_from_slice(&body);
+        handshake_record_body(&hs)
+    }
+
+    fn two_hellos_record(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut hs = first[5..].to_vec();
+        hs.extend_from_slice(&second[5..]);
+        handshake_record_body(&hs)
+    }
+
     fn sni_hello_host(host: &[u8]) -> Vec<u8> {
         let mut body = vec![0x03, 0x03];
         body.extend_from_slice(&[0u8; 32]);
@@ -2798,6 +2834,98 @@ mod tests {
             assert_eq!(
                 cell.counted, None,
                 "empty type {msg_type} then CH same record"
+            );
+        }
+    }
+
+    #[test]
+    fn throwing_last_hello_ext_keeps_prior_sni_and_drops_later_hellos() {
+        let other = sni_hello("other.example");
+        let hello = sni_hello("www.example.com");
+        let named = ["www.example.com"];
+        let blank: [&str; 0] = [];
+        let throws: &[(u16, &[u8])] = &[
+            (1, &[]),
+            (5, &[]),
+            (9, &[]),
+            (11, &[]),
+            (15, &[]),
+            (19, &[]),
+            (20, &[]),
+            (24, &[]),
+            (24, &[0x00]),
+            (28, &[]),
+            (28, &[0x00]),
+            (53, &[]),
+            (54, &[]),
+            (57, &[0x00]),
+            (65445, &[0x00]),
+            (65486, &[]),
+            (65486, &[0x00]),
+            (65486, &[0x00, 0x00]),
+            (65037, &[]),
+            (65037, &[0x00]),
+            (65037, &[0x00, 0x00]),
+        ];
+        for &(typ, data) in throws {
+            let first = sni_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_record(&first, &other);
+            for (label, frame) in [
+                ("443", eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &same)),
+                ("unnamed", eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &same)),
+            ] {
+                let cell = walk_tls(&frame);
+                assert_eq!(cell.tls_sni, named, "type {typ} len {} {label}", data.len());
+                assert_eq!(cell.counted, None, "type {typ} len {} {label}", data.len());
+            }
+            let empty_first = sni_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_record(&empty_first, &hello);
+            let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &empty_then));
+            assert_eq!(
+                cell.tls_sni,
+                blank,
+                "type {typ} len {} first-only then CH",
+                data.len()
+            );
+            assert_eq!(
+                cell.counted,
+                None,
+                "type {typ} len {} first-only then CH",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            let cells = next_seq_on(50000, 443, &leftover, &hello);
+            assert_eq!(
+                cells[0].tls_sni,
+                named,
+                "type {typ} len {} leftover first",
+                data.len()
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                named,
+                "type {typ} len {} leftover then 0x0301",
+                data.len()
+            );
+            assert_eq!(
+                cells[1].counted,
+                None,
+                "type {typ} len {} leftover then 0x0301",
+                data.len()
+            );
+            let next = next_seq_on(50000, 443, &first, &other);
+            assert_eq!(
+                next[0].tls_sni,
+                named,
+                "type {typ} len {} next first",
+                data.len()
+            );
+            assert_eq!(
+                next[1].tls_sni,
+                ["other.example"],
+                "type {typ} len {} next payload",
+                data.len()
             );
         }
     }

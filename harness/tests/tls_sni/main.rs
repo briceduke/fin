@@ -217,6 +217,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .into_iter()
     .chain(record_version_cases())
     .chain(review_cases())
+    .chain(hello_ext_throw_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -242,6 +243,81 @@ fn record_version_cases() -> Vec<(&'static str, Vec<u8>)> {
         )
     })
     .collect()
+}
+
+fn hello_ext_throw_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let other = client_hello(Some("other.example"));
+    let hello = client_hello(Some("www.example.com"));
+    let throws: &[(&str, u16, &[u8])] = &[
+        ("maxfrag-0", 1, &[]),
+        ("maxfrag-1", 1, &[0x01]),
+        ("status-0", 5, &[]),
+        ("certtype-0", 9, &[]),
+        ("ecpf-0", 11, &[]),
+        ("heartbeat-0", 15, &[]),
+        ("heartbeat-1", 15, &[0x01]),
+        ("client-cert-0", 19, &[]),
+        ("server-cert-0", 20, &[]),
+        ("tokenbind-0", 24, &[]),
+        ("tokenbind-1", 24, &[0x00]),
+        ("rsl-0", 28, &[]),
+        ("rsl-1", 28, &[0x00]),
+        ("cid-dep-0", 53, &[]),
+        ("cid-0", 54, &[]),
+        ("quic-tp-v1-1", 57, &[0x00]),
+        ("quic-tp-old-1", 65445, &[0x00]),
+        ("esni-0", 65486, &[]),
+        ("esni-1", 65486, &[0x00]),
+        ("esni-2", 65486, &[0x00, 0x00]),
+        ("ech-0", 65037, &[]),
+        ("ech-1", 65037, &[0x00]),
+        ("ech-2", 65037, &[0x00, 0x00]),
+    ];
+    let mut cases = Vec::new();
+    for &(tag, typ, data) in throws {
+        let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+        let empty_first = client_hello_exts(None, &[(typ, data)]);
+        let same = two_client_hellos_record(&first, &other);
+        cases.push((
+            leak(format!("hello-ext-{tag}-then-other-443")),
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &same)]),
+        ));
+        cases.push((
+            leak(format!("hello-ext-{tag}-then-other-unnamed")),
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 40001, 40002, &same)]),
+        ));
+        cases.push((
+            leak(format!("hello-ext-{tag}-only-then-www-443")),
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &two_client_hellos_record(&empty_first, &hello),
+                )],
+            ),
+        ));
+        let mut leftover = first.clone();
+        leftover.push(0x00);
+        cases.push((
+            leak(format!("hello-ext-{tag}-leftover-00-then-0301")),
+            sequential_payloads(50000, 443, &[&leftover, &hello]),
+        ));
+        cases.push((
+            leak(format!("hello-ext-{tag}-next-payload-other")),
+            sequential_payloads(50000, 443, &[&first, &other]),
+        ));
+    }
+    cases
+}
+
+fn two_client_hellos_record(first: &[u8], second: &[u8]) -> Vec<u8> {
+    let mut body = first[5..].to_vec();
+    body.extend_from_slice(&second[5..]);
+    let mut rec = handshake_record(&body);
+    rec[1..3].copy_from_slice(&0x0301u16.to_be_bytes());
+    rec
 }
 
 fn split_client_hello() -> Vec<u8> {
