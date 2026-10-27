@@ -18,10 +18,13 @@ const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_SERVER_HELLO: u8 = 2;
 const EXT_SERVER_NAME: u16 = 0;
 const EXT_MAX_FRAGMENT_LENGTH: u16 = 1;
+const EXT_TRUSTED_CA_KEYS: u16 = 3;
 const EXT_STATUS_REQUEST: u16 = 5;
 const EXT_CERT_TYPE: u16 = 9;
 const EXT_EC_POINT_FORMATS: u16 = 11;
 const EXT_HEARTBEAT_MODE: u16 = 15;
+const EXT_ALPN: u16 = 16;
+const EXT_STATUS_REQUEST_V2: u16 = 17;
 const EXT_CLIENT_CERT_TYPE: u16 = 19;
 const EXT_SERVER_CERT_TYPE: u16 = 20;
 const EXT_TOKEN_BINDING: u16 = 24;
@@ -30,6 +33,7 @@ const EXT_RECORD_SIZE_LIMIT: u16 = 28;
 const EXT_EARLY_DATA: u16 = 42;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_TICKET_EARLY_DATA_INFO: u16 = 46;
+const EXT_OID_FILTERS: u16 = 48;
 const EXT_CONNECTION_ID_DEPRECATED: u16 = 53;
 const EXT_CONNECTION_ID: u16 = 54;
 const EXT_QUIC_TP_V1: u16 = 57;
@@ -938,8 +942,147 @@ fn hello_ext_handler_throws(typ: u16, ext_len: usize, data: usize, hello: &[u8])
         // Suite (2) then KeyShare group (2). `ssl_add_vector` for key_exchange
         // does not throw, so length 4–5 stays inside the hello tvb.
         EXT_ESNI => rem < 4,
+        EXT_ALPN => alpn_throws(hello, data, ext_len),
+        EXT_STATUS_REQUEST_V2 => status_request_v2_throws(hello, data, ext_len),
+        EXT_OID_FILTERS => oid_filters_throws(hello, data, ext_len),
+        EXT_TRUSTED_CA_KEYS => trusted_ca_keys_throws(hello, data, ext_len),
         _ => false,
     }
+}
+
+/// 2-byte `ssl_add_vector`: a short or truncated length is expert-info only.
+fn hello_u16_vec(hello: &[u8], data: usize, ext_len: usize) -> Option<(usize, usize)> {
+    if ext_len < 2 {
+        return None;
+    }
+    let len = u16::from_be_bytes([hello[data], hello[data + 1]]) as usize;
+    if ext_len - 2 < len {
+        return None;
+    }
+    Some((data + 2, data + 2 + len))
+}
+
+/// `ssl_dissect_hnd_hello_ext_alpn`: list then name `ssl_add_vector` (min is
+/// expert-info only). ClientHello ja4 then `tvb_get_uint8`s the name from
+/// the hello tvb, including a last name of length 0 at the hello end.
+fn alpn_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
+        return false;
+    };
+    while offset < end {
+        if end - offset < 1 {
+            return false;
+        }
+        let name_len = hello[offset] as usize;
+        offset += 1;
+        if end - offset < name_len {
+            return false;
+        }
+        if hello.len().saturating_sub(offset) < 1 {
+            return true;
+        }
+        if name_len > 0 && hello.len().saturating_sub(offset + name_len - 1) < 1 {
+            return true;
+        }
+        offset += name_len;
+        if name_len == 0 {
+            break;
+        }
+    }
+    false
+}
+
+/// `ssl_dissect_hnd_hello_ext_status_request_v2` then
+/// `ssl_dissect_hnd_hello_ext_status_request(..., has_length=true)`:
+/// `tvb_get_uint8` status type and a 2-byte request length from the hello tvb.
+fn status_request_v2_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
+        return false;
+    };
+    while offset < end {
+        if hello.len().saturating_sub(offset) < 1 {
+            return true;
+        }
+        offset += 1;
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        offset += 2;
+        if offset > end {
+            return false;
+        }
+    }
+    false
+}
+
+/// `ssl_dissect_hnd_hello_ext_oid_filters`: filter list then OID length
+/// `ssl_add_vector` (min is expert-info only). `dissect_ber_object_identifier_str`
+/// then reads identifier and length from the hello tvb.
+fn oid_filters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
+        return false;
+    };
+    while offset < end {
+        if end - offset < 1 {
+            return false;
+        }
+        let oid_len = hello[offset] as usize;
+        offset += 1;
+        if end - offset < oid_len {
+            return false;
+        }
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        offset += oid_len;
+        if end.saturating_sub(offset) < 2 {
+            return false;
+        }
+        let values_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        if end.saturating_sub(offset) < values_len {
+            return false;
+        }
+        offset += values_len;
+    }
+    false
+}
+
+/// `ssl_dissect_hnd_hello_ext_trusted_ca_keys`: list `ssl_add_vector` (no throw),
+/// then `tvb_get_uint8` identifier_type and, for SHA1 types 1 and 3, a 20-byte
+/// hash from the hello tvb.
+fn trusted_ca_keys_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
+        return false;
+    };
+    while offset < end {
+        if hello.len().saturating_sub(offset) < 1 {
+            return true;
+        }
+        let id = hello[offset];
+        offset += 1;
+        match id {
+            1 | 3 => {
+                if hello.len().saturating_sub(offset) < 20 {
+                    return true;
+                }
+                offset += 20;
+            }
+            2 => {
+                if end.saturating_sub(offset) < 2 {
+                    return false;
+                }
+                let name_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+                offset += 2;
+                if end.saturating_sub(offset) < name_len {
+                    return false;
+                }
+                offset += name_len;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `ssl_dissect_hnd_hello_ext_compress_certificate`: 1-byte `ssl_add_vector`
@@ -998,10 +1141,12 @@ fn quic_params_varint_throws(hello: &[u8], mut offset: usize, next_offset: usize
             return true;
         };
         offset += type_len;
-        let Some((parameter_length, len_len)) = hello.get(offset..).and_then(quic_varint) else {
+        let Some((plen, len_len)) = hello.get(offset..).and_then(quic_varint) else {
             return true;
         };
         offset += len_len;
+        // tshark 4.6.9: parameter_length = (uint32_t)parameter_length64
+        let parameter_length = plen as u32 as usize;
         if quic_param_throws(hello, offset, next_offset, parameter_type, parameter_length) {
             return true;
         }
@@ -2744,6 +2889,16 @@ mod tests {
             (EXT_ECH, &[]),
             (EXT_ECH, &[0x00]),
             (EXT_ECH, &[0x00, 0x00]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x00]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x01]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x02]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x03]),
+            (EXT_ALPN, &[0x00, 0x01, 0x00]),
+            (EXT_OID_FILTERS, &[0x00, 0x02, 0x01, 0x00]),
+            (EXT_OID_FILTERS, &[0x00, 0x01, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x01]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x03]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x02, 0x01, 0x00]),
         ];
         for &(typ, data) in throws {
             let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
@@ -2807,6 +2962,20 @@ mod tests {
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17]),
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x00]),
+            (EXT_ALPN, &[0x00, 0x00]),
+            (EXT_ALPN, &[0x00, 0x02, 0x01, 0x00]),
+            (EXT_OID_FILTERS, &[0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x00]),
+            (
+                EXT_QUIC_TP_V1,
+                &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                EXT_QUIC_TP,
+                &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
         ];
         for &(typ, data) in keep {
             let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
