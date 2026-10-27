@@ -994,15 +994,14 @@ fn quic_params_varint_throws(hello: &[u8], mut offset: usize, next_offset: usize
         if hello.len().saturating_sub(offset) < 2 {
             return true;
         }
-        let Some((_, type_len)) = quic_varint(hello, offset) else {
+        let Some((_, type_len)) = hello.get(offset..).and_then(quic_varint) else {
             return true;
         };
         offset += type_len;
-        let Some((plen, len_len)) = quic_varint(hello, offset) else {
+        let Some((parameter_length, len_len)) = hello.get(offset..).and_then(quic_varint) else {
             return true;
         };
         offset += len_len;
-        let parameter_length = plen as u32 as usize;
         if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
             return true;
         }
@@ -1034,25 +1033,6 @@ fn quic_params_legacy_throws(hello: &[u8], mut offset: usize, next_offset: usize
         offset += parameter_length;
     }
     false
-}
-
-/// QUIC varint: length is `1 << (first >> 6)` (1/2/4/8). None means the hello
-/// tvb read throws.
-fn quic_varint(hello: &[u8], offset: usize) -> Option<(u64, usize)> {
-    let rem = hello.len().saturating_sub(offset);
-    if rem == 0 {
-        return None;
-    }
-    let first = hello[offset];
-    let len = 1usize << (first >> 6);
-    if rem < len {
-        return None;
-    }
-    let mut value = 0u64;
-    for &b in &hello[offset..offset + len] {
-        value = (value << 8) | u64::from(b);
-    }
-    Some((value & ((1u64 << (len * 8 - 2)) - 1), len))
 }
 
 /// `ssl_dissect_hnd_hello_ext_ech` ClientHello: type, then outer cipher suite.
