@@ -157,6 +157,40 @@ pub fn client_hello(sni: Option<&str>) -> Vec<u8> {
     client_hello_host(sni.map(str::as_bytes), 0x0301)
 }
 
+pub fn client_hello_exts(sni: Option<&str>, extra: &[(u16, &[u8])]) -> Vec<u8> {
+    client_hello_exts_at(sni, extra, 0x0301)
+}
+
+pub fn client_hello_exts_at(sni: Option<&str>, extra: &[(u16, &[u8])], version: u16) -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0x11u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0, 2, 0x00, 0x2f]);
+    body.extend_from_slice(&[1, 0]);
+    let mut exts = Vec::new();
+    if let Some(host) = sni {
+        let host = host.as_bytes();
+        let entry_len = 1 + 2 + host.len();
+        let sni_data_len = 2 + entry_len;
+        exts.extend_from_slice(&[0, 0]);
+        exts.extend_from_slice(&(sni_data_len as u16).to_be_bytes());
+        exts.extend_from_slice(&(entry_len as u16).to_be_bytes());
+        exts.push(0);
+        exts.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        exts.extend_from_slice(host);
+    }
+    for &(typ, data) in extra {
+        exts.extend_from_slice(&typ.to_be_bytes());
+        exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        exts.extend_from_slice(data);
+    }
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+    let mut rec = handshake_record(&handshake(1, &body));
+    rec[1..3].copy_from_slice(&version.to_be_bytes());
+    rec
+}
+
 pub fn client_hello_host(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
     let mut body = vec![0x03, 0x03];
     body.extend_from_slice(&[0x11u8; 32]);

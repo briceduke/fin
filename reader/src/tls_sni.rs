@@ -17,9 +17,31 @@ const CONTENT_CCS: u8 = 0x14;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_SERVER_HELLO: u8 = 2;
 const EXT_SERVER_NAME: u16 = 0;
+const EXT_MAX_FRAGMENT_LENGTH: u16 = 1;
+const EXT_TRUSTED_CA_KEYS: u16 = 3;
+const EXT_STATUS_REQUEST: u16 = 5;
+const EXT_CERT_TYPE: u16 = 9;
+const EXT_EC_POINT_FORMATS: u16 = 11;
+const EXT_HEARTBEAT_MODE: u16 = 15;
+const EXT_ALPN: u16 = 16;
+const EXT_STATUS_REQUEST_V2: u16 = 17;
+const EXT_CLIENT_CERT_TYPE: u16 = 19;
+const EXT_SERVER_CERT_TYPE: u16 = 20;
+const EXT_TOKEN_BINDING: u16 = 24;
+const EXT_COMPRESS_CERTIFICATE: u16 = 27;
+const EXT_RECORD_SIZE_LIMIT: u16 = 28;
+const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_EARLY_DATA: u16 = 42;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_TICKET_EARLY_DATA_INFO: u16 = 46;
+const EXT_CERTIFICATE_AUTHORITIES: u16 = 47;
+const EXT_OID_FILTERS: u16 = 48;
+const EXT_CONNECTION_ID_DEPRECATED: u16 = 53;
+const EXT_CONNECTION_ID: u16 = 54;
+const EXT_QUIC_TP_V1: u16 = 57;
+const EXT_ECH: u16 = 65037;
+const EXT_QUIC_TP: u16 = 65445;
+const EXT_ESNI: u16 = 65486;
 const RECORD_HEADER: usize = 5;
 const TLS_MAX_RECORD: usize = 16384 + 2048;
 
@@ -65,6 +87,8 @@ pub struct TlsOutcome {
     pub after_ccs: bool,
     /// tshark `ssl_set_server(dst)` at entry of `SSL_HND_CLIENT_HELLO`.
     pub set_server: bool,
+    /// Last ClientHello extension whose throw fin cannot prove.
+    pub counted: Option<&'static str>,
 }
 
 /// Parse SNI from one TCP payload on an unnamed port. The first record must
@@ -102,17 +126,20 @@ pub fn parse_tls_after_ccs(
             session,
             after_ccs,
             set_server: false,
+            counted: None,
         };
     }
     let mut session = session;
     let mut after_ccs = after_ccs;
     let mut set_server = false;
+    let (kind, counted) = parse_records(payload, &mut session, &mut after_ccs, &mut set_server);
     TlsOutcome {
-        kind: parse_records(payload, &mut session, &mut after_ccs, &mut set_server),
+        kind,
         claimed: true,
         session,
         after_ccs,
         set_server,
+        counted,
     }
 }
 
@@ -121,14 +148,15 @@ fn parse_records(
     session: &mut TlsSession,
     after_ccs: &mut bool,
     set_server: &mut bool,
-) -> TlsParse {
+) -> (TlsParse, Option<&'static str>) {
     if payload.is_empty() {
-        return TlsParse::Other;
+        return (TlsParse::Other, None);
     }
     let mut offset = 0;
     let mut names = Vec::new();
     let mut saw_hello = false;
     let mut unproved = false;
+    let mut counted = None;
     // tshark only treats CCS as already seen when `pinfo->num > ccs_frame`.
     // A CCS in this payload arms later frames, not later records here.
     let mut armed = *after_ccs;
@@ -180,7 +208,7 @@ fn parse_records(
             } => {
                 apply_session_version(session, CONTENT_HANDSHAKE, version, Some(body));
                 let leftover = &payload[next..];
-                let (hello, threw, reset_ccs) = parse_handshake_messages(
+                let (hello, threw, reset_ccs, uncertain) = parse_handshake_messages(
                     body,
                     leftover,
                     session.tls_version(),
@@ -201,10 +229,14 @@ fn parse_records(
                         break;
                     }
                 }
-                if threw {
-                    // THROW(ReportedBoundsError) aborts dissect_ssl at that
-                    // handshake message. Later messages in this record and
-                    // later records in this payload are not walked.
+                if uncertain {
+                    counted = Some("tls-hello-ext-uncertain");
+                }
+                if threw || uncertain {
+                    // THROW aborts dissect_ssl. An uncertain last ClientHello
+                    // extension is not proved as a throw, so leftover still
+                    // desegments; later messages/records in this payload are
+                    // not printed.
                     break;
                 }
                 offset = next;
@@ -212,13 +244,14 @@ fn parse_records(
         }
     }
     *after_ccs = armed || saw_ccs;
-    if saw_hello {
+    let kind = if saw_hello {
         TlsParse::ClientHello(names)
     } else if unproved {
         TlsParse::Unproved
     } else {
         TlsParse::Other
-    }
+    };
+    (kind, counted)
 }
 
 /// True when the first bytes look like a TLS handshake record.
@@ -271,6 +304,14 @@ enum Hello {
     Names(Vec<String>),
     None,
     Unproved,
+}
+
+/// Exact hello-tvb throw, or a last extension whose throw fin cannot prove.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelloExtAction {
+    Continue,
+    Throw,
+    Uncertain,
 }
 
 fn take_record<'a>(payload: &'a [u8], offset: usize, session: &mut TlsSession) -> Record<'a> {
@@ -780,7 +821,7 @@ fn handshake_throws(body: &[u8], leftover: &[u8], version: u16) -> bool {
 fn message_throws(msg_type: u8, body: &[u8], parent: &[u8], leftover: &[u8], version: u16) -> bool {
     match msg_type {
         0 | 5 | 8 | 11 | 12 | 13 | 14 | 16 | 23 => false,
-        HANDSHAKE_CLIENT_HELLO => client_hello_throws(body),
+        HANDSHAKE_CLIENT_HELLO => client_hello_action(body) == HelloExtAction::Throw,
         HANDSHAKE_SERVER_HELLO => server_hello_throws(parent, leftover, version),
         4 => new_session_ticket_throws(parent, leftover, version),
         6 => hello_retry_throws(parent, leftover),
@@ -814,13 +855,453 @@ fn parent_u16(parent: &[u8], leftover: &[u8], offset: usize) -> u16 {
 }
 
 /// `ssl_dissect_hnd_cli_hello` subsets the message body, so leftover after the
-/// record cannot satisfy version/random/session_id.
-fn client_hello_throws(body: &[u8]) -> bool {
+/// record cannot satisfy version/random/session_id. `ssl_add_vector` does not
+/// throw; `proto_tree_add_item` / `tvb_get_*` on the hello tvb do.
+fn client_hello_action(body: &[u8]) -> HelloExtAction {
     if body.len() < 35 {
-        return true;
+        return HelloExtAction::Throw;
     }
     let sid_len = body[34] as usize;
-    body.len() < 35 + sid_len
+    if body.len() < 35 + sid_len {
+        return HelloExtAction::Throw;
+    }
+    client_hello_exts_action(body)
+}
+
+/// tshark 4.6.9 `ssl_dissect_hnd_extension` on a ClientHello tvb.
+fn client_hello_exts_action(body: &[u8]) -> HelloExtAction {
+    let Some((mut offset, ext_end)) = hello_ext_range(body) else {
+        return HelloExtAction::Continue;
+    };
+    while ext_end.saturating_sub(offset) >= 4 {
+        let typ = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let len = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
+        let next = match offset.checked_add(4).and_then(|data| data.checked_add(len)) {
+            Some(next) => next,
+            None => return HelloExtAction::Throw,
+        };
+        let is_last = ext_end.saturating_sub(next) < 4;
+        match hello_ext_action(body, offset, typ, len, is_last) {
+            HelloExtAction::Continue => {}
+            other => return other,
+        }
+        offset = next;
+    }
+    HelloExtAction::Continue
+}
+
+fn hello_ext_range(body: &[u8]) -> Option<(usize, usize)> {
+    if body.len() < 34 {
+        return None;
+    }
+    let mut offset = 34;
+    let sid_len = *body.get(offset)? as usize;
+    offset += 1;
+    offset = offset.checked_add(sid_len)?;
+    if offset + 2 > body.len() {
+        return None;
+    }
+    let cipher_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2;
+    offset = offset.checked_add(cipher_len)?;
+    let comp_len = *body.get(offset)? as usize;
+    offset += 1;
+    offset = offset.checked_add(comp_len)?;
+    if offset == body.len() {
+        return Some((offset, offset));
+    }
+    if offset + 2 > body.len() {
+        return None;
+    }
+    let ext_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2;
+    let ext_end = offset.checked_add(ext_len)?;
+    if ext_end > body.len() {
+        return None;
+    }
+    Some((offset, ext_end))
+}
+
+/// `proto_tree_add_none_format(..., 4 + ext_len)` then the type handler.
+fn hello_ext_throws(hello: &[u8], header: usize, typ: u16, len: usize) -> bool {
+    hello_ext_action(hello, header, typ, len, false) == HelloExtAction::Throw
+}
+
+fn hello_ext_action(
+    hello: &[u8],
+    header: usize,
+    typ: u16,
+    len: usize,
+    is_last: bool,
+) -> HelloExtAction {
+    let Some(data) = header.checked_add(4) else {
+        return HelloExtAction::Throw;
+    };
+    let Some(claimed) = data.checked_add(len) else {
+        return HelloExtAction::Throw;
+    };
+    if claimed > hello.len() {
+        return HelloExtAction::Throw;
+    }
+    hello_ext_handler_action(typ, len, data, hello, is_last)
+}
+
+/// Fixed-width hello-tvb reads in tshark 4.6.9 `ssl_dissect_hnd_extension`.
+/// Last ALPN / status_request_v2 / PSK / certificate_authorities / oid_filters
+/// and trusted_ca_keys x509_name are counted: those handlers walk BER, JA4,
+/// or OCSP in ways fin does not prove.
+fn hello_ext_handler_action(
+    typ: u16,
+    ext_len: usize,
+    data: usize,
+    hello: &[u8],
+    is_last: bool,
+) -> HelloExtAction {
+    if is_last
+        && matches!(
+            typ,
+            EXT_ALPN
+                | EXT_STATUS_REQUEST_V2
+                | EXT_PRE_SHARED_KEY
+                | EXT_CERTIFICATE_AUTHORITIES
+                | EXT_OID_FILTERS
+        )
+    {
+        return HelloExtAction::Uncertain;
+    }
+    let rem = hello.len().saturating_sub(data);
+    match typ {
+        EXT_MAX_FRAGMENT_LENGTH
+        | EXT_STATUS_REQUEST
+        | EXT_CERT_TYPE
+        | EXT_HEARTBEAT_MODE
+        | EXT_CLIENT_CERT_TYPE
+        | EXT_SERVER_CERT_TYPE => {
+            if rem < 1 {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        EXT_EC_POINT_FORMATS => {
+            if rem < 1 || rem < 1 + hello[data] as usize {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        EXT_TOKEN_BINDING | EXT_RECORD_SIZE_LIMIT => {
+            if rem < 2 {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        EXT_CONNECTION_ID_DEPRECATED | EXT_CONNECTION_ID => {
+            if rem < 1 {
+                HelloExtAction::Throw
+            } else {
+                let cidl = hello[data] as usize;
+                if cidl > 0 && rem < 1 + cidl {
+                    HelloExtAction::Throw
+                } else {
+                    HelloExtAction::Continue
+                }
+            }
+        }
+        EXT_COMPRESS_CERTIFICATE => {
+            if compress_certificate_throws(hello, data, ext_len) {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        EXT_QUIC_TP_V1 | EXT_QUIC_TP => {
+            if quic_transport_parameters_throws(hello, data, ext_len) {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        EXT_ECH => {
+            if ech_client_hello_throws(hello, data) {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        // Suite (2) then KeyShare group (2). `ssl_add_vector` for key_exchange
+        // does not throw, so length 4–5 stays inside the hello tvb.
+        EXT_ESNI => {
+            if rem < 4 {
+                HelloExtAction::Throw
+            } else {
+                HelloExtAction::Continue
+            }
+        }
+        EXT_TRUSTED_CA_KEYS => trusted_ca_keys_action(hello, data, ext_len, is_last),
+        _ => HelloExtAction::Continue,
+    }
+}
+
+/// `ssl_dissect_hnd_hello_ext_trusted_ca_keys`: list `ssl_add_vector` (no throw),
+/// then `tvb_get_uint8` identifier_type and, for SHA1 types 1 and 3, a 20-byte
+/// hash from the hello tvb. Type `x509_name` (2) walks DistinguishedName BER;
+/// a last extension that contains it is counted instead of parsed.
+fn trusted_ca_keys_action(
+    hello: &[u8],
+    data: usize,
+    ext_len: usize,
+    is_last: bool,
+) -> HelloExtAction {
+    if ext_len < 2 {
+        return HelloExtAction::Continue;
+    }
+    let list_len = u16::from_be_bytes([hello[data], hello[data + 1]]) as usize;
+    if ext_len - 2 < list_len {
+        return HelloExtAction::Continue;
+    }
+    let end = data + 2 + list_len;
+    let mut offset = data + 2;
+    while offset < end {
+        if hello.len().saturating_sub(offset) < 1 {
+            return HelloExtAction::Throw;
+        }
+        let id = hello[offset];
+        offset += 1;
+        match id {
+            1 | 3 => {
+                if hello.len().saturating_sub(offset) < 20 {
+                    return HelloExtAction::Throw;
+                }
+                offset += 20;
+            }
+            2 => {
+                if is_last {
+                    return HelloExtAction::Uncertain;
+                }
+                if end.saturating_sub(offset) < 2 {
+                    return HelloExtAction::Continue;
+                }
+                let name_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+                offset += 2;
+                if end.saturating_sub(offset) < name_len {
+                    return HelloExtAction::Continue;
+                }
+                offset += name_len;
+            }
+            _ => {}
+        }
+    }
+    HelloExtAction::Continue
+}
+
+/// `ssl_dissect_hnd_hello_ext_compress_certificate`: 1-byte `ssl_add_vector`
+/// does not throw, then 2-byte algorithm IDs from the hello tvb.
+fn compress_certificate_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    if ext_len < 1 {
+        return false;
+    }
+    let Some(&alg_len) = hello.get(data) else {
+        return false;
+    };
+    let alg_len = alg_len as usize;
+    if ext_len - 1 < alg_len {
+        return false;
+    }
+    let mut offset = data + 1;
+    let next_offset = offset + alg_len;
+    while offset < next_offset {
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        offset += 2;
+    }
+    false
+}
+
+/// `ssl_dissect_hnd_hello_ext_quic_transport_parameters`.
+fn quic_transport_parameters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    if quic_draft26(hello, data, ext_len) {
+        let list_len = u16::from_be_bytes([hello[data], hello[data + 1]]) as usize;
+        if ext_len < 2 || ext_len - 2 < list_len {
+            return false;
+        }
+        return quic_params_legacy_throws(hello, data + 2, data + 2 + list_len);
+    }
+    quic_params_varint_throws(hello, data, data + ext_len)
+}
+
+/// Draft -26 or older: 2-byte list length, then 2-byte type/length params.
+fn quic_draft26(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    if ext_len < 6 {
+        return false;
+    }
+    let list_len = u16::from_be_bytes([hello[data], hello[data + 1]]) as usize;
+    let first_val = u16::from_be_bytes([hello[data + 4], hello[data + 5]]) as usize;
+    2 + list_len == ext_len && 6 + first_val <= ext_len
+}
+
+fn quic_params_varint_throws(hello: &[u8], mut offset: usize, next_offset: usize) -> bool {
+    while offset < next_offset {
+        // `proto_tree_add_subtree(..., 2)` then type/length `ENC_VARINT_QUIC`.
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        let Some((parameter_type, type_len)) = hello.get(offset..).and_then(quic_varint) else {
+            return true;
+        };
+        offset += type_len;
+        let Some((plen, len_len)) = hello.get(offset..).and_then(quic_varint) else {
+            return true;
+        };
+        offset += len_len;
+        // tshark 4.6.9: parameter_length = (uint32_t)parameter_length64
+        let parameter_length = plen as u32 as usize;
+        if quic_param_throws(hello, offset, next_offset, parameter_type, parameter_length) {
+            return true;
+        }
+        match offset.checked_add(parameter_length) {
+            Some(end) => offset = end,
+            None => return true,
+        }
+    }
+    false
+}
+
+fn quic_params_legacy_throws(hello: &[u8], mut offset: usize, next_offset: usize) -> bool {
+    while offset < next_offset {
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        let parameter_type = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        if next_offset.saturating_sub(offset) < 2 {
+            return false;
+        }
+        let parameter_length = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        if next_offset.saturating_sub(offset) < parameter_length {
+            return false;
+        }
+        if quic_param_throws(hello, offset, next_offset, parameter_type, parameter_length) {
+            return true;
+        }
+        offset += parameter_length;
+    }
+    false
+}
+
+/// tshark 4.6.9 `ssl_dissect_hnd_hello_ext_quic_transport_parameters` switch:
+/// `proto_tree_add_item` / `ENC_VARINT_QUIC` from the hello tvb, including
+/// when `parameter_length` is 0. `ssl_add_vector` does not throw.
+fn quic_param_throws(
+    hello: &[u8],
+    offset: usize,
+    ext_end: usize,
+    parameter_type: usize,
+    parameter_length: usize,
+) -> bool {
+    if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
+        return true;
+    }
+    match parameter_type {
+        0x02 => hello.len().saturating_sub(offset) < 16,
+        0x0d => quic_preferred_address_throws(hello, offset, ext_end),
+        0x11 | 0xff73db => quic_version_information_throws(hello, offset, parameter_length),
+        0x1000 => quic_two_varints_throw(hello, offset),
+        0x4751 | 0x4752 => hello.len().saturating_sub(offset) < 4,
+        0x01 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0e | 0x20
+        | 0x1057 | 0x3127 | 0x7158 | 0xde1a | 0xff00 | 0xff03de1a | 0xff04de1a | 0xff04de1b
+        | 0x9f81a176 | 0x0f739bbc1b666d04 | 0x0f739bbc1b666d07 | 0x0f739bbc1b666d09
+        | 0x0f739bbc1b666d11 | 0x0f739bbc1b666d0c | 0x0f739bbc1b666d0d => {
+            hello.get(offset..).and_then(quic_varint).is_none()
+        }
+        _ => false,
+    }
+}
+
+fn quic_two_varints_throw(hello: &[u8], offset: usize) -> bool {
+    let Some((_, n)) = hello.get(offset..).and_then(quic_varint) else {
+        return true;
+    };
+    match offset.checked_add(n) {
+        Some(next) => hello.get(next..).and_then(quic_varint).is_none(),
+        None => true,
+    }
+}
+
+fn quic_version_information_throws(
+    hello: &[u8],
+    mut offset: usize,
+    parameter_length: usize,
+) -> bool {
+    if hello.len().saturating_sub(offset) < 4 {
+        return true;
+    }
+    offset += 4;
+    let mut consumed = 4;
+    while consumed < parameter_length {
+        if hello.len().saturating_sub(offset) < 4 {
+            return true;
+        }
+        offset += 4;
+        consumed += 4;
+    }
+    false
+}
+
+/// IPv4 (4) + port (2) + IPv6 (16) + port (2), then `ssl_add_vector` CID
+/// (no throw), then a 16-byte reset token from the hello tvb.
+fn quic_preferred_address_throws(hello: &[u8], mut offset: usize, ext_end: usize) -> bool {
+    if hello.len().saturating_sub(offset) < 24 {
+        return true;
+    }
+    offset += 24;
+    if offset > ext_end || ext_end - offset < 1 {
+        return false;
+    }
+    let cid_len = hello[offset] as usize;
+    offset += 1;
+    if ext_end.saturating_sub(offset) < cid_len {
+        return false;
+    }
+    offset += cid_len;
+    hello.len().saturating_sub(offset) < 16
+}
+
+/// `ssl_dissect_hnd_hello_ext_ech` ClientHello: type, then outer cipher suite.
+fn ech_client_hello_throws(hello: &[u8], data: usize) -> bool {
+    if hello.len().saturating_sub(data) < 1 {
+        return true;
+    }
+    if hello[data] != 0 {
+        return false;
+    }
+    let mut offset = data + 1;
+    if hello.len().saturating_sub(offset) < 4 {
+        return true;
+    }
+    offset += 4;
+    if hello.len().saturating_sub(offset) < 1 {
+        return true;
+    }
+    offset += 1;
+    if hello.len().saturating_sub(offset) < 2 {
+        return true;
+    }
+    let enc_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+    offset += 2;
+    if hello.len().saturating_sub(offset) < enc_len {
+        return true;
+    }
+    offset += enc_len;
+    if hello.len().saturating_sub(offset) < 2 {
+        return true;
+    }
+    let payload_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+    offset += 2;
+    hello.len().saturating_sub(offset) < payload_len
 }
 
 /// `ssl_dissect_hnd_srv_hello` then `ssl_dissect_hnd_hello_common`.
@@ -987,15 +1468,15 @@ fn parse_handshake_messages(
     version: u16,
     after_ccs: bool,
     set_server: &mut bool,
-) -> (Hello, bool, bool) {
+) -> (Hello, bool, bool, bool) {
     if body.is_empty() {
-        return (Hello::Unproved, false, false);
+        return (Hello::Unproved, false, false, false);
     }
     let encrypted = is_encrypted_handshake_message(body, after_ccs);
     if encrypted.hides() {
         // dissect_tls_handshake treats the rest of this record as Encrypted
         // Handshake Message. Later ClientHellos in this record are not printed.
-        return (Hello::None, false, false);
+        return (Hello::None, false, false, false);
     }
     let reset_ccs = encrypted == EncryptedCheck::ResetCcs;
     let mut offset = 0;
@@ -1003,14 +1484,14 @@ fn parse_handshake_messages(
     let mut saw_hello = false;
     while offset < body.len() {
         if body.len() - offset < 4 {
-            return (Hello::Unproved, false, reset_ccs);
+            return (Hello::Unproved, false, reset_ccs, false);
         }
         let msg_type = body[offset];
         let msg_len = u24(&body[offset + 1..offset + 4]);
         let start = offset + 4;
         let end = start.saturating_add(msg_len);
         if end > body.len() {
-            return (Hello::Unproved, false, reset_ccs);
+            return (Hello::Unproved, false, reset_ccs, false);
         }
         if msg_type == HANDSHAKE_CLIENT_HELLO {
             // tshark 4.6.9 calls ssl_set_server at the start of the
@@ -1021,19 +1502,29 @@ fn parse_handshake_messages(
                     saw_hello = true;
                     names.extend(found);
                 }
-                None => return (Hello::Unproved, false, reset_ccs),
+                None => return (Hello::Unproved, false, reset_ccs, false),
             }
         }
         let msg_body = &body[start..end];
         let parent = &body[start..];
-        if message_throws(msg_type, msg_body, parent, leftover, version) {
+        if msg_type == HANDSHAKE_CLIENT_HELLO {
+            match client_hello_action(msg_body) {
+                HelloExtAction::Throw => {
+                    return (hello_names(saw_hello, names), true, reset_ccs, false);
+                }
+                HelloExtAction::Uncertain => {
+                    return (hello_names(saw_hello, names), false, reset_ccs, true);
+                }
+                HelloExtAction::Continue => {}
+            }
+        } else if message_throws(msg_type, msg_body, parent, leftover, version) {
             // THROW(ReportedBoundsError) aborts dissect_ssl at this message.
             // Later handshake messages in this record are not walked.
-            return (hello_names(saw_hello, names), true, reset_ccs);
+            return (hello_names(saw_hello, names), true, reset_ccs, false);
         }
         offset = end;
     }
-    (hello_names(saw_hello, names), false, reset_ccs)
+    (hello_names(saw_hello, names), false, reset_ccs, false)
 }
 
 fn hello_names(saw_hello: bool, names: Vec<String>) -> Hello {
@@ -1048,50 +1539,28 @@ fn parse_client_hello(body: &[u8]) -> Option<Vec<String>> {
     if body.len() < 34 {
         return None;
     }
-    let mut offset = 34;
-    let sid_len = *body.get(offset)? as usize;
-    offset += 1;
-    offset = offset.checked_add(sid_len)?;
-    if offset + 2 > body.len() {
-        return None;
-    }
-    let cipher_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
-    offset += 2;
-    offset = offset.checked_add(cipher_len)?;
-    let comp_len = *body.get(offset)? as usize;
-    offset += 1;
-    offset = offset.checked_add(comp_len)?;
-    if offset == body.len() {
-        return Some(Vec::new());
-    }
-    if offset + 2 > body.len() {
-        return None;
-    }
-    let ext_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
-    offset += 2;
-    let ext_end = offset.checked_add(ext_len)?;
-    if ext_end > body.len() {
-        return None;
-    }
-    parse_extensions(&body[offset..ext_end])
+    let (offset, ext_end) = hello_ext_range(body)?;
+    parse_extensions(body, offset, ext_end)
 }
 
-fn parse_extensions(exts: &[u8]) -> Option<Vec<String>> {
-    let mut offset = 0;
+fn parse_extensions(hello: &[u8], mut offset: usize, ext_end: usize) -> Option<Vec<String>> {
     let mut names = Vec::new();
-    while offset < exts.len() {
-        if offset + 4 > exts.len() {
+    while offset < ext_end {
+        if offset + 4 > ext_end {
             return None;
         }
-        let typ = u16::from_be_bytes([exts[offset], exts[offset + 1]]);
-        let len = u16::from_be_bytes([exts[offset + 2], exts[offset + 3]]) as usize;
+        let typ = u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+        let len = u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+        if hello_ext_throws(hello, offset, typ, len) {
+            return Some(names);
+        }
         offset += 4;
         let end = offset.checked_add(len)?;
-        if end > exts.len() {
+        if end > ext_end {
             return None;
         }
         if typ == EXT_SERVER_NAME {
-            names.extend(parse_server_name(&exts[offset..end])?);
+            names.extend(parse_server_name(&hello[offset..end])?);
         }
         offset = end;
     }
@@ -1245,6 +1714,43 @@ mod tests {
 
     fn client_hello(sni: Option<&str>) -> Vec<u8> {
         client_hello_bytes(sni.map(str::as_bytes), 0x0301)
+    }
+
+    fn client_hello_exts(sni: Option<&str>, extra: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0, 2, 0x00, 0x2f, 1, 0]);
+        let mut exts = Vec::new();
+        if let Some(host) = sni {
+            let host = host.as_bytes();
+            let entry_len = 1 + 2 + host.len();
+            let sni_data_len = 2 + entry_len;
+            exts.extend_from_slice(&EXT_SERVER_NAME.to_be_bytes());
+            exts.extend_from_slice(&(sni_data_len as u16).to_be_bytes());
+            exts.extend_from_slice(&(entry_len as u16).to_be_bytes());
+            exts.push(0);
+            exts.extend_from_slice(&(host.len() as u16).to_be_bytes());
+            exts.extend_from_slice(host);
+        }
+        for &(typ, data) in extra {
+            exts.extend_from_slice(&typ.to_be_bytes());
+            exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            exts.extend_from_slice(data);
+        }
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        record(
+            CONTENT_HANDSHAKE,
+            0x0301,
+            &handshake(HANDSHAKE_CLIENT_HELLO, &body),
+        )
+    }
+
+    fn two_hellos_same_record(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut body = first[RECORD_HEADER..].to_vec();
+        body.extend_from_slice(&second[RECORD_HEADER..]);
+        record(CONTENT_HANDSHAKE, 0x0301, &body)
     }
 
     fn client_hello_bytes(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
@@ -2337,6 +2843,381 @@ mod tests {
             parse_tcp_tls_on_tls_port(&empty_then_record),
             TlsParse::Other,
             "empty CertificateURL then CH as a second record"
+        );
+    }
+
+    #[test]
+    fn throwing_last_hello_ext_aborts_later_hellos_and_leftover() {
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let other = client_hello(Some("other.example"));
+        let hello = client_hello(Some("www.example.com"));
+        let throws: &[(u16, &[u8])] = &[
+            (EXT_MAX_FRAGMENT_LENGTH, &[]),
+            (EXT_STATUS_REQUEST, &[]),
+            (EXT_CERT_TYPE, &[]),
+            (EXT_EC_POINT_FORMATS, &[]),
+            (EXT_HEARTBEAT_MODE, &[]),
+            (EXT_CLIENT_CERT_TYPE, &[]),
+            (EXT_SERVER_CERT_TYPE, &[]),
+            (EXT_TOKEN_BINDING, &[]),
+            (EXT_TOKEN_BINDING, &[0x00]),
+            (EXT_RECORD_SIZE_LIMIT, &[]),
+            (EXT_RECORD_SIZE_LIMIT, &[0x00]),
+            (EXT_CONNECTION_ID_DEPRECATED, &[]),
+            (EXT_CONNECTION_ID, &[]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x01, 0x00]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x03, 0x00, 0x00, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x00]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x40]),
+            (EXT_QUIC_TP_V1, &[0x40, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x80, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x01]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x00, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x01, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (EXT_QUIC_TP_V1, &[0x0d, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x03, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x04, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x05, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x06, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x07, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x08, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x09, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x0a, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x0b, 0x00]),
+            (EXT_QUIC_TP, &[0x00]),
+            (EXT_QUIC_TP, &[0x00, 0x40]),
+            (EXT_QUIC_TP, &[0x40, 0x00]),
+            (EXT_QUIC_TP, &[0x80, 0x00]),
+            (EXT_QUIC_TP, &[0x00, 0x01]),
+            (EXT_QUIC_TP, &[0x00, 0x00, 0x00]),
+            (EXT_QUIC_TP, &[0x01, 0x00]),
+            (EXT_QUIC_TP, &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (EXT_QUIC_TP, &[0x0d, 0x00]),
+            (EXT_QUIC_TP, &[0x03, 0x00]),
+            (EXT_QUIC_TP, &[0x04, 0x00]),
+            (EXT_QUIC_TP, &[0x05, 0x00]),
+            (EXT_QUIC_TP, &[0x06, 0x00]),
+            (EXT_QUIC_TP, &[0x07, 0x00]),
+            (EXT_QUIC_TP, &[0x08, 0x00]),
+            (EXT_QUIC_TP, &[0x09, 0x00]),
+            (EXT_QUIC_TP, &[0x0a, 0x00]),
+            (EXT_QUIC_TP, &[0x0b, 0x00]),
+            (EXT_ESNI, &[]),
+            (EXT_ESNI, &[0x00]),
+            (EXT_ESNI, &[0x00, 0x00]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00]),
+            (EXT_ECH, &[]),
+            (EXT_ECH, &[0x00]),
+            (EXT_ECH, &[0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x01]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x03]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x02, 0x01, 0x00]),
+        ];
+        for &(typ, data) in throws {
+            let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_same_record(&first, &other);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                named.clone(),
+                "type {typ} len {} then other same record",
+                data.len()
+            );
+            assert_eq!(
+                parse_tcp_tls(&same),
+                named.clone(),
+                "unnamed type {typ} len {} then other",
+                data.len()
+            );
+            let empty_first = client_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_same_record(&empty_first, &hello);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&empty_then),
+                TlsParse::ClientHello(Vec::new()),
+                "type {typ} len {} only then www.example.com",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            assert_eq!(
+                truncated_handshake_prefix(&leftover, TlsSession::Unknown),
+                None,
+                "type {typ} len {} leftover 00",
+                data.len()
+            );
+            assert_eq!(
+                stitch_leftover(&leftover, &hello),
+                named.clone(),
+                "type {typ} len {} leftover 00 then 0x0301",
+                data.len()
+            );
+            assert_eq!(
+                stitch_leftover(&first, &other),
+                TlsParse::ClientHello(vec!["other.example".to_string()]),
+                "type {typ} len {} next payload no leftover",
+                data.len()
+            );
+            assert_eq!(
+                parse_tls(&same, TlsSession::Unknown, false).counted,
+                None,
+                "type {typ} len {} exact throw is not counted",
+                data.len()
+            );
+        }
+        let both = TlsParse::ClientHello(vec![
+            "www.example.com".to_string(),
+            "other.example".to_string(),
+        ]);
+        let keep: &[(u16, &[u8])] = &[
+            (EXT_HEARTBEAT_MODE, &[0x01]),
+            (EXT_COMPRESS_CERTIFICATE, &[]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x00]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x02, 0x00, 0x01]),
+            (EXT_QUIC_TP_V1, &[]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x0c, 0x00]),
+            (EXT_QUIC_TP, &[]),
+            (EXT_QUIC_TP, &[0x00, 0x00]),
+            (EXT_QUIC_TP, &[0x0c, 0x00]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x00]),
+            (
+                EXT_QUIC_TP_V1,
+                &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                EXT_QUIC_TP,
+                &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+        for &(typ, data) in keep {
+            let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_same_record(&first, &other);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                both.clone(),
+                "keep type {typ} len {} then other same record",
+                data.len()
+            );
+            assert_eq!(
+                parse_tcp_tls(&same),
+                both.clone(),
+                "unnamed keep type {typ} len {} then other",
+                data.len()
+            );
+            let empty_first = client_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_same_record(&empty_first, &hello);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&empty_then),
+                named.clone(),
+                "keep type {typ} len {} only then www.example.com",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            assert!(
+                truncated_handshake_prefix(&leftover, TlsSession::Unknown).is_some(),
+                "keep type {typ} len {} leftover 00 desegments",
+                data.len()
+            );
+            assert_eq!(
+                stitch_leftover(&leftover, &hello),
+                TlsParse::Other,
+                "keep type {typ} len {} leftover 00 then 0x0301 is continuation",
+                data.len()
+            );
+            assert_eq!(
+                parse_tls(&same, TlsSession::Unknown, false).counted,
+                None,
+                "keep type {typ} len {} is not counted",
+                data.len()
+            );
+        }
+        let uncertain: &[(u16, &[u8])] = &[
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x00]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x01]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x02]),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x03]),
+            (
+                EXT_STATUS_REQUEST_V2,
+                &[
+                    0x00, 0x15, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (EXT_STATUS_REQUEST_V2, &[0x00, 0x00]),
+            (
+                EXT_STATUS_REQUEST_V2,
+                &[0x00, 0x05, 0x01, 0x00, 0x02, 0x00, 0x00],
+            ),
+            (EXT_ALPN, &[0x00, 0x01, 0x00]),
+            (EXT_ALPN, &[0x00, 0x00]),
+            (EXT_ALPN, &[0x00, 0x02, 0x01, 0x00]),
+            (EXT_ALPN, &[0x00, 0x03, 0x01, 0x00, 0x00]),
+            (EXT_ALPN, &[0x00, 0x03, 0x01, 0x68, 0x00]),
+            (EXT_OID_FILTERS, &[0x00, 0x02, 0x01, 0x00]),
+            (EXT_OID_FILTERS, &[0x00, 0x01, 0x00]),
+            (EXT_OID_FILTERS, &[0x00, 0x00]),
+            (
+                EXT_OID_FILTERS,
+                &[0x00, 0x06, 0x02, 0x06, 0x00, 0x00, 0x01, 0x00],
+            ),
+            (
+                EXT_OID_FILTERS,
+                &[0x00, 0x07, 0x02, 0x06, 0x00, 0x00, 0x02, 0x00, 0x00],
+            ),
+            (EXT_OID_FILTERS, &[0x00, 0x03, 0x02, 0x06, 0x05]),
+            (EXT_OID_FILTERS, &[0x00, 0x04, 0x03, 0x06, 0x81, 0x05]),
+            (EXT_OID_FILTERS, &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x03, 0x02, 0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x04, 0x02, 0x00, 0x01, 0x00]),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x05],
+            ),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x06, 0x02, 0x00, 0x03, 0x30, 0x81, 0x05],
+            ),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x00],
+            ),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x07, 0x02, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
+            ),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x02, 0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x03, 0x00, 0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x04, 0x00, 0x00, 0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x01, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x02, 0x00, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x03, 0x00, 0x00, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x03, 0x00, 0x01, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x00]),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
+            ),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x05, 0x00, 0x03, 0x30, 0x81, 0x05],
+            ),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00],
+            ),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
+            ),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x05, 0x00, 0x03, 0x1f, 0x00, 0x05],
+            ),
+        ];
+        for &(typ, data) in uncertain {
+            let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_same_record(&first, &other);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                named.clone(),
+                "uncertain type {typ} len {} then other same record",
+                data.len()
+            );
+            assert_eq!(
+                parse_tls(&same, TlsSession::Unknown, false).counted,
+                Some("tls-hello-ext-uncertain"),
+                "uncertain type {typ} len {} is counted",
+                data.len()
+            );
+            assert_eq!(
+                parse_tcp_tls(&same),
+                named.clone(),
+                "unnamed uncertain type {typ} len {} then other",
+                data.len()
+            );
+            let empty_first = client_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_same_record(&empty_first, &hello);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&empty_then),
+                TlsParse::ClientHello(Vec::new()),
+                "uncertain type {typ} len {} only then www.example.com",
+                data.len()
+            );
+            assert_eq!(
+                parse_tls(&empty_then, TlsSession::Unknown, false).counted,
+                Some("tls-hello-ext-uncertain"),
+                "uncertain type {typ} len {} empty-first is counted",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            assert!(
+                truncated_handshake_prefix(&leftover, TlsSession::Unknown).is_some(),
+                "uncertain type {typ} len {} leftover 00 desegments",
+                data.len()
+            );
+            assert_eq!(
+                stitch_leftover(&leftover, &hello),
+                TlsParse::Other,
+                "uncertain type {typ} len {} leftover 00 then 0x0301 is continuation",
+                data.len()
+            );
+            assert_eq!(
+                stitch_leftover(&first, &other),
+                TlsParse::ClientHello(vec!["other.example".to_string()]),
+                "uncertain type {typ} len {} next payload no leftover",
+                data.len()
+            );
+        }
+        let host = b"www.example.com";
+        let entry_len = 1 + 2 + host.len();
+        let mut sni_data = Vec::from((entry_len as u16).to_be_bytes());
+        sni_data.push(0);
+        sni_data.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        sni_data.extend_from_slice(host);
+        let before = client_hello_exts(
+            None,
+            &[(EXT_MAX_FRAGMENT_LENGTH, &[]), (EXT_SERVER_NAME, &sni_data)],
+        );
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&before),
+            named.clone(),
+            "type 1 length 0 is not last: the 1-byte read is inside the hello tvb"
+        );
+        let grease_last = client_hello_exts(Some("www.example.com"), &[(0x0a0a, &[])]);
+        let grease_same = two_hellos_same_record(&grease_last, &other);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&grease_same),
+            both.clone(),
+            "last GREASE extension is default-arm, not counted"
+        );
+        assert_eq!(
+            parse_tls(&grease_same, TlsSession::Unknown, false).counted,
+            None,
+            "last GREASE extension is default-arm, not counted"
+        );
+        let alpn_then_esni = client_hello_exts(
+            Some("www.example.com"),
+            &[
+                (EXT_ALPN, &[0x00, 0x00]),
+                (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
+            ],
+        );
+        let alpn_middle = two_hellos_same_record(&alpn_then_esni, &other);
+        assert_eq!(
+            parse_tcp_tls_on_tls_port(&alpn_middle),
+            both,
+            "middle ALPN is not last, later hello stays"
+        );
+        assert_eq!(
+            parse_tls(&alpn_middle, TlsSession::Unknown, false).counted,
+            None,
+            "middle ALPN is not last, not counted"
         );
     }
 

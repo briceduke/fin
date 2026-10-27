@@ -72,6 +72,44 @@ fn stdin_matches_the_file_path() {
 }
 
 #[test]
+fn uncertain_last_hello_ext_counts_tls_hello_ext_uncertain() {
+    let fin = fin_bin();
+    let other = client_hello(Some("other.example"));
+    let first = client_hello_exts(
+        Some("www.example.com"),
+        &[(47, &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05])],
+    );
+    let same = two_client_hellos_record(&first, &other);
+    let path = work_dir().join("hello-ext-uncertain-reason.pcap");
+    fs::write(
+        &path,
+        pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &same)]),
+    )
+    .unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("www.example.com"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("other.example"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 1 tls-hello-ext-uncertain"),
+        "stderr={stderr:?}"
+    );
+    assert!(!output.status.success(), "exit={:?}", output.status.code());
+}
+
+#[test]
 fn combined_ip_src_and_sni_matches_tshark_469() {
     let Some((tshark, fin)) = tools() else {
         return;
@@ -217,6 +255,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .into_iter()
     .chain(record_version_cases())
     .chain(review_cases())
+    .chain(hello_ext_throw_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -242,6 +281,267 @@ fn record_version_cases() -> Vec<(&'static str, Vec<u8>)> {
         )
     })
     .collect()
+}
+
+fn hello_ext_throw_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let other = client_hello(Some("other.example"));
+    let hello = client_hello(Some("www.example.com"));
+    let throws: &[(&str, u16, &[u8])] = &[
+        ("maxfrag-0", 1, &[]),
+        ("maxfrag-1", 1, &[0x01]),
+        ("status-0", 5, &[]),
+        ("certtype-0", 9, &[]),
+        ("ecpf-0", 11, &[]),
+        ("heartbeat-0", 15, &[]),
+        ("heartbeat-1", 15, &[0x01]),
+        ("client-cert-0", 19, &[]),
+        ("server-cert-0", 20, &[]),
+        ("tokenbind-0", 24, &[]),
+        ("tokenbind-1", 24, &[0x00]),
+        ("rsl-0", 28, &[]),
+        ("rsl-1", 28, &[0x00]),
+        ("cid-dep-0", 53, &[]),
+        ("cid-0", 54, &[]),
+        ("compress-cert-odd-2", 27, &[0x01, 0x00]),
+        ("compress-cert-odd-4", 27, &[0x03, 0x00, 0x00, 0x00]),
+        ("compress-cert-0", 27, &[]),
+        ("compress-cert-1", 27, &[0x00]),
+        ("compress-cert-even", 27, &[0x02, 0x00, 0x01]),
+        ("quic-tp-v1-0", 57, &[]),
+        ("quic-tp-v1-1", 57, &[0x00]),
+        ("quic-tp-v1-00-40", 57, &[0x00, 0x40]),
+        ("quic-tp-v1-40-00", 57, &[0x40, 0x00]),
+        ("quic-tp-v1-80-00", 57, &[0x80, 0x00]),
+        ("quic-tp-v1-00-01", 57, &[0x00, 0x01]),
+        ("quic-tp-v1-len3", 57, &[0x00, 0x00, 0x00]),
+        ("quic-tp-v1-00-00", 57, &[0x00, 0x00]),
+        ("quic-tp-v1-idle-0", 57, &[0x01, 0x00]),
+        (
+            "quic-tp-v1-reset-8",
+            57,
+            &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        ("quic-tp-v1-prefaddr-0", 57, &[0x0d, 0x00]),
+        ("quic-tp-v1-03-0", 57, &[0x03, 0x00]),
+        ("quic-tp-v1-04-0", 57, &[0x04, 0x00]),
+        ("quic-tp-v1-05-0", 57, &[0x05, 0x00]),
+        ("quic-tp-v1-06-0", 57, &[0x06, 0x00]),
+        ("quic-tp-v1-07-0", 57, &[0x07, 0x00]),
+        ("quic-tp-v1-08-0", 57, &[0x08, 0x00]),
+        ("quic-tp-v1-09-0", 57, &[0x09, 0x00]),
+        ("quic-tp-v1-0a-0", 57, &[0x0a, 0x00]),
+        ("quic-tp-v1-0b-0", 57, &[0x0b, 0x00]),
+        ("quic-tp-v1-migr-0", 57, &[0x0c, 0x00]),
+        ("quic-tp-old-0", 65445, &[]),
+        ("quic-tp-old-1", 65445, &[0x00]),
+        ("quic-tp-old-00-40", 65445, &[0x00, 0x40]),
+        ("quic-tp-old-40-00", 65445, &[0x40, 0x00]),
+        ("quic-tp-old-80-00", 65445, &[0x80, 0x00]),
+        ("quic-tp-old-00-01", 65445, &[0x00, 0x01]),
+        ("quic-tp-old-len3", 65445, &[0x00, 0x00, 0x00]),
+        ("quic-tp-old-00-00", 65445, &[0x00, 0x00]),
+        ("quic-tp-old-idle-0", 65445, &[0x01, 0x00]),
+        (
+            "quic-tp-old-reset-8",
+            65445,
+            &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        ("quic-tp-old-prefaddr-0", 65445, &[0x0d, 0x00]),
+        ("quic-tp-old-03-0", 65445, &[0x03, 0x00]),
+        ("quic-tp-old-04-0", 65445, &[0x04, 0x00]),
+        ("quic-tp-old-05-0", 65445, &[0x05, 0x00]),
+        ("quic-tp-old-06-0", 65445, &[0x06, 0x00]),
+        ("quic-tp-old-07-0", 65445, &[0x07, 0x00]),
+        ("quic-tp-old-08-0", 65445, &[0x08, 0x00]),
+        ("quic-tp-old-09-0", 65445, &[0x09, 0x00]),
+        ("quic-tp-old-0a-0", 65445, &[0x0a, 0x00]),
+        ("quic-tp-old-0b-0", 65445, &[0x0b, 0x00]),
+        ("quic-tp-old-migr-0", 65445, &[0x0c, 0x00]),
+        ("esni-0", 65486, &[]),
+        ("esni-1", 65486, &[0x00]),
+        ("esni-2", 65486, &[0x00, 0x00]),
+        ("esni-3", 65486, &[0x00, 0x2f, 0x00]),
+        ("esni-4", 65486, &[0x00, 0x2f, 0x00, 0x17]),
+        ("esni-5", 65486, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
+        ("esni-6", 65486, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
+        ("ech-0", 65037, &[]),
+        ("ech-1", 65037, &[0x00]),
+        ("ech-2", 65037, &[0x00, 0x00]),
+        ("status-v2-000100", 17, &[0x00, 0x01, 0x00]),
+        ("status-v2-000101", 17, &[0x00, 0x01, 0x01]),
+        ("status-v2-000102", 17, &[0x00, 0x01, 0x02]),
+        ("status-v2-000103", 17, &[0x00, 0x01, 0x03]),
+        ("status-v2-0000", 17, &[0x00, 0x00]),
+        (
+            "status-v2-001501-20z",
+            17,
+            &[
+                0x00, 0x15, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        ),
+        (
+            "status-v2-00050100020000",
+            17,
+            &[0x00, 0x05, 0x01, 0x00, 0x02, 0x00, 0x00],
+        ),
+        ("alpn-000100", 16, &[0x00, 0x01, 0x00]),
+        ("alpn-0000", 16, &[0x00, 0x00]),
+        ("alpn-00020100", 16, &[0x00, 0x02, 0x01, 0x00]),
+        ("alpn-0003010000", 16, &[0x00, 0x03, 0x01, 0x00, 0x00]),
+        ("alpn-0003016800", 16, &[0x00, 0x03, 0x01, 0x68, 0x00]),
+        ("oid-filters-00020100", 48, &[0x00, 0x02, 0x01, 0x00]),
+        ("oid-filters-000100", 48, &[0x00, 0x01, 0x00]),
+        ("oid-filters-0000", 48, &[0x00, 0x00]),
+        (
+            "oid-filters-0006020600000100",
+            48,
+            &[0x00, 0x06, 0x02, 0x06, 0x00, 0x00, 0x01, 0x00],
+        ),
+        (
+            "oid-filters-000702060000020000",
+            48,
+            &[0x00, 0x07, 0x02, 0x06, 0x00, 0x00, 0x02, 0x00, 0x00],
+        ),
+        (
+            "oid-filters-0003020605",
+            48,
+            &[0x00, 0x03, 0x02, 0x06, 0x05],
+        ),
+        (
+            "oid-filters-000403068105",
+            48,
+            &[0x00, 0x04, 0x03, 0x06, 0x81, 0x05],
+        ),
+        ("trusted-ca-000101", 3, &[0x00, 0x01, 0x01]),
+        ("trusted-ca-000103", 3, &[0x00, 0x01, 0x03]),
+        ("trusted-ca-00020100", 3, &[0x00, 0x02, 0x01, 0x00]),
+        ("trusted-ca-0000", 3, &[0x00, 0x00]),
+        ("trusted-ca-000100", 3, &[0x00, 0x01, 0x00]),
+        ("trusted-ca-0003020000", 3, &[0x00, 0x03, 0x02, 0x00, 0x00]),
+        (
+            "trusted-ca-000402000100",
+            3,
+            &[0x00, 0x04, 0x02, 0x00, 0x01, 0x00],
+        ),
+        (
+            "trusted-ca-00050200023005",
+            3,
+            &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x05],
+        ),
+        (
+            "trusted-ca-0006020003308105",
+            3,
+            &[0x00, 0x06, 0x02, 0x00, 0x03, 0x30, 0x81, 0x05],
+        ),
+        (
+            "trusted-ca-00050200023000",
+            3,
+            &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x00],
+        ),
+        ("psk-00020000", 41, &[0x00, 0x02, 0x00, 0x00]),
+        ("psk-0003000000", 41, &[0x00, 0x03, 0x00, 0x00, 0x00]),
+        (
+            "psk-000400000000",
+            41,
+            &[0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+        ),
+        ("psk-0000", 41, &[0x00, 0x00]),
+        ("psk-000100", 41, &[0x00, 0x01, 0x00]),
+        ("cert-auth-00020000", 47, &[0x00, 0x02, 0x00, 0x00]),
+        ("cert-auth-0003000000", 47, &[0x00, 0x03, 0x00, 0x00, 0x00]),
+        ("cert-auth-0003000100", 47, &[0x00, 0x03, 0x00, 0x01, 0x00]),
+        ("cert-auth-0000", 47, &[0x00, 0x00]),
+        (
+            "cert-auth-000400023005",
+            47,
+            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
+        ),
+        (
+            "cert-auth-00050003308105",
+            47,
+            &[0x00, 0x05, 0x00, 0x03, 0x30, 0x81, 0x05],
+        ),
+        (
+            "cert-auth-000400023000",
+            47,
+            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00],
+        ),
+        (
+            "cert-auth-0006000430023105",
+            47,
+            &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
+        ),
+        (
+            "cert-auth-000500031f0005",
+            47,
+            &[0x00, 0x05, 0x00, 0x03, 0x1f, 0x00, 0x05],
+        ),
+        (
+            "oid-filters-000400023005",
+            48,
+            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
+        ),
+        (
+            "trusted-ca-000702000430023105",
+            3,
+            &[0x00, 0x07, 0x02, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
+        ),
+        (
+            "quic-tp-v1-len32-wrap",
+            57,
+            &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+        ),
+        (
+            "quic-tp-old-len32-wrap",
+            65445,
+            &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+        ),
+    ];
+    let mut cases = Vec::new();
+    for &(tag, typ, data) in throws {
+        let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+        let empty_first = client_hello_exts(None, &[(typ, data)]);
+        let same = two_client_hellos_record(&first, &other);
+        cases.push((
+            leak(format!("hello-ext-{tag}-then-other-443")),
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &same)]),
+        ));
+        cases.push((
+            leak(format!("hello-ext-{tag}-then-other-unnamed")),
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 40001, 40002, &same)]),
+        ));
+        cases.push((
+            leak(format!("hello-ext-{tag}-only-then-www-443")),
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    443,
+                    &two_client_hellos_record(&empty_first, &hello),
+                )],
+            ),
+        ));
+        let mut leftover = first.clone();
+        leftover.push(0x00);
+        cases.push((
+            leak(format!("hello-ext-{tag}-leftover-00-then-0301")),
+            sequential_payloads(50000, 443, &[&leftover, &hello]),
+        ));
+        cases.push((
+            leak(format!("hello-ext-{tag}-next-payload-other")),
+            sequential_payloads(50000, 443, &[&first, &other]),
+        ));
+    }
+    cases
+}
+
+fn two_client_hellos_record(first: &[u8], second: &[u8]) -> Vec<u8> {
+    let mut body = first[5..].to_vec();
+    body.extend_from_slice(&second[5..]);
+    let mut rec = handshake_record(&body);
+    rec[1..3].copy_from_slice(&0x0301u16.to_be_bytes());
+    rec
 }
 
 fn split_client_hello() -> Vec<u8> {
