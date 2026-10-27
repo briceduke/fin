@@ -37,7 +37,7 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
 
 fn pad_four(bytes: &[u8]) -> Vec<u8> {
     let mut padded = bytes.to_vec();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push(0);
     }
     padded

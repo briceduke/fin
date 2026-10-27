@@ -307,7 +307,7 @@ fn enhanced_packet(frame: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&len.to_le_bytes());
     body.extend_from_slice(&len.to_le_bytes());
     body.extend_from_slice(frame);
-    while body.len() % 4 != 0 {
+    while !body.len().is_multiple_of(4) {
         body.push(0);
     }
     block(6, &body)

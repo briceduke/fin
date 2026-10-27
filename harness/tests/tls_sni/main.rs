@@ -2360,7 +2360,7 @@ fn fuzz_cases() -> Vec<Vec<u8>> {
     let base = client_hello(Some("fuzz.example"));
     let frame = eth_ipv4_tcp(OUTER, 50000, 443, &base);
     let payload_at = frame.len() - base.len();
-    let mut files = vec![pcap(LINK_ETHERNET, &[frame.clone()])];
+    let mut files = vec![pcap(LINK_ETHERNET, std::slice::from_ref(&frame))];
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for _ in 0..64 {
         let mut packet = frame.clone();
