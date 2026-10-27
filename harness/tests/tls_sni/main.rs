@@ -996,10 +996,11 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(tls_port_association_cases())
     .chain(client_hello_sets_server_cases())
     .chain(oversized_incomplete_record_cases())
+    .chain(oversized_complete_record_cases())
     .collect()
 }
 
-/// Incomplete TLS records with u16 length 18431, 18432, or 65535 desegment.
+/// Incomplete TLS records with u16 length 18431, 18432, 18433, or 65535 desegment.
 /// The next in-order Hello Request plus ClientHello is Continuation Data.
 fn oversized_incomplete_record_cases() -> Vec<(&'static str, Vec<u8>)> {
     let hr_ch =
@@ -1013,7 +1014,7 @@ fn oversized_incomplete_record_cases() -> Vec<(&'static str, Vec<u8>)> {
         ("hb", 0x18),
         ("hs", 0x16),
     ] {
-        for length in [18431u16, 18432, 65535] {
+        for length in [18431u16, 18432, 18433, 65535] {
             let first = claimed_tls_record(content, length, &body);
             cases.push((
                 leak(format!("{tag}-{length}-then-hr-ch")),
@@ -1025,6 +1026,116 @@ fn oversized_incomplete_record_cases() -> Vec<(&'static str, Vec<u8>)> {
             ));
         }
     }
+    cases
+}
+
+/// Complete TLS records of any u16 length are dissected. ssl_check_record_length
+/// is expert-info only, so leftover ClientHello and later records are walked.
+fn oversized_complete_record_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let hello = client_hello(Some("www.example.com"));
+    let hr_ch =
+        handshake_messages_record(0x0303, &[(0, &[]), (1, &hello_inner("www.example.com"))]);
+    let contents = [
+        ("ccs", 0x14u8),
+        ("alert", 0x15),
+        ("app", 0x17),
+        ("hb", 0x18),
+        ("hs", 0x16),
+        ("cid", 0x19),
+        ("ack", 0x1A),
+    ];
+    let mut cases = Vec::new();
+    for (tag, content) in contents {
+        for length in [18431u16, 18432, 18433, 20000] {
+            let rec = claimed_tls_record(content, length, &vec![0x01; length as usize]);
+            let mut same = rec.clone();
+            same.extend_from_slice(&hello);
+            cases.push((
+                leak(format!("{tag}-{length}-hello-same")),
+                sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&same]),
+            ));
+            cases.push((
+                leak(format!("{tag}-{length}-hello-same-dest")),
+                sequential_payloads(50000, 443, &[&same]),
+            ));
+            let first = claimed_tls_record(content, length, &[0x01]);
+            let mut rest = vec![0x01u8; length as usize - 1];
+            rest.extend_from_slice(&hello);
+            cases.push((
+                leak(format!("{tag}-{length}-complete-plus-hello")),
+                sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&first, &rest]),
+            ));
+            cases.push((
+                leak(format!("{tag}-{length}-complete-plus-hello-dest")),
+                sequential_payloads(50000, 443, &[&first, &rest]),
+            ));
+        }
+    }
+    for length in [18431u16, 18432, 18433, 20000] {
+        let rec = claimed_tls_record(0x14, length, &vec![0x01; length as usize]);
+        cases.push((
+            leak(format!("ccs-{length}-then-hr-ch-complete")),
+            sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&rec, &hr_ch]),
+        ));
+        cases.push((
+            leak(format!("ccs-{length}-then-hr-ch-complete-dest")),
+            sequential_payloads(50000, 443, &[&rec, &hr_ch]),
+        ));
+        for leftover in [0x00u8, 0x01, 0xff] {
+            let mut first = rec.clone();
+            first.push(leftover);
+            cases.push((
+                leak(format!("ccs-{length}-leftover-{leftover:02x}-hello")),
+                sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&first, &hello]),
+            ));
+            cases.push((
+                leak(format!("ccs-{length}-leftover-{leftover:02x}-hello-dest")),
+                sequential_payloads(50000, 443, &[&first, &hello]),
+            ));
+        }
+    }
+    for (tag, content) in [("alert", 0x15u8), ("app", 0x17), ("hb", 0x18)] {
+        let rec = claimed_tls_record(content, 18432, &vec![0x01; 18432]);
+        cases.push((
+            leak(format!("{tag}-18432-then-hr-ch-complete")),
+            sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&rec, &hr_ch]),
+        ));
+    }
+    let rec = claimed_tls_record(0x14, 18432, &vec![0x01; 18432]);
+    cases.push((
+        "ccs-18432-then-reverse-hr-ch",
+        two_way_ipv4(
+            (PEER, OUTER, 443, 50000, rec.as_slice()),
+            (OUTER, PEER, 50000, 443, hr_ch.as_slice()),
+        ),
+    ));
+    let mut same = rec.clone();
+    same.extend_from_slice(&hello);
+    cases.push((
+        "ccs-18432-hello-same-ipv6",
+        sequential_ipv6_flow(PEER_V6, OUTER_V6, 443, 50000, &[&same]),
+    ));
+    for port in [465u16, 636, 853, 993, 995] {
+        cases.push((
+            leak(format!("ccs-18432-hello-same-{port}")),
+            sequential_ipv4_flow(PEER, OUTER, port, 50000, &[&same]),
+        ));
+        cases.push((
+            leak(format!("ccs-18432-hello-same-{port}-dest")),
+            sequential_payloads(50000, port, &[&same]),
+        ));
+    }
+    let first = claimed_tls_record(0x14, 65535, &vec![0x01; 1024]);
+    let mut rest = vec![0x01u8; 65535 - 1024];
+    rest.extend_from_slice(&hello);
+    cases.push((
+        "ccs-65535-complete-plus-hello",
+        sequential_ipv4_flow(PEER, OUTER, 443, 50000, &[&first, &rest]),
+    ));
+    cases.push((
+        "ccs-65535-complete-plus-hello-dest",
+        sequential_payloads(50000, 443, &[&first, &rest]),
+    ));
     cases
 }
 

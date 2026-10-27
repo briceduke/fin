@@ -3216,6 +3216,123 @@ mod tests {
     }
 
     #[test]
+    fn complete_oversized_record_walks_like_tshark() {
+        let hello = sni_hello("www.example.com");
+        let hr_ch = hello_request_then_sni();
+        let named = ["www.example.com"];
+        let blank: [&str; 0] = [];
+        const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for content in [0x14u8, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x16] {
+            for length in [18431u16, 18432, 18433, 20000] {
+                let rec = claimed_record(content, length, &vec![0x01; length as usize]);
+                let mut same = rec.clone();
+                same.extend_from_slice(&hello);
+                for (label, cell) in [
+                    (
+                        "src443",
+                        walk_tls(&eth_ipv4_tcp_flow(SERVER, CLIENT, 443, 50000, 1, &same)),
+                    ),
+                    (
+                        "dst443",
+                        walk_tls(&eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &same)),
+                    ),
+                ] {
+                    assert_eq!(
+                        cell.tls_sni, named,
+                        "content {content} length {length} {label} same"
+                    );
+                    assert_eq!(
+                        cell.counted, None,
+                        "content {content} length {length} {label} same"
+                    );
+                }
+                let first = claimed_record(content, length, &[0x01]);
+                let mut rest = vec![0x01u8; length as usize - 1];
+                rest.extend_from_slice(&hello);
+                for (label, cells) in [
+                    (
+                        "src443",
+                        next_seq_flow(SERVER, CLIENT, 443, 50000, &first, &rest),
+                    ),
+                    ("dst443", next_seq_on(50000, 443, &first, &rest)),
+                ] {
+                    assert_eq!(
+                        cells[0].tls_sni, blank,
+                        "content {content} length {length} {label} first"
+                    );
+                    assert_eq!(
+                        cells[1].tls_sni, named,
+                        "content {content} length {length} {label} completing"
+                    );
+                    assert_eq!(
+                        cells[1].counted, None,
+                        "content {content} length {length} {label} completing"
+                    );
+                }
+            }
+        }
+        for length in [18431u16, 18432, 18433, 20000] {
+            let rec = claimed_record(0x14, length, &vec![0x01; length as usize]);
+            for (label, cells) in [
+                (
+                    "src443",
+                    next_seq_flow(SERVER, CLIENT, 443, 50000, &rec, &hr_ch),
+                ),
+                ("dst443", next_seq_on(50000, 443, &rec, &hr_ch)),
+            ] {
+                assert_eq!(cells[0].tls_sni, blank, "ccs {length} {label} first");
+                assert_eq!(cells[0].counted, None, "ccs {length} {label} first");
+                assert_eq!(cells[1].tls_sni, blank, "ccs {length} {label} HR+CH");
+                assert_eq!(cells[1].counted, None, "ccs {length} {label} HR+CH");
+            }
+            for leftover in [0x00u8, 0x01, 0xff] {
+                let mut first = rec.clone();
+                first.push(leftover);
+                let cells = next_seq_flow(SERVER, CLIENT, 443, 50000, &first, &hello);
+                assert_eq!(
+                    cells[1].tls_sni, blank,
+                    "ccs {length} leftover {leftover:#04x}"
+                );
+                assert_eq!(
+                    cells[1].counted, None,
+                    "ccs {length} leftover {leftover:#04x}"
+                );
+            }
+        }
+        for content in [0x15u8, 0x17, 0x18] {
+            let rec = claimed_record(content, 18432, &vec![0x01; 18432]);
+            let cells = next_seq_flow(SERVER, CLIENT, 443, 50000, &rec, &hr_ch);
+            assert_eq!(cells[1].tls_sni, named, "content {content} next HR+CH");
+            assert_eq!(cells[1].counted, None, "content {content} next HR+CH");
+        }
+        let rec = claimed_record(0x14, 18432, &vec![0x01; 18432]);
+        let reverse = server_then_client(443, 50000, &rec, &hr_ch);
+        assert_eq!(reverse[1].tls_sni, named, "reverse 5-tuple");
+        assert_eq!(reverse[1].counted, None, "reverse 5-tuple");
+        let mut same = rec.clone();
+        same.extend_from_slice(&hello);
+        for port in [443u16, 465, 636, 853, 993, 995] {
+            let src = walk_tls(&eth_ipv4_tcp_flow(SERVER, CLIENT, port, 50000, 1, &same));
+            assert_eq!(src.tls_sni, named, "port {port} src same");
+            assert_eq!(src.counted, None, "port {port} src same");
+            let dst = walk_tls(&eth_ipv4_tcp_seq(CLIENT, 50000, port, 1, &same));
+            assert_eq!(dst.tls_sni, named, "port {port} dest same");
+            assert_eq!(dst.counted, None, "port {port} dest same");
+        }
+        let v6_first = eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 443, 50000, 1, &same);
+        let v6 = walk_tls_frames(&[&v6_first]);
+        assert_eq!(v6[0].tls_sni, named, "ipv6 same");
+        assert_eq!(v6[0].counted, None, "ipv6 same");
+        let first = claimed_record(0x14, 65535, &vec![0x01; 1024]);
+        let mut rest = vec![0x01u8; 65535 - 1024];
+        rest.extend_from_slice(&hello);
+        let cells = next_seq_flow(SERVER, CLIENT, 443, 50000, &first, &rest);
+        assert_eq!(cells[1].tls_sni, named, "ccs 65535 completing+hello");
+        assert_eq!(cells[1].counted, None, "ccs 65535 completing+hello");
+    }
+
+    #[test]
     fn complete_hello_then_split_next_hello_prints_each_name() {
         let first = sni_hello("www.example.com");
         let second = sni_hello("other.example");

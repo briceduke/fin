@@ -314,10 +314,11 @@ fn take_record<'a>(payload: &'a [u8], offset: usize, session: &mut TlsSession) -
     let start = offset + RECORD_HEADER;
     let end = start.saturating_add(length);
     // dissect_ssl3_record desegments an incomplete record before
-    // ssl_check_record_length. A complete record at or above TLS_MAX_RECORD
-    // is still Unproved/Done; an incomplete one of any u16 length is too,
-    // and record_tail buffers it.
-    if end > payload.len() || length >= TLS_MAX_RECORD {
+    // ssl_check_record_length. ssl_check_record_length is expert-info only
+    // and does not abort the content-type switch, so a complete record of
+    // any u16 length is walked. An incomplete one is Unproved/Done here;
+    // record_tail buffers it.
+    if end > payload.len() {
         return if content == CONTENT_HANDSHAKE {
             Record::Unproved
         } else {
@@ -698,15 +699,12 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
         if need > rest.len() {
             // tshark 4.6.9 dissect_ssl3_record desegments any incomplete
             // record after a valid content type, including u16 length
-            // 18432–65535. TLS_MAX_RECORD is ssl_check_record_length, which
-            // runs only after the full record is assembled.
+            // 18432–65535. ssl_check_record_length runs only after the
+            // full record is assembled, and is expert-info only.
             return Some(RecordTail {
                 start: offset,
                 more: need - rest.len(),
             });
-        }
-        if length >= TLS_MAX_RECORD {
-            return None;
         }
         if length == 0 {
             apply_session_version(&mut session, content, version, None);
@@ -2793,6 +2791,85 @@ mod tests {
             stitch_leftover(&complete, &hello),
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
+    }
+
+    #[test]
+    fn complete_oversized_record_walks_like_tshark() {
+        let hello = client_hello(Some("www.example.com"));
+        let named = TlsParse::ClientHello(vec!["www.example.com".to_string()]);
+        let hr_ch = hello_request_then_hello("www.example.com");
+        let contents = [CONTENT_CCS, 0x15, 0x17, 0x18, 0x19, 0x1A, CONTENT_HANDSHAKE];
+        for content in contents {
+            for length in [18431u16, 18432, 18433, 20000] {
+                let rec = claimed_record(content, length, &vec![0x01; length as usize]);
+                assert_eq!(
+                    truncated_handshake_need(&rec),
+                    None,
+                    "content {content} length {length} complete"
+                );
+                let mut same = rec.clone();
+                same.extend_from_slice(&hello);
+                assert_eq!(
+                    parse_tcp_tls_on_tls_port(&same),
+                    named.clone(),
+                    "content {content} length {length} same-payload hello"
+                );
+                let first = incomplete(content, length, 1);
+                let more = RECORD_HEADER + length as usize - first.len();
+                assert_eq!(
+                    truncated_handshake_need(&first),
+                    Some(more),
+                    "content {content} length {length} incomplete"
+                );
+                let mut rest = vec![0x01u8; more];
+                rest.extend_from_slice(&hello);
+                assert_eq!(
+                    stitch_leftover(&first, &rest),
+                    named.clone(),
+                    "content {content} length {length} completing+hello"
+                );
+            }
+        }
+        for leftover in [0x00u8, 0x01, 0xff] {
+            for length in [18431u16, 18432] {
+                let mut first = claimed_record(CONTENT_CCS, length, &vec![0x01; length as usize]);
+                first.push(leftover);
+                assert_eq!(
+                    truncated_handshake_need(&first),
+                    Some(4),
+                    "ccs {length} leftover {leftover:#04x}"
+                );
+                assert_eq!(
+                    stitch_leftover(&first, &hello),
+                    TlsParse::Other,
+                    "ccs {length} leftover {leftover:#04x} hello"
+                );
+            }
+        }
+        let oversized_ccs = claimed_record(CONTENT_CCS, 18432, &vec![0x01; 18432]);
+        let first = parse_tls_after_ccs(&oversized_ccs, TlsSession::Unknown, false, false);
+        assert!(first.after_ccs, "oversized CCS arms the next frame");
+        assert_eq!(
+            parse_tls_after_ccs(&hr_ch, first.session, false, first.after_ccs).kind,
+            TlsParse::Other,
+            "oversized CCS then HR+CH next frame"
+        );
+        let dest = parse_tls_after_ccs(&hr_ch, first.session, false, false);
+        assert_eq!(
+            dest.kind,
+            named.clone(),
+            "oversized CCS then reverse-tuple HR+CH still prints"
+        );
+        let huge = claimed_record(CONTENT_CCS, 65535, &[0x01]);
+        let huge_more = RECORD_HEADER + 65535 - huge.len();
+        assert_eq!(truncated_handshake_need(&huge), Some(huge_more));
+        let mut huge_rest = vec![0x01u8; huge_more];
+        huge_rest.extend_from_slice(&hello);
+        assert_eq!(stitch_leftover(&huge, &huge_rest), named);
+    }
+
+    fn incomplete(content: u8, length: u16, body_n: usize) -> Vec<u8> {
+        claimed_record(content, length, &vec![0x01; body_n])
     }
 
     #[test]
