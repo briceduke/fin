@@ -72,6 +72,44 @@ fn stdin_matches_the_file_path() {
 }
 
 #[test]
+fn uncertain_last_hello_ext_counts_tls_hello_ext_uncertain() {
+    let fin = fin_bin();
+    let other = client_hello(Some("other.example"));
+    let first = client_hello_exts(
+        Some("www.example.com"),
+        &[(47, &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05])],
+    );
+    let same = two_client_hellos_record(&first, &other);
+    let path = work_dir().join("hello-ext-uncertain-reason.pcap");
+    fs::write(
+        &path,
+        pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &same)]),
+    )
+    .unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("www.example.com"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("other.example"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 1 tls-hello-ext-uncertain"),
+        "stderr={stderr:?}"
+    );
+    assert!(!output.status.success(), "exit={:?}", output.status.code());
+}
+
+#[test]
 fn combined_ip_src_and_sni_matches_tshark_469() {
     let Some((tshark, fin)) = tools() else {
         return;
@@ -427,6 +465,26 @@ fn hello_ext_throw_cases() -> Vec<(&'static str, Vec<u8>)> {
             "cert-auth-000400023000",
             47,
             &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00],
+        ),
+        (
+            "cert-auth-0006000430023105",
+            47,
+            &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
+        ),
+        (
+            "cert-auth-000500031f0005",
+            47,
+            &[0x00, 0x05, 0x00, 0x03, 0x1f, 0x00, 0x05],
+        ),
+        (
+            "oid-filters-000400023005",
+            48,
+            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
+        ),
+        (
+            "trusted-ca-000702000430023105",
+            3,
+            &[0x00, 0x07, 0x02, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
         ),
         (
             "quic-tp-v1-len32-wrap",

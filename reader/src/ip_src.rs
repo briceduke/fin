@@ -107,6 +107,8 @@ struct TcpSeq {
 struct TlsNeed {
     next_seq: u32,
     prefix: Vec<u8>,
+    /// Completing segment after an uncertain last ClientHello extension.
+    uncertain: bool,
 }
 
 /// Session state for a sequential field walk.
@@ -739,8 +741,18 @@ impl Walk<'_> {
             // Heuristic TLS (unnamed, unclaimed) never entered dissect_ssl, so
             // leftover that is not a record start is not desegmented.
             if outcome.claimed {
-                self.set_tls_need(flow, seq, parsed, payload_len, session);
+                self.set_tls_need(
+                    flow,
+                    seq,
+                    parsed,
+                    payload_len,
+                    session,
+                    outcome.counted.is_some(),
+                );
             }
+        }
+        if let Some(reason) = outcome.counted {
+            self.count(reason);
         }
         match outcome.kind {
             TlsParse::ClientHello(names) => {
@@ -778,6 +790,7 @@ impl Walk<'_> {
         parsed: &[u8],
         payload_len: usize,
         session: TlsSession,
+        uncertain: bool,
     ) {
         match truncated_handshake_prefix(parsed, session) {
             Some(prefix) => {
@@ -786,6 +799,7 @@ impl Walk<'_> {
                     TlsNeed {
                         next_seq: seq.wrapping_add(payload_len as u32),
                         prefix: prefix.to_vec(),
+                        uncertain,
                     },
                 );
             }
@@ -807,9 +821,13 @@ impl Walk<'_> {
         if seq != need.next_seq {
             return None;
         }
+        let uncertain = need.uncertain;
         let mut buf = need.prefix.clone();
         buf.extend_from_slice(payload);
-        let outcome = parse_tls_after_ccs(&buf, session, false, after_ccs);
+        let mut outcome = parse_tls_after_ccs(&buf, session, false, after_ccs);
+        if uncertain && outcome.counted.is_none() {
+            outcome.counted = Some("tls-hello-ext-uncertain");
+        }
         Some((outcome, buf))
     }
 
@@ -2879,32 +2897,9 @@ mod tests {
             (65037, &[]),
             (65037, &[0x00]),
             (65037, &[0x00, 0x00]),
-            (17, &[0x00, 0x01, 0x00]),
-            (17, &[0x00, 0x01, 0x01]),
-            (17, &[0x00, 0x01, 0x02]),
-            (17, &[0x00, 0x01, 0x03]),
-            (16, &[0x00, 0x01, 0x00]),
-            (48, &[0x00, 0x02, 0x01, 0x00]),
-            (48, &[0x00, 0x01, 0x00]),
-            (48, &[0x00, 0x06, 0x02, 0x06, 0x00, 0x00, 0x01, 0x00]),
-            (48, &[0x00, 0x07, 0x02, 0x06, 0x00, 0x00, 0x02, 0x00, 0x00]),
-            (48, &[0x00, 0x03, 0x02, 0x06, 0x05]),
-            (48, &[0x00, 0x04, 0x03, 0x06, 0x81, 0x05]),
             (3, &[0x00, 0x01, 0x01]),
             (3, &[0x00, 0x01, 0x03]),
             (3, &[0x00, 0x02, 0x01, 0x00]),
-            (3, &[0x00, 0x03, 0x02, 0x00, 0x00]),
-            (3, &[0x00, 0x04, 0x02, 0x00, 0x01, 0x00]),
-            (3, &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x05]),
-            (3, &[0x00, 0x06, 0x02, 0x00, 0x03, 0x30, 0x81, 0x05]),
-            (41, &[0x00, 0x02, 0x00, 0x00]),
-            (41, &[0x00, 0x03, 0x00, 0x00, 0x00]),
-            (41, &[0x00, 0x04, 0x00, 0x00, 0x00, 0x00]),
-            (47, &[0x00, 0x02, 0x00, 0x00]),
-            (47, &[0x00, 0x03, 0x00, 0x00, 0x00]),
-            (47, &[0x00, 0x03, 0x00, 0x01, 0x00]),
-            (47, &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05]),
-            (47, &[0x00, 0x05, 0x00, 0x03, 0x30, 0x81, 0x05]),
         ];
         for &(typ, data) in throws {
             let first = sni_hello_exts(Some("www.example.com"), &[(typ, data)]);
@@ -2979,17 +2974,8 @@ mod tests {
             (65486, &[0x00, 0x2f, 0x00, 0x17]),
             (65486, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
             (65486, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
-            (17, &[0x00, 0x00]),
-            (16, &[0x00, 0x00]),
-            (16, &[0x00, 0x02, 0x01, 0x00]),
-            (48, &[0x00, 0x00]),
             (3, &[0x00, 0x00]),
             (3, &[0x00, 0x01, 0x00]),
-            (3, &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x00]),
-            (41, &[0x00, 0x00]),
-            (41, &[0x00, 0x01, 0x00]),
-            (47, &[0x00, 0x00]),
-            (47, &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00]),
             (57, &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),
             (
                 65445,
@@ -3051,6 +3037,120 @@ mod tests {
                 cells[1].counted,
                 None,
                 "keep type {typ} len {} leftover then 0x0301",
+                data.len()
+            );
+        }
+        let uncertain: &[(u16, &[u8])] = &[
+            (17, &[0x00, 0x01, 0x00]),
+            (17, &[0x00, 0x01, 0x01]),
+            (17, &[0x00, 0x01, 0x02]),
+            (17, &[0x00, 0x01, 0x03]),
+            (17, &[0x00, 0x00]),
+            (16, &[0x00, 0x01, 0x00]),
+            (16, &[0x00, 0x00]),
+            (16, &[0x00, 0x02, 0x01, 0x00]),
+            (16, &[0x00, 0x03, 0x01, 0x00, 0x00]),
+            (48, &[0x00, 0x02, 0x01, 0x00]),
+            (48, &[0x00, 0x01, 0x00]),
+            (48, &[0x00, 0x00]),
+            (48, &[0x00, 0x06, 0x02, 0x06, 0x00, 0x00, 0x01, 0x00]),
+            (48, &[0x00, 0x03, 0x02, 0x06, 0x05]),
+            (48, &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05]),
+            (3, &[0x00, 0x03, 0x02, 0x00, 0x00]),
+            (3, &[0x00, 0x04, 0x02, 0x00, 0x01, 0x00]),
+            (3, &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x05]),
+            (3, &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x00]),
+            (3, &[0x00, 0x07, 0x02, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05]),
+            (41, &[0x00, 0x02, 0x00, 0x00]),
+            (41, &[0x00, 0x00]),
+            (41, &[0x00, 0x01, 0x00]),
+            (47, &[0x00, 0x02, 0x00, 0x00]),
+            (47, &[0x00, 0x00]),
+            (47, &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05]),
+            (47, &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00]),
+            (47, &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05]),
+            (47, &[0x00, 0x05, 0x00, 0x03, 0x1f, 0x00, 0x05]),
+        ];
+        for &(typ, data) in uncertain {
+            let first = sni_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_record(&first, &other);
+            for (label, frame) in [
+                ("443", eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &same)),
+                ("unnamed", eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &same)),
+            ] {
+                let cell = walk_tls(&frame);
+                assert_eq!(
+                    cell.tls_sni,
+                    named,
+                    "uncertain type {typ} len {} {label}",
+                    data.len()
+                );
+                assert_eq!(
+                    cell.counted,
+                    Some("tls-hello-ext-uncertain"),
+                    "uncertain type {typ} len {} {label}",
+                    data.len()
+                );
+            }
+            let empty_first = sni_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_record(&empty_first, &hello);
+            let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &empty_then));
+            assert_eq!(
+                cell.tls_sni,
+                blank,
+                "uncertain type {typ} len {} first-only then CH",
+                data.len()
+            );
+            assert_eq!(
+                cell.counted,
+                Some("tls-hello-ext-uncertain"),
+                "uncertain type {typ} len {} first-only then CH",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            let cells = next_seq_on(50000, 443, &leftover, &hello);
+            assert_eq!(
+                cells[0].tls_sni,
+                named,
+                "uncertain type {typ} len {} leftover first",
+                data.len()
+            );
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-hello-ext-uncertain"),
+                "uncertain type {typ} len {} leftover first counted",
+                data.len()
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                blank,
+                "uncertain type {typ} len {} leftover then 0x0301",
+                data.len()
+            );
+            assert_eq!(
+                cells[1].counted,
+                Some("tls-hello-ext-uncertain"),
+                "uncertain type {typ} len {} leftover then 0x0301 counted",
+                data.len()
+            );
+            let next = next_seq_on(50000, 443, &first, &other);
+            assert_eq!(
+                next[0].tls_sni,
+                named,
+                "uncertain type {typ} len {} next first",
+                data.len()
+            );
+            assert_eq!(
+                next[0].counted,
+                Some("tls-hello-ext-uncertain"),
+                "uncertain type {typ} len {} next first counted",
+                data.len()
+            );
+            assert_eq!(
+                next[1].tls_sni,
+                ["other.example"],
+                "uncertain type {typ} len {} next payload",
                 data.len()
             );
         }
