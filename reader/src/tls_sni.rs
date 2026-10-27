@@ -994,7 +994,7 @@ fn quic_params_varint_throws(hello: &[u8], mut offset: usize, next_offset: usize
         if hello.len().saturating_sub(offset) < 2 {
             return true;
         }
-        let Some((_, type_len)) = hello.get(offset..).and_then(quic_varint) else {
+        let Some((parameter_type, type_len)) = hello.get(offset..).and_then(quic_varint) else {
             return true;
         };
         offset += type_len;
@@ -1002,7 +1002,7 @@ fn quic_params_varint_throws(hello: &[u8], mut offset: usize, next_offset: usize
             return true;
         };
         offset += len_len;
-        if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
+        if quic_param_throws(hello, offset, next_offset, parameter_type, parameter_length) {
             return true;
         }
         match offset.checked_add(parameter_length) {
@@ -1018,6 +1018,7 @@ fn quic_params_legacy_throws(hello: &[u8], mut offset: usize, next_offset: usize
         if hello.len().saturating_sub(offset) < 2 {
             return true;
         }
+        let parameter_type = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
         offset += 2;
         if next_offset.saturating_sub(offset) < 2 {
             return false;
@@ -1027,12 +1028,90 @@ fn quic_params_legacy_throws(hello: &[u8], mut offset: usize, next_offset: usize
         if next_offset.saturating_sub(offset) < parameter_length {
             return false;
         }
-        if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
+        if quic_param_throws(hello, offset, next_offset, parameter_type, parameter_length) {
             return true;
         }
         offset += parameter_length;
     }
     false
+}
+
+/// tshark 4.6.9 `ssl_dissect_hnd_hello_ext_quic_transport_parameters` switch:
+/// `proto_tree_add_item` / `ENC_VARINT_QUIC` from the hello tvb, including
+/// when `parameter_length` is 0. `ssl_add_vector` does not throw.
+fn quic_param_throws(
+    hello: &[u8],
+    offset: usize,
+    ext_end: usize,
+    parameter_type: usize,
+    parameter_length: usize,
+) -> bool {
+    if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
+        return true;
+    }
+    match parameter_type {
+        0x02 => hello.len().saturating_sub(offset) < 16,
+        0x0d => quic_preferred_address_throws(hello, offset, ext_end),
+        0x11 | 0xff73db => quic_version_information_throws(hello, offset, parameter_length),
+        0x1000 => quic_two_varints_throw(hello, offset),
+        0x4751 | 0x4752 => hello.len().saturating_sub(offset) < 4,
+        0x01 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0e | 0x20
+        | 0x1057 | 0x3127 | 0x7158 | 0xde1a | 0xff00 | 0xff03de1a | 0xff04de1a | 0xff04de1b
+        | 0x9f81a176 | 0x0f739bbc1b666d04 | 0x0f739bbc1b666d07 | 0x0f739bbc1b666d09
+        | 0x0f739bbc1b666d11 | 0x0f739bbc1b666d0c | 0x0f739bbc1b666d0d => {
+            hello.get(offset..).and_then(quic_varint).is_none()
+        }
+        _ => false,
+    }
+}
+
+fn quic_two_varints_throw(hello: &[u8], offset: usize) -> bool {
+    let Some((_, n)) = hello.get(offset..).and_then(quic_varint) else {
+        return true;
+    };
+    match offset.checked_add(n) {
+        Some(next) => hello.get(next..).and_then(quic_varint).is_none(),
+        None => true,
+    }
+}
+
+fn quic_version_information_throws(
+    hello: &[u8],
+    mut offset: usize,
+    parameter_length: usize,
+) -> bool {
+    if hello.len().saturating_sub(offset) < 4 {
+        return true;
+    }
+    offset += 4;
+    let mut consumed = 4;
+    while consumed < parameter_length {
+        if hello.len().saturating_sub(offset) < 4 {
+            return true;
+        }
+        offset += 4;
+        consumed += 4;
+    }
+    false
+}
+
+/// IPv4 (4) + port (2) + IPv6 (16) + port (2), then `ssl_add_vector` CID
+/// (no throw), then a 16-byte reset token from the hello tvb.
+fn quic_preferred_address_throws(hello: &[u8], mut offset: usize, ext_end: usize) -> bool {
+    if hello.len().saturating_sub(offset) < 24 {
+        return true;
+    }
+    offset += 24;
+    if offset > ext_end || ext_end - offset < 1 {
+        return false;
+    }
+    let cid_len = hello[offset] as usize;
+    offset += 1;
+    if ext_end.saturating_sub(offset) < cid_len {
+        return false;
+    }
+    offset += cid_len;
+    hello.len().saturating_sub(offset) < 16
 }
 
 /// `ssl_dissect_hnd_hello_ext_ech` ClientHello: type, then outer cipher suite.
@@ -2628,12 +2707,36 @@ mod tests {
             (EXT_QUIC_TP_V1, &[0x80, 0x00]),
             (EXT_QUIC_TP_V1, &[0x00, 0x01]),
             (EXT_QUIC_TP_V1, &[0x00, 0x00, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x01, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (EXT_QUIC_TP_V1, &[0x0d, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x03, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x04, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x05, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x06, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x07, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x08, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x09, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x0a, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x0b, 0x00]),
             (EXT_QUIC_TP, &[0x00]),
             (EXT_QUIC_TP, &[0x00, 0x40]),
             (EXT_QUIC_TP, &[0x40, 0x00]),
             (EXT_QUIC_TP, &[0x80, 0x00]),
             (EXT_QUIC_TP, &[0x00, 0x01]),
             (EXT_QUIC_TP, &[0x00, 0x00, 0x00]),
+            (EXT_QUIC_TP, &[0x01, 0x00]),
+            (EXT_QUIC_TP, &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (EXT_QUIC_TP, &[0x0d, 0x00]),
+            (EXT_QUIC_TP, &[0x03, 0x00]),
+            (EXT_QUIC_TP, &[0x04, 0x00]),
+            (EXT_QUIC_TP, &[0x05, 0x00]),
+            (EXT_QUIC_TP, &[0x06, 0x00]),
+            (EXT_QUIC_TP, &[0x07, 0x00]),
+            (EXT_QUIC_TP, &[0x08, 0x00]),
+            (EXT_QUIC_TP, &[0x09, 0x00]),
+            (EXT_QUIC_TP, &[0x0a, 0x00]),
+            (EXT_QUIC_TP, &[0x0b, 0x00]),
             (EXT_ESNI, &[]),
             (EXT_ESNI, &[0x00]),
             (EXT_ESNI, &[0x00, 0x00]),
@@ -2697,8 +2800,10 @@ mod tests {
             (EXT_COMPRESS_CERTIFICATE, &[0x02, 0x00, 0x01]),
             (EXT_QUIC_TP_V1, &[]),
             (EXT_QUIC_TP_V1, &[0x00, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x0c, 0x00]),
             (EXT_QUIC_TP, &[]),
             (EXT_QUIC_TP, &[0x00, 0x00]),
+            (EXT_QUIC_TP, &[0x0c, 0x00]),
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17]),
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
