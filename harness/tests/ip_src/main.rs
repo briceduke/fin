@@ -3,9 +3,9 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use harness::{check_pair, run_pair, RunError, TsharkSession};
@@ -168,6 +168,48 @@ fn claimed_preference_is_accepted() {
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("unrecognized flag"), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "10.0.0.1\n");
+}
+
+#[test]
+fn broken_stdout_pipe_is_not_a_panic() {
+    let fin = fin_bin();
+    let path = work_dir().join("broken-pipe.pcap");
+    let mut packets = Vec::new();
+    for _ in 0..16_384 {
+        packets.push(eth_ipv4_udp(OUTER, 12345, 9, PAYLOAD));
+    }
+    fs::write(&path, pcap(LINK_ETHERNET, &packets)).unwrap();
+    let mut child = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", "ip.src"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("fin");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stdout.read(&mut byte).expect("read stdout");
+        if n == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    drop(stdout);
+    let mut stderr = child.stderr.take().expect("stderr");
+    let status = child.wait().expect("wait");
+    let mut err = Vec::new();
+    stderr.read_to_end(&mut err).expect("stderr");
+    let stderr = String::from_utf8_lossy(&err);
+    assert_eq!(line, b"10.0.0.1\n", "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("Broken pipe"), "{stderr}");
+    assert_ne!(status.code(), Some(101), "{stderr}");
 }
 
 fn cases() -> Vec<(&'static str, Vec<u8>)> {

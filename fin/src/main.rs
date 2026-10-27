@@ -3,13 +3,16 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 
 use memmap2::Mmap;
 use reader::{read_capture, read_capture_chunked, IpSrc};
+
+/// Packet rows and counted lines share this buffer so a capture is not one write per line.
+const OUTPUT_BUF: usize = 1 << 20;
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
@@ -61,6 +64,18 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
 }
 
 fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i32, String> {
+    match write_rows(name, capture, fields) {
+        Ok(code) => Ok(code),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io::Result<i32> {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut out = BufWriter::with_capacity(OUTPUT_BUF, stdout.lock());
+    let mut err = BufWriter::with_capacity(OUTPUT_BUF, stderr.lock());
     let want_ip = fields.contains(&Field::IpSrc);
     let want_tls = fields.contains(&Field::TlsSni);
     let mut session = IpSrc::query(want_ip, want_tls);
@@ -74,19 +89,22 @@ fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i3
                 Field::TlsSni => columns.push(escape_field(&cell.tls_sni.join(","))),
             }
         }
-        println!("{}", columns.join("\t"));
+        writeln!(out, "{}", columns.join("\t"))?;
         if let Some(reason) = cell.counted {
             counted.push((index as u64 + 1, reason));
         }
     }
+    out.flush()?;
     for (frame, reason) in &counted {
-        eprintln!("counted {frame} {reason}");
+        writeln!(err, "counted {frame} {reason}")?;
     }
-    eprintln!("total {}", counted.len());
+    writeln!(err, "total {}", counted.len())?;
     if let Some(fault) = capture.fault {
-        eprintln!("fin: {name}: {}", fault.phrase());
+        writeln!(err, "fin: {name}: {}", fault.phrase())?;
+        err.flush()?;
         return Ok(capture.exit_code());
     }
+    err.flush()?;
     if counted.is_empty() {
         Ok(0)
     } else {
