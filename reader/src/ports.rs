@@ -157,10 +157,8 @@ impl PortTables {
                 "tcp.port" => {
                     tcp.entry(port).or_insert(name);
                 }
-                "tls.port" => {
-                    if port != 0 {
-                        tls.insert(port);
-                    }
+                "tls.port" if port != 0 => {
+                    tls.insert(port);
                 }
                 _ => {}
             }
@@ -234,9 +232,7 @@ fn parse_port(key: &str) -> Option<u16> {
 /// CI source build of 4.6.9 register different optional dissectors
 /// (OPC UA, EtherCAT, Gryphon vs UCI on 7000), so the full tables differ.
 pub fn is_pinned_name(name: &str) -> bool {
-    name == "vxlan"
-        || ALWAYS_CLAIM.iter().any(|&item| item == name)
-        || REACHES_IP.iter().any(|&item| item == name)
+    name == "vxlan" || ALWAYS_CLAIM.contains(&name) || REACHES_IP.contains(&name)
 }
 
 /// Raw dump text, for the live-tshark comparison test.

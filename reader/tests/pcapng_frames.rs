@@ -37,7 +37,7 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
 
 fn pad_four(bytes: &[u8]) -> Vec<u8> {
     let mut padded = bytes.to_vec();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push(0);
     }
     padded
@@ -197,9 +197,9 @@ fn one_enhanced_packet_and_the_packet_after_padding() {
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x10, 0x20, 0x30]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0x99]);
-    assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn big_endian_section_reads_one_packet() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x07, 0x08]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -231,9 +231,9 @@ fn snaplen_does_not_clip_an_enhanced_packet() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].captured, &[0x01, 0x02, 0x03, 0x04]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0xab]);
-    assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -251,10 +251,10 @@ fn second_interface_supplies_its_link_type() {
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].link_type, 113);
     assert_eq!(capture.frames[1].captured, &[0xbb, 0xcc]);
-    assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn a_new_section_resets_interface_ids() {
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[1].link_type, 276);
     assert_eq!(capture.frames[1].captured, &[2, 3]);
-    assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -292,9 +292,9 @@ fn an_unknown_block_between_packets_is_skipped() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].captured, &[0x01]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0x02]);
-    assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -310,7 +310,7 @@ fn simple_packet_clips_to_snaplen() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x01, 0x02, 0x03, 0x04]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn simple_packet_snaplen_zero_keeps_the_original_length() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &packet);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -350,12 +350,9 @@ fn simple_packet_snaplen_zero_above_the_maximum_is_not_a_frame() {
         }
     );
     assert_eq!(capture.exit_code(), 14);
-    assert_eq!(
-        fault
-            .phrase()
-            .contains("larger than maximum supported length 262144"),
-        true
-    );
+    assert!(fault
+        .phrase()
+        .contains("larger than maximum supported length 262144"));
 }
 
 #[test]
@@ -495,9 +492,9 @@ fn a_packet_option_does_not_swallow_the_next_packet() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].captured, &[0x11]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0x22]);
-    assert_eq!(is_subslice(&bytes, capture.frames[1].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -513,7 +510,7 @@ fn obsolete_packet_block_is_a_frame() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x0a, 0x0b]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -529,7 +526,7 @@ fn an_unclaimed_pcapng_link_type_still_yields_the_frame() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 127);
     assert_eq!(capture.frames[0].captured, &[0x22]);
-    assert_eq!(is_subslice(&bytes, capture.frames[0].captured), true);
+    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -573,7 +570,7 @@ fn a_truncated_block_keeps_the_earlier_frame() {
         phrase,
         "appears to have been cut short in the middle of a packet"
     );
-    assert_eq!(phrase.contains("or other data"), false);
+    assert!(!phrase.contains("or other data"));
 }
 
 #[test]
@@ -597,12 +594,9 @@ fn captured_length_above_the_maximum_is_not_a_frame() {
         }
     );
     assert_eq!(capture.exit_code(), 14);
-    assert_eq!(
-        fault
-            .phrase()
-            .contains("larger than maximum supported length 262144"),
-        true
-    );
+    assert!(fault
+        .phrase()
+        .contains("larger than maximum supported length 262144"));
 }
 
 #[test]
@@ -626,12 +620,9 @@ fn a_bad_interface_keeps_the_earlier_frame() {
         }
     );
     assert_eq!(capture.exit_code(), 14);
-    assert_eq!(
-        fault
-            .phrase()
-            .contains("interface index 2 is not less than section interface count 1"),
-        true
-    );
+    assert!(fault
+        .phrase()
+        .contains("interface index 2 is not less than section interface count 1"));
 }
 
 #[test]
@@ -683,7 +674,7 @@ fn mismatched_block_lengths_stop() {
         }
     );
     assert_eq!(capture.exit_code(), 14);
-    assert_eq!(fault.phrase().contains("first 36 and second 40"), true);
+    assert!(fault.phrase().contains("first 36 and second 40"));
 }
 
 #[test]

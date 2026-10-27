@@ -47,7 +47,7 @@ struct Packet {
     packet_at: usize,
 }
 
-pub(crate) fn read<'a>(bytes: &'a [u8]) -> Capture<'a> {
+pub(crate) fn read(bytes: &[u8]) -> Capture<'_> {
     match open_section(bytes) {
         Ok((big_endian, offset)) => blocks(bytes, big_endian, offset),
         Err(fault) => Capture::halt(Vec::new(), fault, false),
@@ -78,7 +78,7 @@ fn shb_version(bytes: &[u8], offset: usize, big_endian: bool) -> Result<(), Faul
     }
 }
 
-fn blocks<'a>(bytes: &'a [u8], mut big_endian: bool, mut offset: usize) -> Capture<'a> {
+fn blocks(bytes: &[u8], mut big_endian: bool, mut offset: usize) -> Capture<'_> {
     let mut frames = Vec::new();
     let mut interfaces = Vec::new();
     let mut after_packet = false;
@@ -486,12 +486,12 @@ fn frame<'a>(
     })
 }
 
-fn packet_bytes<'a>(
-    bytes: &'a [u8],
+fn packet_bytes(
+    bytes: &[u8],
     packet_at: usize,
     captured_len: u32,
     data_end: usize,
-) -> Result<&'a [u8], Fault> {
+) -> Result<&[u8], Fault> {
     let Some(end) = packet_at.checked_add(captured_len as usize) else {
         return Err(Fault::CutShort);
     };

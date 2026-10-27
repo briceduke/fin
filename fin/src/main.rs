@@ -61,8 +61,8 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
 }
 
 fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i32, String> {
-    let want_ip = fields.iter().any(|field| *field == Field::IpSrc);
-    let want_tls = fields.iter().any(|field| *field == Field::TlsSni);
+    let want_ip = fields.contains(&Field::IpSrc);
+    let want_tls = fields.contains(&Field::TlsSni);
     let mut session = IpSrc::query(want_ip, want_tls);
     let mut counted = Vec::new();
     for (index, frame) in capture.frames.iter().enumerate() {
