@@ -1086,9 +1086,10 @@ fn certificate_authorities_throws(hello: &[u8], data: usize, ext_len: usize) -> 
 
 /// `ssl_dissect_hnd_hello_ext_oid_filters`: filter list then OID length
 /// `ssl_add_vector` (min is expert-info only). `dissect_ber_object_identifier_str`
-/// then reads identifier and length from the hello tvb. When `values_length > 0`,
-/// `dissect_ber_identifier` / `dissect_ber_length` and `call_ber_oid_callback`'s
-/// `tvb_get_ntohs` also read from the hello tvb.
+/// then reads identifier, length, and the BER value of that length from the
+/// hello tvb. When `values_length > 0`, `dissect_ber_identifier` /
+/// `dissect_ber_length` and `call_ber_oid_callback`'s `tvb_get_ntohs` also
+/// read from the hello tvb.
 fn oid_filters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
     let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
         return false;
@@ -1102,7 +1103,7 @@ fn oid_filters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
         if end - offset < oid_len {
             return false;
         }
-        if hello.len().saturating_sub(offset) < 2 {
+        if ber_value_overruns_hello(hello, offset) {
             return true;
         }
         offset += oid_len;
@@ -1166,13 +1167,25 @@ fn trusted_ca_keys_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
     false
 }
 
-/// tshark 4.6.9 `dissect_x509if_DistinguishedName`: BER identifier and
-/// length from the hello tvb. A missing identifier or length octet throws.
+/// tshark 4.6.9 `dissect_x509if_DistinguishedName` via
+/// `dissect_ber_sequence_of`: BER identifier and length from the hello tvb,
+/// then the BER value of that length. A missing identifier or length octet
+/// throws. A header that fits and a value that overruns the hello tvb also
+/// throws, including long-form length.
 fn distinguished_name_throws(hello: &[u8], offset: usize) -> bool {
+    ber_value_overruns_hello(hello, offset)
+}
+
+/// tshark 4.6.9 BER TLV from the ClientHello tvb: identifier, length, then
+/// the value of that length (`proto_tree_add_item` / `tvb_get_ptr`).
+fn ber_value_overruns_hello(hello: &[u8], offset: usize) -> bool {
     let Some(id_end) = ber_identifier_end(hello, offset) else {
         return true;
     };
-    ber_length(hello, id_end).is_none()
+    let Some((len_end, len)) = ber_length(hello, id_end) else {
+        return true;
+    };
+    hello.len().saturating_sub(len_end) < len
 }
 
 /// tshark 4.6.9 `get_ber_identifier`: one octet, then long-tag octets while
@@ -3052,6 +3065,24 @@ mod tests {
             (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x02, 0x00, 0x00]),
             (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x03, 0x00, 0x00, 0x00]),
             (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x03, 0x00, 0x01, 0x00]),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
+            ),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x05, 0x00, 0x03, 0x30, 0x81, 0x05],
+            ),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x05],
+            ),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x06, 0x02, 0x00, 0x03, 0x30, 0x81, 0x05],
+            ),
+            (EXT_OID_FILTERS, &[0x00, 0x03, 0x02, 0x06, 0x05]),
+            (EXT_OID_FILTERS, &[0x00, 0x04, 0x03, 0x06, 0x81, 0x05]),
         ];
         for &(typ, data) in throws {
             let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
@@ -3127,9 +3158,17 @@ mod tests {
             (EXT_OID_FILTERS, &[0x00, 0x00]),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x00]),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x00]),
+            (
+                EXT_TRUSTED_CA_KEYS,
+                &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x00],
+            ),
             (EXT_PRE_SHARED_KEY, &[0x00, 0x00]),
             (EXT_PRE_SHARED_KEY, &[0x00, 0x01, 0x00]),
             (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x00]),
+            (
+                EXT_CERTIFICATE_AUTHORITIES,
+                &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00],
+            ),
             (
                 EXT_QUIC_TP_V1,
                 &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
