@@ -30,9 +30,11 @@ const EXT_SERVER_CERT_TYPE: u16 = 20;
 const EXT_TOKEN_BINDING: u16 = 24;
 const EXT_COMPRESS_CERTIFICATE: u16 = 27;
 const EXT_RECORD_SIZE_LIMIT: u16 = 28;
+const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_EARLY_DATA: u16 = 42;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_TICKET_EARLY_DATA_INFO: u16 = 46;
+const EXT_CERTIFICATE_AUTHORITIES: u16 = 47;
 const EXT_OID_FILTERS: u16 = 48;
 const EXT_CONNECTION_ID_DEPRECATED: u16 = 53;
 const EXT_CONNECTION_ID: u16 = 54;
@@ -944,6 +946,8 @@ fn hello_ext_handler_throws(typ: u16, ext_len: usize, data: usize, hello: &[u8])
         EXT_ESNI => rem < 4,
         EXT_ALPN => alpn_throws(hello, data, ext_len),
         EXT_STATUS_REQUEST_V2 => status_request_v2_throws(hello, data, ext_len),
+        EXT_PRE_SHARED_KEY => pre_shared_key_throws(hello, data, ext_len),
+        EXT_CERTIFICATE_AUTHORITIES => certificate_authorities_throws(hello, data, ext_len),
         EXT_OID_FILTERS => oid_filters_throws(hello, data, ext_len),
         EXT_TRUSTED_CA_KEYS => trusted_ca_keys_throws(hello, data, ext_len),
         _ => false,
@@ -962,13 +966,29 @@ fn hello_u16_vec(hello: &[u8], data: usize, ext_len: usize) -> Option<(usize, us
     Some((data + 2, data + 2 + len))
 }
 
+/// 2-byte `ssl_add_vector` inside an outer vector: short or truncated is
+/// expert-info only, and the caller returns the outer end.
+fn hello_u16_in(hello: &[u8], offset: usize, end: usize) -> Option<(usize, usize)> {
+    if end.saturating_sub(offset) < 2 {
+        return None;
+    }
+    let len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+    let start = offset + 2;
+    if end.saturating_sub(start) < len {
+        return None;
+    }
+    Some((start, start + len))
+}
+
 /// `ssl_dissect_hnd_hello_ext_alpn`: list then name `ssl_add_vector` (min is
-/// expert-info only). ClientHello ja4 then `tvb_get_uint8`s the name from
-/// the hello tvb, including a last name of length 0 at the hello end.
+/// expert-info only). ClientHello ja4 fills `ja4_data->alpn` from the first
+/// name only (`tvb_get_uint8` first/last char). A later empty name is
+/// `proto_tree_add_item` length 0 and does not throw.
 fn alpn_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
     let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
         return false;
     };
+    let mut ja4 = true;
     while offset < end {
         if end - offset < 1 {
             return false;
@@ -978,16 +998,16 @@ fn alpn_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
         if end - offset < name_len {
             return false;
         }
-        if hello.len().saturating_sub(offset) < 1 {
-            return true;
-        }
-        if name_len > 0 && hello.len().saturating_sub(offset + name_len - 1) < 1 {
-            return true;
+        if ja4 {
+            if hello.len().saturating_sub(offset) < 1 {
+                return true;
+            }
+            if name_len > 0 && hello.len().saturating_sub(offset + name_len - 1) < 1 {
+                return true;
+            }
+            ja4 = false;
         }
         offset += name_len;
-        if name_len == 0 {
-            break;
-        }
     }
     false
 }
@@ -995,6 +1015,8 @@ fn alpn_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
 /// `ssl_dissect_hnd_hello_ext_status_request_v2` then
 /// `ssl_dissect_hnd_hello_ext_status_request(..., has_length=true)`:
 /// `tvb_get_uint8` status type and a 2-byte request length from the hello tvb.
+/// `request_length` is not a bound; ocsp / ocsp_multi then `ssl_add_vector`
+/// the responder list and extensions (no throw) from the v2 list end.
 fn status_request_v2_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
     let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
         return false;
@@ -1003,21 +1025,70 @@ fn status_request_v2_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
         if hello.len().saturating_sub(offset) < 1 {
             return true;
         }
+        let status = hello[offset];
         offset += 1;
         if hello.len().saturating_sub(offset) < 2 {
             return true;
         }
         offset += 2;
-        if offset > end {
-            return false;
+        if status == 1 || status == 2 {
+            let Some((_, resp_end)) = hello_u16_in(hello, offset, end) else {
+                return false;
+            };
+            let Some((_, req_end)) = hello_u16_in(hello, resp_end, end) else {
+                return false;
+            };
+            offset = req_end;
         }
+    }
+    false
+}
+
+/// `ssl_dissect_hnd_hello_ext_pre_shared_key` ClientHello: identities
+/// `ssl_add_vector` (min 7 is expert-info only), then each identity length
+/// `ssl_add_vector` (min is expert-info only) and a 4-byte
+/// `obfuscated_ticket_age` from the hello tvb.
+fn pre_shared_key_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
+        return false;
+    };
+    while offset < end {
+        let Some((_, id_end)) = hello_u16_in(hello, offset, end) else {
+            return false;
+        };
+        offset = id_end;
+        if hello.len().saturating_sub(offset) < 4 {
+            return true;
+        }
+        offset += 4;
+    }
+    false
+}
+
+/// `tls_dissect_certificate_authorities`: DistinguishedName list
+/// `ssl_add_vector` (min is expert-info only), then
+/// `dissect_x509if_DistinguishedName` from the hello tvb.
+fn certificate_authorities_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
+        return false;
+    };
+    while offset < end {
+        let Some((name_start, name_end)) = hello_u16_in(hello, offset, end) else {
+            return false;
+        };
+        if distinguished_name_throws(hello, name_start) {
+            return true;
+        }
+        offset = name_end;
     }
     false
 }
 
 /// `ssl_dissect_hnd_hello_ext_oid_filters`: filter list then OID length
 /// `ssl_add_vector` (min is expert-info only). `dissect_ber_object_identifier_str`
-/// then reads identifier and length from the hello tvb.
+/// then reads identifier and length from the hello tvb. When `values_length > 0`,
+/// `dissect_ber_identifier` / `dissect_ber_length` and `call_ber_oid_callback`'s
+/// `tvb_get_ntohs` also read from the hello tvb.
 fn oid_filters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
     let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
         return false;
@@ -1035,22 +1106,34 @@ fn oid_filters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
             return true;
         }
         offset += oid_len;
-        if end.saturating_sub(offset) < 2 {
+        let Some((values_start, values_end)) = hello_u16_in(hello, offset, end) else {
             return false;
+        };
+        if values_end - values_start > 0 && oid_filter_values_throw(hello, values_start) {
+            return true;
         }
-        let values_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
-        offset += 2;
-        if end.saturating_sub(offset) < values_len {
-            return false;
-        }
-        offset += values_len;
+        offset = values_end;
     }
     false
 }
 
+/// tshark 4.6.9 values vector with length > 0: BER identifier, BER length,
+/// then `tvb_get_ntohs` in `call_ber_oid_callback` from the hello tvb.
+fn oid_filter_values_throw(hello: &[u8], offset: usize) -> bool {
+    let Some(id_end) = ber_identifier_end(hello, offset) else {
+        return true;
+    };
+    let Some((len_end, _)) = ber_length(hello, id_end) else {
+        return true;
+    };
+    hello.len().saturating_sub(len_end) < 2
+}
+
 /// `ssl_dissect_hnd_hello_ext_trusted_ca_keys`: list `ssl_add_vector` (no throw),
 /// then `tvb_get_uint8` identifier_type and, for SHA1 types 1 and 3, a 20-byte
-/// hash from the hello tvb.
+/// hash from the hello tvb. Type `x509_name` (2) `ssl_add_vector`s the
+/// DistinguishedName (min is expert-info only) then
+/// `dissect_x509if_DistinguishedName` from the hello tvb.
 fn trusted_ca_keys_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
     let Some((mut offset, end)) = hello_u16_vec(hello, data, ext_len) else {
         return false;
@@ -1069,20 +1152,68 @@ fn trusted_ca_keys_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
                 offset += 20;
             }
             2 => {
-                if end.saturating_sub(offset) < 2 {
+                let Some((name_start, name_end)) = hello_u16_in(hello, offset, end) else {
                     return false;
+                };
+                if distinguished_name_throws(hello, name_start) {
+                    return true;
                 }
-                let name_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
-                offset += 2;
-                if end.saturating_sub(offset) < name_len {
-                    return false;
-                }
-                offset += name_len;
+                offset = name_end;
             }
             _ => {}
         }
     }
     false
+}
+
+/// tshark 4.6.9 `dissect_x509if_DistinguishedName`: BER identifier and
+/// length from the hello tvb. A missing identifier or length octet throws.
+fn distinguished_name_throws(hello: &[u8], offset: usize) -> bool {
+    let Some(id_end) = ber_identifier_end(hello, offset) else {
+        return true;
+    };
+    ber_length(hello, id_end).is_none()
+}
+
+/// tshark 4.6.9 `get_ber_identifier`: one octet, then long-tag octets while
+/// remaining > 0. A missing first octet throws.
+fn ber_identifier_end(hello: &[u8], mut offset: usize) -> Option<usize> {
+    let id = *hello.get(offset)?;
+    offset += 1;
+    if id & 0x1F == 0x1F {
+        while offset < hello.len() {
+            let t = hello[offset];
+            offset += 1;
+            if t & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    Some(offset)
+}
+
+/// tshark 4.6.9 `try_get_ber_length`. A missing length octet throws.
+fn ber_length(hello: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    let oct = *hello.get(offset)?;
+    offset += 1;
+    if oct & 0x80 == 0 {
+        return Some((offset, oct as usize));
+    }
+    let n = (oct & 0x7F) as usize;
+    if n == 0 {
+        let _ = *hello.get(offset)?;
+        let _ = *hello.get(offset + 1)?;
+        return Some((offset, 0));
+    }
+    if hello.len().saturating_sub(offset) < n {
+        return None;
+    }
+    let mut len = 0usize;
+    for _ in 0..n {
+        len = (len << 8) + hello[offset] as usize;
+        offset += 1;
+    }
+    Some((offset, len))
 }
 
 /// `ssl_dissect_hnd_hello_ext_compress_certificate`: 1-byte `ssl_add_vector`
@@ -2893,12 +3024,34 @@ mod tests {
             (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x01]),
             (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x02]),
             (EXT_STATUS_REQUEST_V2, &[0x00, 0x01, 0x03]),
+            (
+                EXT_STATUS_REQUEST_V2,
+                &[
+                    0x00, 0x15, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
             (EXT_ALPN, &[0x00, 0x01, 0x00]),
             (EXT_OID_FILTERS, &[0x00, 0x02, 0x01, 0x00]),
             (EXT_OID_FILTERS, &[0x00, 0x01, 0x00]),
+            (
+                EXT_OID_FILTERS,
+                &[0x00, 0x06, 0x02, 0x06, 0x00, 0x00, 0x01, 0x00],
+            ),
+            (
+                EXT_OID_FILTERS,
+                &[0x00, 0x07, 0x02, 0x06, 0x00, 0x00, 0x02, 0x00, 0x00],
+            ),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x01]),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x03]),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x02, 0x01, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x03, 0x02, 0x00, 0x00]),
+            (EXT_TRUSTED_CA_KEYS, &[0x00, 0x04, 0x02, 0x00, 0x01, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x02, 0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x03, 0x00, 0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x04, 0x00, 0x00, 0x00, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x02, 0x00, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x03, 0x00, 0x00, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x03, 0x00, 0x01, 0x00]),
         ];
         for &(typ, data) in throws {
             let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
@@ -2963,11 +3116,20 @@ mod tests {
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
             (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
             (EXT_STATUS_REQUEST_V2, &[0x00, 0x00]),
+            (
+                EXT_STATUS_REQUEST_V2,
+                &[0x00, 0x05, 0x01, 0x00, 0x02, 0x00, 0x00],
+            ),
             (EXT_ALPN, &[0x00, 0x00]),
             (EXT_ALPN, &[0x00, 0x02, 0x01, 0x00]),
+            (EXT_ALPN, &[0x00, 0x03, 0x01, 0x00, 0x00]),
+            (EXT_ALPN, &[0x00, 0x03, 0x01, 0x68, 0x00]),
             (EXT_OID_FILTERS, &[0x00, 0x00]),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x00]),
             (EXT_TRUSTED_CA_KEYS, &[0x00, 0x01, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x00]),
+            (EXT_PRE_SHARED_KEY, &[0x00, 0x01, 0x00]),
+            (EXT_CERTIFICATE_AUTHORITIES, &[0x00, 0x00]),
             (
                 EXT_QUIC_TP_V1,
                 &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
