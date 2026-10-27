@@ -278,11 +278,8 @@ fn closed_stdout_still_prints_truncated_pcap_fault() {
     assert_eq!(err, fault);
 }
 
-#[cfg(unix)]
 #[test]
 fn closed_stderr_keeps_counted_exit() {
-    use std::os::unix::net::UnixStream;
-
     let path = work_dir().join("closed-stderr-gre.pcap");
     fs::write(
         &path,
@@ -292,7 +289,7 @@ fn closed_stderr_keeps_counted_exit() {
         ),
     )
     .unwrap();
-    let (reader, writer) = UnixStream::pair().unwrap();
+    let (reader, writer) = io::pipe().unwrap();
     drop(reader);
     let status = Command::new(fin_bin())
         .arg("-r")
