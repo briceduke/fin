@@ -2858,11 +2858,24 @@ mod tests {
             (28, &[0x00]),
             (53, &[]),
             (54, &[]),
+            (27, &[0x01, 0x00]),
+            (27, &[0x03, 0x00, 0x00, 0x00]),
             (57, &[0x00]),
+            (57, &[0x00, 0x40]),
+            (57, &[0x40, 0x00]),
+            (57, &[0x80, 0x00]),
+            (57, &[0x00, 0x01]),
+            (57, &[0x00, 0x00, 0x00]),
             (65445, &[0x00]),
+            (65445, &[0x00, 0x40]),
+            (65445, &[0x40, 0x00]),
+            (65445, &[0x80, 0x00]),
+            (65445, &[0x00, 0x01]),
+            (65445, &[0x00, 0x00, 0x00]),
             (65486, &[]),
             (65486, &[0x00]),
             (65486, &[0x00, 0x00]),
+            (65486, &[0x00, 0x2f, 0x00]),
             (65037, &[]),
             (65037, &[0x00]),
             (65037, &[0x00, 0x00]),
@@ -2925,6 +2938,77 @@ mod tests {
                 next[1].tls_sni,
                 ["other.example"],
                 "type {typ} len {} next payload",
+                data.len()
+            );
+        }
+        let both = ["www.example.com", "other.example"];
+        let keep: &[(u16, &[u8])] = &[
+            (27, &[]),
+            (27, &[0x00]),
+            (27, &[0x02, 0x00, 0x01]),
+            (57, &[]),
+            (57, &[0x00, 0x00]),
+            (65445, &[]),
+            (65445, &[0x00, 0x00]),
+            (65486, &[0x00, 0x2f, 0x00, 0x17]),
+            (65486, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
+            (65486, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
+        ];
+        for &(typ, data) in keep {
+            let first = sni_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_record(&first, &other);
+            for (label, frame) in [
+                ("443", eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &same)),
+                ("unnamed", eth_ipv4_tcp([10, 0, 0, 1], 40001, 40002, &same)),
+            ] {
+                let cell = walk_tls(&frame);
+                assert_eq!(
+                    cell.tls_sni,
+                    both,
+                    "keep type {typ} len {} {label}",
+                    data.len()
+                );
+                assert_eq!(
+                    cell.counted,
+                    None,
+                    "keep type {typ} len {} {label}",
+                    data.len()
+                );
+            }
+            let empty_first = sni_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_record(&empty_first, &hello);
+            let cell = walk_tls(&eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &empty_then));
+            assert_eq!(
+                cell.tls_sni,
+                named,
+                "keep type {typ} len {} first-only then CH",
+                data.len()
+            );
+            assert_eq!(
+                cell.counted,
+                None,
+                "keep type {typ} len {} first-only then CH",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            let cells = next_seq_on(50000, 443, &leftover, &hello);
+            assert_eq!(
+                cells[0].tls_sni,
+                named,
+                "keep type {typ} len {} leftover first",
+                data.len()
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                blank,
+                "keep type {typ} len {} leftover then 0x0301",
+                data.len()
+            );
+            assert_eq!(
+                cells[1].counted,
+                None,
+                "keep type {typ} len {} leftover then 0x0301",
                 data.len()
             );
         }

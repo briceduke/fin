@@ -25,6 +25,7 @@ const EXT_HEARTBEAT_MODE: u16 = 15;
 const EXT_CLIENT_CERT_TYPE: u16 = 19;
 const EXT_SERVER_CERT_TYPE: u16 = 20;
 const EXT_TOKEN_BINDING: u16 = 24;
+const EXT_COMPRESS_CERTIFICATE: u16 = 27;
 const EXT_RECORD_SIZE_LIMIT: u16 = 28;
 const EXT_EARLY_DATA: u16 = 42;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
@@ -931,11 +932,127 @@ fn hello_ext_handler_throws(typ: u16, ext_len: usize, data: usize, hello: &[u8])
             let cidl = hello[data] as usize;
             cidl > 0 && rem < 1 + cidl
         }
-        EXT_QUIC_TP_V1 | EXT_QUIC_TP => ext_len > 0 && rem < 2,
+        EXT_COMPRESS_CERTIFICATE => compress_certificate_throws(hello, data, ext_len),
+        EXT_QUIC_TP_V1 | EXT_QUIC_TP => quic_transport_parameters_throws(hello, data, ext_len),
         EXT_ECH => ech_client_hello_throws(hello, data),
-        EXT_ESNI => rem < 6,
+        // Suite (2) then KeyShare group (2). `ssl_add_vector` for key_exchange
+        // does not throw, so length 4–5 stays inside the hello tvb.
+        EXT_ESNI => rem < 4,
         _ => false,
     }
+}
+
+/// `ssl_dissect_hnd_hello_ext_compress_certificate`: 1-byte `ssl_add_vector`
+/// does not throw, then 2-byte algorithm IDs from the hello tvb.
+fn compress_certificate_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    if ext_len < 1 {
+        return false;
+    }
+    let Some(&alg_len) = hello.get(data) else {
+        return false;
+    };
+    let alg_len = alg_len as usize;
+    if ext_len - 1 < alg_len {
+        return false;
+    }
+    let mut offset = data + 1;
+    let next_offset = offset + alg_len;
+    while offset < next_offset {
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        offset += 2;
+    }
+    false
+}
+
+/// `ssl_dissect_hnd_hello_ext_quic_transport_parameters`.
+fn quic_transport_parameters_throws(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    if quic_draft26(hello, data, ext_len) {
+        let list_len = u16::from_be_bytes([hello[data], hello[data + 1]]) as usize;
+        if ext_len < 2 || ext_len - 2 < list_len {
+            return false;
+        }
+        return quic_params_legacy_throws(hello, data + 2, data + 2 + list_len);
+    }
+    quic_params_varint_throws(hello, data, data + ext_len)
+}
+
+/// Draft -26 or older: 2-byte list length, then 2-byte type/length params.
+fn quic_draft26(hello: &[u8], data: usize, ext_len: usize) -> bool {
+    if ext_len < 6 {
+        return false;
+    }
+    let list_len = u16::from_be_bytes([hello[data], hello[data + 1]]) as usize;
+    let first_val = u16::from_be_bytes([hello[data + 4], hello[data + 5]]) as usize;
+    2 + list_len == ext_len && 6 + first_val <= ext_len
+}
+
+fn quic_params_varint_throws(hello: &[u8], mut offset: usize, next_offset: usize) -> bool {
+    while offset < next_offset {
+        // `proto_tree_add_subtree(..., 2)` then type/length `ENC_VARINT_QUIC`.
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        let Some((_, type_len)) = quic_varint(hello, offset) else {
+            return true;
+        };
+        offset += type_len;
+        let Some((plen, len_len)) = quic_varint(hello, offset) else {
+            return true;
+        };
+        offset += len_len;
+        let parameter_length = plen as u32 as usize;
+        if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
+            return true;
+        }
+        match offset.checked_add(parameter_length) {
+            Some(end) => offset = end,
+            None => return true,
+        }
+    }
+    false
+}
+
+fn quic_params_legacy_throws(hello: &[u8], mut offset: usize, next_offset: usize) -> bool {
+    while offset < next_offset {
+        if hello.len().saturating_sub(offset) < 2 {
+            return true;
+        }
+        offset += 2;
+        if next_offset.saturating_sub(offset) < 2 {
+            return false;
+        }
+        let parameter_length = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        if next_offset.saturating_sub(offset) < parameter_length {
+            return false;
+        }
+        if parameter_length > 0 && hello.len().saturating_sub(offset) < parameter_length {
+            return true;
+        }
+        offset += parameter_length;
+    }
+    false
+}
+
+/// QUIC varint: length is `1 << (first >> 6)` (1/2/4/8). None means the hello
+/// tvb read throws.
+fn quic_varint(hello: &[u8], offset: usize) -> Option<(u64, usize)> {
+    let rem = hello.len().saturating_sub(offset);
+    if rem == 0 {
+        return None;
+    }
+    let first = hello[offset];
+    let len = 1usize << (first >> 6);
+    if rem < len {
+        return None;
+    }
+    let mut value = 0u64;
+    for &b in &hello[offset..offset + len] {
+        value = (value << 8) | u64::from(b);
+    }
+    Some((value & ((1u64 << (len * 8 - 2)) - 1), len))
 }
 
 /// `ssl_dissect_hnd_hello_ext_ech` ClientHello: type, then outer cipher suite.
@@ -2523,11 +2640,24 @@ mod tests {
             (EXT_RECORD_SIZE_LIMIT, &[0x00]),
             (EXT_CONNECTION_ID_DEPRECATED, &[]),
             (EXT_CONNECTION_ID, &[]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x01, 0x00]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x03, 0x00, 0x00, 0x00]),
             (EXT_QUIC_TP_V1, &[0x00]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x40]),
+            (EXT_QUIC_TP_V1, &[0x40, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x80, 0x00]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x01]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x00, 0x00]),
             (EXT_QUIC_TP, &[0x00]),
+            (EXT_QUIC_TP, &[0x00, 0x40]),
+            (EXT_QUIC_TP, &[0x40, 0x00]),
+            (EXT_QUIC_TP, &[0x80, 0x00]),
+            (EXT_QUIC_TP, &[0x00, 0x01]),
+            (EXT_QUIC_TP, &[0x00, 0x00, 0x00]),
             (EXT_ESNI, &[]),
             (EXT_ESNI, &[0x00]),
             (EXT_ESNI, &[0x00, 0x00]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00]),
             (EXT_ECH, &[]),
             (EXT_ECH, &[0x00]),
             (EXT_ECH, &[0x00, 0x00]),
@@ -2576,16 +2706,60 @@ mod tests {
                 data.len()
             );
         }
-        let keep = client_hello_exts(Some("www.example.com"), &[(EXT_HEARTBEAT_MODE, &[0x01])]);
-        let same = two_hellos_same_record(&keep, &other);
-        assert_eq!(
-            parse_tcp_tls_on_tls_port(&same),
-            TlsParse::ClientHello(vec![
-                "www.example.com".to_string(),
-                "other.example".to_string()
-            ]),
-            "heartbeat mode length 1 does not throw"
-        );
+        let both = TlsParse::ClientHello(vec![
+            "www.example.com".to_string(),
+            "other.example".to_string(),
+        ]);
+        let keep: &[(u16, &[u8])] = &[
+            (EXT_HEARTBEAT_MODE, &[0x01]),
+            (EXT_COMPRESS_CERTIFICATE, &[]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x00]),
+            (EXT_COMPRESS_CERTIFICATE, &[0x02, 0x00, 0x01]),
+            (EXT_QUIC_TP_V1, &[]),
+            (EXT_QUIC_TP_V1, &[0x00, 0x00]),
+            (EXT_QUIC_TP, &[]),
+            (EXT_QUIC_TP, &[0x00, 0x00]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
+            (EXT_ESNI, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
+        ];
+        for &(typ, data) in keep {
+            let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+            let same = two_hellos_same_record(&first, &other);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&same),
+                both.clone(),
+                "keep type {typ} len {} then other same record",
+                data.len()
+            );
+            assert_eq!(
+                parse_tcp_tls(&same),
+                both.clone(),
+                "unnamed keep type {typ} len {} then other",
+                data.len()
+            );
+            let empty_first = client_hello_exts(None, &[(typ, data)]);
+            let empty_then = two_hellos_same_record(&empty_first, &hello);
+            assert_eq!(
+                parse_tcp_tls_on_tls_port(&empty_then),
+                named.clone(),
+                "keep type {typ} len {} only then www.example.com",
+                data.len()
+            );
+            let mut leftover = first.clone();
+            leftover.push(0x00);
+            assert!(
+                truncated_handshake_prefix(&leftover, TlsSession::Unknown).is_some(),
+                "keep type {typ} len {} leftover 00 desegments",
+                data.len()
+            );
+            assert_eq!(
+                stitch_leftover(&leftover, &hello),
+                TlsParse::Other,
+                "keep type {typ} len {} leftover 00 then 0x0301 is continuation",
+                data.len()
+            );
+        }
         let host = b"www.example.com";
         let entry_len = 1 + 2 + host.len();
         let mut sni_data = Vec::from((entry_len as u16).to_be_bytes());
