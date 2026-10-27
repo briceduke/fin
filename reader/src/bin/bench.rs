@@ -31,7 +31,9 @@ fn main() -> ExitCode {
         eprintln!("load {:.6}", load_started.elapsed().as_secs_f64());
     }
     if chunked {
-        let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         return bench_pair(&bytes, threads);
     }
     let mut timed = [0.0; 3];

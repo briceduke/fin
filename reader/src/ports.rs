@@ -1,7 +1,8 @@
 //! tshark 4.6.9 UDP/TCP port table snapshot.
 //!
 //! `udp-tcp-decodes.txt` is the `udp.port` / `tcp.port` rows of
-//! `tshark -G decodes`. Names on the always-claim
+//! `tshark -G decodes`. `tls-port-decodes.txt` is the `tls.port` rows
+//! (`ssl_associations`). Names on the always-claim
 //! and reaches-IP lists come from `reader/ports/reaches-ip.md` and
 //! `reader/ports/may-reject.md`. Anything not proved to always claim may reject.
 
@@ -9,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const DECODES: &str = include_str!("../ports/udp-tcp-decodes.txt");
+const TLS_DECODES: &str = include_str!("../ports/tls-port-decodes.txt");
 
 /// Port dissectors proved in 4.6.9 to always claim the payload.
 const ALWAYS_CLAIM: &[&str] = &[
@@ -110,12 +112,17 @@ impl PortPick {
     pub fn is_vxlan(self) -> bool {
         self.name == Some("vxlan") && !self.may_reject
     }
+
+    pub fn is_tls(self) -> bool {
+        self.name == Some("tls")
+    }
 }
 
-/// Snapshotted `udp.port` / `tcp.port` tables from tshark 4.6.9.
+/// Snapshotted `udp.port` / `tcp.port` / `tls.port` tables from tshark 4.6.9.
 pub struct PortTables {
     udp: HashMap<u16, &'static str>,
     tcp: HashMap<u16, &'static str>,
+    tls: HashSet<u16>,
     always_claim: HashSet<&'static str>,
     reaches_ip: HashSet<&'static str>,
 }
@@ -134,7 +141,8 @@ impl PortTables {
     fn from_dump() -> Self {
         let mut udp = HashMap::new();
         let mut tcp = HashMap::new();
-        for line in DECODES.lines() {
+        let mut tls = HashSet::new();
+        for line in DECODES.lines().chain(TLS_DECODES.lines()) {
             let mut cols = line.split('\t');
             let Some(table) = cols.next() else { continue };
             let Some(key) = cols.next() else { continue };
@@ -142,16 +150,25 @@ impl PortTables {
             let Some(port) = parse_port(key) else {
                 continue;
             };
-            let slot = match table {
-                "udp.port" => &mut udp,
-                "tcp.port" => &mut tcp,
-                _ => continue,
-            };
-            slot.entry(port).or_insert(name);
+            match table {
+                "udp.port" => {
+                    udp.entry(port).or_insert(name);
+                }
+                "tcp.port" => {
+                    tcp.entry(port).or_insert(name);
+                }
+                "tls.port" => {
+                    if port != 0 {
+                        tls.insert(port);
+                    }
+                }
+                _ => {}
+            }
         }
         Self {
             udp,
             tcp,
+            tls,
             always_claim: ALWAYS_CLAIM.iter().copied().collect(),
             reaches_ip: REACHES_IP.iter().copied().collect(),
         }
@@ -163,6 +180,13 @@ impl PortTables {
 
     pub fn tcp(&self, src: u16, dst: u16) -> PortPick {
         self.pick(&self.tcp, src, dst)
+    }
+
+    /// tshark 4.6.9 `ssl_packet_from_server` before `ssl_set_server`:
+    /// `dissector_get_uint_handle(ssl_associations, srcport) != 0`.
+    /// `ssl_associations` is the `tls.port` table, not `tcp.port`.
+    pub fn is_tls_port(&self, port: u16) -> bool {
+        port != 0 && self.tls.contains(&port)
     }
 
     fn pick(&self, map: &HashMap<u16, &'static str>, src: u16, dst: u16) -> PortPick {
@@ -220,6 +244,11 @@ pub fn checked_in_decodes() -> &'static str {
     DECODES
 }
 
+/// `tls.port` dump text, for the live-tshark comparison test.
+pub fn checked_in_tls_ports() -> &'static str {
+    TLS_DECODES
+}
+
 pub fn checked_in_heuristics() -> &'static str {
     include_str!("../ports/heuristic-decodes.txt")
 }
@@ -260,5 +289,37 @@ mod tests {
         let pick = tables.udp(12345, 9);
         assert_eq!(pick.name, Some("discard"));
         assert!(!pick.must_count());
+    }
+
+    #[test]
+    fn tcp_443_is_tls() {
+        let tables = snapshot();
+        let pick = tables.tcp(50000, 443);
+        assert_eq!(pick.name, Some("tls"));
+        assert!(pick.is_tls());
+        assert!(!pick.is_vxlan());
+    }
+
+    #[test]
+    fn tls_port_is_the_source_port_not_the_pair() {
+        let tables = snapshot();
+        for port in [443u16, 465, 636, 853, 993, 995] {
+            assert!(tables.is_tls_port(port), "{port}");
+        }
+        assert!(!tables.is_tls_port(50000));
+        assert!(!tables.is_tls_port(40001));
+        assert!(!tables.is_tls_port(0));
+    }
+
+    #[test]
+    fn tls_port_is_ssl_associations_not_tcp_port() {
+        let tables = snapshot();
+        for port in [3389u16, 4420, 4460, 6514, 8009, 10050, 10051, 10809, 27017] {
+            assert!(tables.is_tls_port(port), "{port}");
+            assert_ne!(first_named(&tables.tcp, port), Some("tls"), "{port}");
+        }
+        assert_eq!(first_named(&tables.tcp, 3389), Some("tpkt"));
+        assert!(first_named(&tables.tcp, 4460).is_none());
+        assert!(first_named(&tables.tcp, 6514).is_none());
     }
 }
