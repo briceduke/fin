@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::diff::PairOutput;
@@ -63,7 +63,8 @@ impl TsharkSession {
     }
 }
 
-static VERIFIED_TSHARK: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+static VERIFIED_TSHARK: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn ensure_version(tshark: &Path) -> Result<(), RunError> {
     {
