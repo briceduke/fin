@@ -153,7 +153,7 @@ pub struct IpSrc {
     /// Payload already walked at this TCP seq.
     http_seen: HashMap<TcpSeq, HttpSeen>,
     /// Next unused TCP seq on that direction, matching tshark 4.6.9
-    /// `tcp.reassemble_out_of_order:TRUE` nxtseq.
+    /// `tcp.reassemble_out_of_order:TRUE` nxtseq. SYN consumes one.
     http_next_seq: HashMap<TcpFlow, u32>,
     /// Direction waiting for `http.desegment_body` continuation.
     http_desegment: HashSet<TcpFlow>,
@@ -254,6 +254,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         flow_src: None,
         flow_dst: None,
         depth: 0,
+        tcp_syn: false,
     };
     walk.link(frame.link_type, frame.captured);
     Cell {
@@ -289,6 +290,8 @@ struct Walk<'a> {
     flow_src: Option<FlowHost>,
     flow_dst: Option<FlowHost>,
     depth: usize,
+    /// This TCP segment has SYN; tshark 4.6.9 nxtseq is seq+len+1.
+    tcp_syn: bool,
 }
 
 impl Walk<'_> {
@@ -702,6 +705,7 @@ impl Walk<'_> {
         let flags = bytes[13];
         let fin = flags & 0x01 != 0;
         let rst = flags & 0x04 != 0;
+        self.tcp_syn = flags & 0x02 != 0;
         let pick = self.tables.tcp(src, dst);
         let payload = &bytes[data_off..];
         if self.want_tls {
@@ -823,6 +827,9 @@ impl Walk<'_> {
                         .and_then(|key| self.http_seen.get(&key).map(|prev| prev.hosts))
                         .unwrap_or(skip_hosts);
                     self.note_http_seen(flow, key, seq, payload, true, already.max(skip_hosts));
+                    if let Some(flow) = flow {
+                        self.http_desegment.insert(flow);
+                    }
                 }
                 HttpParse::Unproved => {
                     self.note_http_seen(flow, key, seq, payload, true, skip_hosts);
@@ -934,7 +941,8 @@ impl Walk<'_> {
         let Some(flow) = flow else {
             return;
         };
-        let end = seq.wrapping_add(len);
+        // tshark 4.6.9 TCP nxtseq after SYN is seq+len+1; SYN consumes a seq.
+        let end = seq.wrapping_add(len).wrapping_add(u32::from(self.tcp_syn));
         match self.http_next_seq.get(&flow).copied() {
             Some(next) if (end.wrapping_sub(next) as i32) <= 0 => {}
             _ => {
@@ -2685,6 +2693,69 @@ mod tests {
     }
 
     #[test]
+    fn http_syn_payload_nxtseq_skips_seq_plus_len() {
+        for (label, flags) in SYN_HTTP_FLAGS {
+            let cells = syn_http_then(flags, 35, 80);
+            assert_eq!(cells[0].http_host, ["a.example"], "{label} extra");
+            assert_eq!(cells[0].counted, None, "{label} extra");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} extra");
+            assert_eq!(cells[1].counted, None, "{label} extra");
+        }
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x1a, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 35, INNER_GET),
+        ]);
+        assert_eq!(ipv6[0].http_host, ["a.example"]);
+        assert_eq!(ipv6[0].counted, None);
+        assert_eq!(ipv6[1].http_host, [] as [&str; 0]);
+        assert_eq!(ipv6[1].counted, None);
+        let port = syn_http_then(0x1a, 35, 8080);
+        assert_eq!(port[0].http_host, ["a.example"]);
+        assert_eq!(port[0].counted, None);
+        assert_eq!(port[1].http_host, [] as [&str; 0]);
+        assert_eq!(port[1].counted, None);
+    }
+
+    #[test]
+    fn http_syn_payload_nxtseq_prints_in_order_after_syn() {
+        for (label, flags) in SYN_HTTP_FLAGS {
+            let cells = syn_http_then(flags, 36, 80);
+            assert_eq!(cells[0].http_host, ["a.example"], "{label} drop");
+            assert_eq!(cells[0].counted, None, "{label} drop");
+            assert_eq!(cells[1].http_host, ["inner.example"], "{label} drop");
+            assert_eq!(cells[1].counted, None, "{label} drop");
+        }
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x1a, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 36, INNER_GET),
+        ]);
+        assert_first_a_then_inner(&ipv6, "ipv6-syn");
+        let port = syn_http_then(0x1a, 36, 8080);
+        assert_first_a_then_inner(&port, "8080-syn");
+    }
+
+    #[test]
+    fn http_empty_syn_then_get_at_seq_1_prints_host() {
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["a.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_get_fin_without_syn_still_prints_in_order() {
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x19, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 36, INNER_GET),
+        ]);
+        assert_first_a_then_inner(&cells, "get-fin");
+    }
+
+    #[test]
     fn http_truncated_prefix_extend_then_complete_prints_host() {
         for cut in [
             b"GET / HTTP/1.1\r\nHost: ".as_slice(),
@@ -2706,6 +2777,63 @@ mod tests {
             assert_eq!(cells[2].http_host, ["inner.example"], "{cut:?}");
             assert_eq!(cells[2].counted, None, "{cut:?}");
         }
+    }
+
+    #[test]
+    fn http_unproved_prefix_extend_suffix_counts_in_order_inner() {
+        for n in [1usize, 2, 3, 17, 18, 19, 20] {
+            let cells = truncated_suffix_then_in_order(&INNER_GET[..n]);
+            assert_eq!(cells[0].http_host, ["a.example"], "cut {n}");
+            assert_eq!(cells[0].counted, None, "cut {n}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "cut {n}");
+            assert_eq!(cells[1].counted, None, "cut {n}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "cut {n}");
+            assert_eq!(cells[2].counted, Some("http"), "cut {n}");
+        }
+        let cut = b"GET / HTTP/1.1\r\nHost: ";
+        let cells = truncated_suffix_then_in_order(cut);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http"));
+        let second = overlap_past_nxtseq(35, b"GET / HTTP/1.1\r\nHos");
+        let nxtseq = 35 + second.len() as u32;
+        let overlap = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, nxtseq, INNER_GET),
+        ]);
+        assert_eq!(overlap[0].http_host, ["a.example"]);
+        assert_eq!(overlap[0].counted, None);
+        assert_eq!(overlap[1].http_host, [] as [&str; 0]);
+        assert_eq!(overlap[1].counted, None);
+        assert_eq!(overlap[2].http_host, [] as [&str; 0]);
+        assert_eq!(overlap[2].counted, Some("http"));
+    }
+
+    #[test]
+    fn http_unproved_prefix_extend_host_value_only_is_counted() {
+        let mut mid = GET_A.to_vec();
+        mid.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
+            eth_ipv4_tcp_seq(
+                CLIENT,
+                50000,
+                80,
+                1 + mid.len() as u32,
+                b"inner.example\r\n\r\n",
+            ),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http"));
     }
 
     #[test]
@@ -2963,6 +3091,31 @@ mod tests {
         let mut payload = vec![b'X'; pad];
         payload.extend_from_slice(suffix);
         payload
+    }
+
+    const SYN_HTTP_FLAGS: [(&str, u8); 5] = [
+        ("syn", 0x02),
+        ("syn-psh", 0x0a),
+        ("syn-ack", 0x12),
+        ("syn-psh-ack", 0x1a),
+        ("syn-psh-ack-fin", 0x1b),
+    ];
+
+    fn syn_http_then(flags: u8, seq: u32, dport: u16) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, dport, seq, INNER_GET),
+        ])
+    }
+
+    fn truncated_suffix_then_in_order(cut: &[u8]) -> Vec<Cell> {
+        let mut mid = GET_A.to_vec();
+        mid.extend_from_slice(cut);
+        walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1 + mid.len() as u32, INNER_GET),
+        ])
     }
 
     fn assert_first_a_then_inner(cells: &[Cell], label: &str) {
@@ -6064,10 +6217,22 @@ mod tests {
         seq: u32,
         payload: &[u8],
     ) -> Vec<u8> {
+        eth_ipv6_tcp_flow_flags(src, dst, sport, dport, seq, 0x18, payload)
+    }
+
+    fn eth_ipv6_tcp_flow_flags(
+        src: [u8; 16],
+        dst: [u8; 16],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut tcp = Vec::from(sport.to_be_bytes());
         tcp.extend_from_slice(&dport.to_be_bytes());
         tcp.extend_from_slice(&seq.to_be_bytes());
-        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, flags, 0, 64, 0, 0, 0, 0]);
         tcp.extend_from_slice(payload);
         let mut frame = vec![
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60, 0, 0, 0,

@@ -296,6 +296,23 @@ fn truncated_prefix_extend(cut: &[u8]) -> Vec<Vec<u8>> {
         eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &last),
     ]
 }
+
+fn syn_then_inner(flags: u8, seq: u32, dport: u16) -> Vec<Vec<u8>> {
+    vec![
+        eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, dport, 0, flags, GET_A),
+        eth_ipv4_tcp_seq(OUTER, 50000, dport, seq, INNER_GET),
+    ]
+}
+
+fn truncated_suffix_then_inner(cut: &[u8]) -> Vec<Vec<u8>> {
+    let mut mid = GET_A.to_vec();
+    mid.extend_from_slice(cut);
+    vec![
+        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &mid),
+        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1 + mid.len() as u32, INNER_GET),
+    ]
+}
 const POST_CL0_A: &[u8] = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
 const RESP_204_A: &[u8] = b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n";
 const NOTIFY_A: &[u8] = b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n";
@@ -3107,9 +3124,135 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(connect_cases())
     .chain(http2_cl24_cases())
     .chain(junk_header_cases())
+    .chain(syn_nxtseq_cases())
+    .chain(prefix_extend_desegment_cases())
     .chain(on_disk())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
+}
+
+fn leak(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
+}
+
+fn syn_nxtseq_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let flags = [
+        ("syn", 0x02u8),
+        ("syn-psh", 0x0a),
+        ("syn-ack", 0x12),
+        ("syn-psh-ack", 0x1a),
+        ("syn-psh-ack-fin", 0x1b),
+    ];
+    let mut out = Vec::new();
+    for (tag, flags) in flags {
+        out.push((
+            leak(format!("{tag}-get-then-seq-35")),
+            pcap(LINK_ETHERNET, &syn_then_inner(flags, 35, 80)),
+        ));
+        out.push((
+            leak(format!("{tag}-get-then-seq-36")),
+            pcap(LINK_ETHERNET, &syn_then_inner(flags, 36, 80)),
+        ));
+    }
+    out.push((
+        "syn-psh-ack-get-then-seq-35-8080",
+        pcap(LINK_ETHERNET, &syn_then_inner(0x1a, 35, 8080)),
+    ));
+    out.push((
+        "syn-psh-ack-get-then-seq-36-8080",
+        pcap(LINK_ETHERNET, &syn_then_inner(0x1a, 36, 8080)),
+    ));
+    out.push((
+        "syn-psh-ack-get-then-seq-35-ipv6",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv6_tcp_to_flags(OUTER_V6, PEER_V6, 50000, 80, 0, 0x1a, GET_A),
+                eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 35, INNER_GET),
+            ],
+        ),
+    ));
+    out.push((
+        "syn-psh-ack-get-then-seq-36-ipv6",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv6_tcp_to_flags(OUTER_V6, PEER_V6, 50000, 80, 0, 0x1a, GET_A),
+                eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 36, INNER_GET),
+            ],
+        ),
+    ));
+    out.push((
+        "empty-syn-then-get-seq-1",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+            ],
+        ),
+    ));
+    out.push((
+        "get-fin-then-in-order-inner",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1, 0x19, GET_A),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 36, INNER_GET),
+            ],
+        ),
+    ));
+    out
+}
+
+fn prefix_extend_desegment_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    for n in [1usize, 2, 3, 17, 18, 19, 20] {
+        out.push((
+            leak(format!("prefix-extend-cut-{n}-then-inner")),
+            pcap(LINK_ETHERNET, &truncated_suffix_then_inner(&INNER_GET[..n])),
+        ));
+    }
+    out.push((
+        "prefix-extend-host-colon-then-inner",
+        pcap(
+            LINK_ETHERNET,
+            &truncated_suffix_then_inner(b"GET / HTTP/1.1\r\nHost: "),
+        ),
+    ));
+    let second = overlap_past_nxtseq(35, b"GET / HTTP/1.1\r\nHos");
+    let nxtseq = 35 + second.len() as u32;
+    out.push((
+        "prefix-extend-overlap-seq-35-hos-then-inner",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 35, &second),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, nxtseq, INNER_GET),
+            ],
+        ),
+    ));
+    let mut mid = GET_A.to_vec();
+    mid.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
+    out.push((
+        "prefix-extend-host-colon-then-host-value",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &mid),
+                eth_ipv4_tcp_seq(
+                    OUTER,
+                    50000,
+                    80,
+                    1 + mid.len() as u32,
+                    b"inner.example\r\n\r\n",
+                ),
+            ],
+        ),
+    ));
+    out
 }
 
 fn connect_req(uri: &str) -> Vec<u8> {

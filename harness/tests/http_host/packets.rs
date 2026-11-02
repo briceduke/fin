@@ -213,9 +213,26 @@ pub fn eth_ipv6_tcp_to(
     seq: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    eth_ipv6_tcp_to_flags(src, dst, sport, dport, seq, 0x18, payload)
+}
+
+pub fn eth_ipv6_tcp_to_flags(
+    src: [u8; 16],
+    dst: [u8; 16],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     eth(
         0x86dd,
-        &ipv6_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+        &ipv6_to(
+            src,
+            dst,
+            6,
+            &tcp_seq_flags(sport, dport, seq, flags, payload),
+        ),
     )
 }
 
