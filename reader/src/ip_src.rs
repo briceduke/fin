@@ -3,6 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
+use crate::http_host::{
+    looks_like_http2_preface, looks_like_http_heuristic, parse_http_pending, HttpParse, HttpProved,
+};
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake,
@@ -47,6 +50,7 @@ const DEPTH: usize = 8;
 pub struct Cell {
     pub values: Vec<String>,
     pub tls_sni: Vec<String>,
+    pub http_host: Vec<String>,
     pub counted: Option<&'static str>,
 }
 
@@ -103,6 +107,30 @@ struct TcpSeq {
     seq: u32,
 }
 
+/// Payload already walked at one TCP seq.
+#[derive(Debug, Clone)]
+struct HttpSeen {
+    len: u32,
+    /// Incomplete at this seq; a later longer overlap may complete it.
+    open: bool,
+    /// Hosts already emitted from this seq, so a later prefix extension
+    /// does not print them again.
+    hosts: usize,
+    payload: Vec<u8>,
+}
+
+/// A later TCP segment versus bytes already walked on that direction.
+enum HttpOverlap {
+    /// In-order at nxtseq; dissect this payload as a new HTTP start.
+    Fresh,
+    /// Retransmission, fully-contained overlap, or a gap after nxtseq.
+    Skip,
+    /// Extends past nxtseq; dissect only the new suffix.
+    Suffix(usize),
+    /// Prefix-extends a still-open seq; re-parse the full payload.
+    OpenComplete { already: usize },
+}
+
 #[derive(Debug, Clone)]
 struct TlsNeed {
     next_seq: u32,
@@ -122,8 +150,28 @@ pub struct IpSrc {
     tls_session: HashMap<TcpFlow, TlsSession>,
     /// Conversation CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
     tls_ccs: HashMap<TcpFlow, TlsCcs>,
+    /// Payload already walked at this TCP seq.
+    http_seen: HashMap<TcpSeq, HttpSeen>,
+    /// Next unused TCP seq on that direction, matching tshark 4.6.9
+    /// `tcp.reassemble_out_of_order:TRUE` nxtseq. SYN consumes one.
+    http_next_seq: HashMap<TcpFlow, u32>,
+    /// Direction waiting for `http.desegment_body` continuation.
+    http_desegment: HashSet<TcpFlow>,
+    /// Heuristic `http_tcp` or an HTTP/2 preface on a named `http` port
+    /// sticks the TCP conversation, matching tshark 4.6.9.
+    http_claimed: HashSet<TcpFlow>,
+    /// `SSTP_DUPLEX_POST` waiting for a complete 200, matching packet-http.c.
+    /// A 1xx does not clear this; tshark 4.6.9 `push_res` keeps `request_method`.
+    http_sstp: HashSet<TcpFlow>,
+    /// CONNECT waiting for a 2xx. The value is the URI port after `:`,
+    /// or `None` when the URI has no colon. tshark 4.6.9
+    /// `http_conversation_is_connect` then `http_payload_subdissector`.
+    http_connect: HashMap<TcpFlow, Option<u32>>,
+    /// Conversation switched off HTTP; later Hosts are counted `http-tunnel`.
+    http_tunnel: HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
+    want_http: bool,
 }
 
 /// tshark 4.6.9 `SslSession` CCS and server role on one TCP conversation.
@@ -148,6 +196,11 @@ impl IpSrc {
 
     /// Walk only the fields the CLI asked for.
     pub fn query(ip_src: bool, tls_sni: bool) -> Self {
+        Self::fields(ip_src, tls_sni, false)
+    }
+
+    /// Walk `ip.src`, TLS SNI, and/or `http.host`.
+    pub fn fields(ip_src: bool, tls_sni: bool, http_host: bool) -> Self {
         Self {
             tables: snapshot(),
             frags: FragTable::default(),
@@ -156,8 +209,16 @@ impl IpSrc {
             tls_claimed: HashSet::new(),
             tls_session: HashMap::new(),
             tls_ccs: HashMap::new(),
-            want_ip: ip_src || !tls_sni,
+            http_seen: HashMap::new(),
+            http_next_seq: HashMap::new(),
+            http_desegment: HashSet::new(),
+            http_claimed: HashSet::new(),
+            http_sstp: HashSet::new(),
+            http_connect: HashMap::new(),
+            http_tunnel: HashSet::new(),
+            want_ip: ip_src || (!tls_sni && !http_host),
             want_tls: tls_sni,
+            want_http: http_host,
         }
     }
 
@@ -171,6 +232,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
     let mut walk = Walk {
         values: Vec::new(),
         tls_sni: Vec::new(),
+        http_host: Vec::new(),
         counted: None,
         tables: session.tables,
         frags: &mut session.frags,
@@ -179,16 +241,26 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tls_claimed: &mut session.tls_claimed,
         tls_session: &mut session.tls_session,
         tls_ccs: &mut session.tls_ccs,
+        http_seen: &mut session.http_seen,
+        http_next_seq: &mut session.http_next_seq,
+        http_desegment: &mut session.http_desegment,
+        http_claimed: &mut session.http_claimed,
+        http_sstp: &mut session.http_sstp,
+        http_connect: &mut session.http_connect,
+        http_tunnel: &mut session.http_tunnel,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
+        want_http: session.want_http,
         flow_src: None,
         flow_dst: None,
         depth: 0,
+        tcp_syn: false,
     };
     walk.link(frame.link_type, frame.captured);
     Cell {
         values: walk.values,
         tls_sni: walk.tls_sni,
+        http_host: walk.http_host,
         counted: walk.counted,
     }
 }
@@ -196,6 +268,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
 struct Walk<'a> {
     values: Vec<String>,
     tls_sni: Vec<String>,
+    http_host: Vec<String>,
     counted: Option<&'static str>,
     tables: &'static PortTables,
     frags: &'a mut FragTable,
@@ -204,11 +277,21 @@ struct Walk<'a> {
     tls_claimed: &'a mut HashSet<TcpFlow>,
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
     tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
+    http_seen: &'a mut HashMap<TcpSeq, HttpSeen>,
+    http_next_seq: &'a mut HashMap<TcpFlow, u32>,
+    http_desegment: &'a mut HashSet<TcpFlow>,
+    http_claimed: &'a mut HashSet<TcpFlow>,
+    http_sstp: &'a mut HashSet<TcpFlow>,
+    http_connect: &'a mut HashMap<TcpFlow, Option<u32>>,
+    http_tunnel: &'a mut HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
+    want_http: bool,
     flow_src: Option<FlowHost>,
     flow_dst: Option<FlowHost>,
     depth: usize,
+    /// This TCP segment has SYN; tshark 4.6.9 nxtseq is seq+len+1.
+    tcp_syn: bool,
 }
 
 impl Walk<'_> {
@@ -329,7 +412,7 @@ impl Walk<'_> {
             return;
         }
         let dst = Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]);
-        if self.want_tls {
+        if self.want_tls || self.want_http {
             self.flow_src = Some(FlowHost::V4(src));
             self.flow_dst = Some(FlowHost::V4(dst));
         }
@@ -404,7 +487,7 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 6 {
             return;
         }
-        if self.want_tls {
+        if self.want_tls || self.want_http {
             let mut src = [0u8; 16];
             let mut dst = [0u8; 16];
             src.copy_from_slice(&bytes[8..24]);
@@ -582,12 +665,21 @@ impl Walk<'_> {
             return;
         }
         let pick = self.tables.udp(src, dst);
-        if self.want_tls {
+        if self.want_tls || self.want_http {
             if pick.is_vxlan() {
                 self.vxlan(payload);
                 return;
             }
-            self.tls_from_udp(payload);
+            if self.want_tls {
+                self.tls_from_udp(payload);
+            }
+            if self.want_http {
+                if looks_like_http_heuristic(payload) {
+                    self.count("http-udp");
+                } else if pick.reaches_ip && !pick.is_vxlan() {
+                    self.count("http-tunnel");
+                }
+            }
             if self.want_ip {
                 self.after_ports(pick, payload);
             }
@@ -603,21 +695,358 @@ impl Walk<'_> {
         let src = u16::from_be_bytes([bytes[0], bytes[1]]);
         let dst = u16::from_be_bytes([bytes[2], bytes[3]]);
         let data_off = (bytes[12] >> 4) as usize * 4;
-        if data_off < TCP_MIN {
-            return;
-        }
-        if bytes.len() <= data_off {
+        if data_off < TCP_MIN || bytes.len() < data_off {
             return;
         }
         let seq = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let flags = bytes[13];
+        let fin = flags & 0x01 != 0;
+        let rst = flags & 0x04 != 0;
+        self.tcp_syn = flags & 0x02 != 0;
+        if bytes.len() == data_off {
+            // Empty SYN consumes a seq, including SYN+RST.
+            if self.want_http && self.tcp_syn {
+                self.note_http_next(self.tcp_flow(src, dst), seq, 0);
+            }
+            return;
+        }
         let pick = self.tables.tcp(src, dst);
         let payload = &bytes[data_off..];
         if self.want_tls {
             self.tls_from_tcp(src, dst, seq, pick, payload);
         }
+        if self.want_http && rst {
+            // RST skips HTTP dissection. SYN still sets nxtseq to seq+1;
+            // tshark 4.6.9 never hands RST payload to dissect_tcp_payload,
+            // so that length does not advance HTTP's in-order seq.
+            if self.tcp_syn {
+                self.note_http_next(self.tcp_flow(src, dst), seq, 0);
+            }
+        } else if self.want_http {
+            self.http_from_tcp(src, dst, seq, fin, pick, payload);
+        }
         if self.want_ip {
             self.after_ports(pick, payload);
         }
+    }
+
+    fn tcp_flow(&self, sport: u16, dport: u16) -> Option<TcpFlow> {
+        Some(TcpFlow {
+            src: self.flow_src?,
+            dst: self.flow_dst?,
+            sport,
+            dport,
+        })
+    }
+
+    fn http_from_tcp(
+        &mut self,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        fin: bool,
+        pick: PortPick,
+        payload: &[u8],
+    ) {
+        let flow = self.tcp_flow(sport, dport);
+        let key = flow.map(|flow| TcpSeq {
+            src: flow.src,
+            dst: flow.dst,
+            sport,
+            dport,
+            seq,
+        });
+        let overlap = self.http_overlap(flow, key, seq, payload);
+        if matches!(overlap, HttpOverlap::Skip) {
+            return;
+        }
+        let (body, skip_hosts, other_is_continuation) = match overlap {
+            HttpOverlap::Fresh => (payload, 0, false),
+            HttpOverlap::Suffix(skip) => (&payload[skip..], 0, true),
+            HttpOverlap::OpenComplete { already } => (payload, already, false),
+            HttpOverlap::Skip => unreachable!(),
+        };
+        if let Some(direction) = flow {
+            let same_seq_again = key
+                .map(|key| self.http_seen.contains_key(&key))
+                .unwrap_or(false);
+            if !same_seq_again && self.http_desegment.contains(&direction) {
+                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                self.count("http");
+                return;
+            }
+            if self.http_tunnel.contains(&direction.conversation()) {
+                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                self.count("http-tunnel");
+                return;
+            }
+        }
+        let sstp_pending = flow
+            .map(|flow| self.http_sstp.contains(&flow.conversation()))
+            .unwrap_or(false);
+        let connect_pending = flow
+            .map(|flow| self.http_connect.contains_key(&flow.conversation()))
+            .unwrap_or(false);
+        if pick.is_http() {
+            if let Some(direction) = flow {
+                if self.http_claimed.contains(&direction.conversation()) {
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                    self.count("http");
+                    return;
+                }
+            }
+            if looks_like_http2_preface(body) {
+                if let Some(flow) = flow {
+                    self.http_claimed.insert(flow.conversation());
+                }
+                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                self.count("http");
+                return;
+            }
+            match parse_http_pending(body, fin, sstp_pending, connect_pending) {
+                HttpParse::Message(proved) => {
+                    let n = proved.hosts.len().max(skip_hosts);
+                    self.note_http_seen(flow, key, seq, payload, proved.desegment, n);
+                    if let Some(flow) = flow {
+                        if proved.http2 {
+                            self.http_claimed.insert(flow.conversation());
+                        }
+                        if proved.desegment {
+                            self.http_desegment.insert(flow);
+                        }
+                        if skip_hosts == 0 {
+                            self.extend_http_hosts(flow, proved);
+                        } else {
+                            self.http_host
+                                .extend(proved.hosts.into_iter().skip(skip_hosts));
+                        }
+                    } else {
+                        self.http_host
+                            .extend(proved.hosts.into_iter().skip(skip_hosts));
+                    }
+                }
+                HttpParse::Partial(hosts) => {
+                    let n = hosts.len().max(skip_hosts);
+                    self.note_http_seen(flow, key, seq, payload, true, n);
+                    if let Some(flow) = flow {
+                        self.http_desegment.insert(flow);
+                    }
+                    self.http_host.extend(hosts.into_iter().skip(skip_hosts));
+                    self.count("http");
+                }
+                HttpParse::Unproved if other_is_continuation => {
+                    let already = key
+                        .and_then(|key| self.http_seen.get(&key).map(|prev| prev.hosts))
+                        .unwrap_or(skip_hosts);
+                    self.note_http_seen(flow, key, seq, payload, true, already.max(skip_hosts));
+                    if let Some(flow) = flow {
+                        self.http_desegment.insert(flow);
+                    }
+                }
+                HttpParse::Unproved => {
+                    self.note_http_seen(flow, key, seq, payload, true, skip_hosts);
+                    if let Some(flow) = flow {
+                        self.http_desegment.insert(flow);
+                    }
+                    self.count("http");
+                }
+                HttpParse::Other if other_is_continuation => {
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                }
+                HttpParse::Other => {
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                    self.count("http");
+                }
+            }
+            return;
+        }
+        let claimed = flow
+            .map(|flow| self.http_claimed.contains(&flow.conversation()))
+            .unwrap_or(false);
+        if claimed || looks_like_http_heuristic(body) {
+            if let Some(flow) = flow {
+                self.http_claimed.insert(flow.conversation());
+            }
+            self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+            self.count("http-heuristic");
+            return;
+        }
+        if pick.is_tls() {
+            self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+            self.count("http-over-tls");
+        }
+    }
+
+    fn http_overlap(
+        &self,
+        flow: Option<TcpFlow>,
+        key: Option<TcpSeq>,
+        seq: u32,
+        payload: &[u8],
+    ) -> HttpOverlap {
+        let Some(flow) = flow else {
+            return HttpOverlap::Fresh;
+        };
+        let Some(&next) = self.http_next_seq.get(&flow) else {
+            return HttpOverlap::Fresh;
+        };
+        let ahead = seq.wrapping_sub(next) as i32;
+        if ahead > 0 {
+            return HttpOverlap::Skip;
+        }
+        if ahead == 0 {
+            return HttpOverlap::Fresh;
+        }
+        let len = payload.len() as u32;
+        let end = seq.wrapping_add(len);
+        if (end.wrapping_sub(next) as i32) <= 0 {
+            return HttpOverlap::Skip;
+        }
+        if let Some(key) = key {
+            if let Some(prev) = self.http_seen.get(&key) {
+                if prev.open && payload.starts_with(&prev.payload) {
+                    return HttpOverlap::OpenComplete {
+                        already: prev.hosts,
+                    };
+                }
+            }
+        }
+        let skip = next.wrapping_sub(seq) as usize;
+        if skip >= payload.len() {
+            return HttpOverlap::Skip;
+        }
+        HttpOverlap::Suffix(skip)
+    }
+
+    fn note_http_seen(
+        &mut self,
+        flow: Option<TcpFlow>,
+        key: Option<TcpSeq>,
+        seq: u32,
+        payload: &[u8],
+        open: bool,
+        hosts: usize,
+    ) {
+        let len = payload.len() as u32;
+        if let Some(key) = key {
+            self.http_seen
+                .entry(key)
+                .and_modify(|prev| {
+                    if len >= prev.len {
+                        prev.len = len;
+                        prev.open = open;
+                        prev.hosts = hosts;
+                        prev.payload = payload.to_vec();
+                    }
+                })
+                .or_insert(HttpSeen {
+                    len,
+                    open,
+                    hosts,
+                    payload: payload.to_vec(),
+                });
+        }
+        self.note_http_next(flow, seq, len);
+    }
+
+    fn note_http_next(&mut self, flow: Option<TcpFlow>, seq: u32, len: u32) {
+        let Some(flow) = flow else {
+            return;
+        };
+        // tshark 4.6.9 TCP nxtseq after SYN is seq+len+1; SYN consumes a seq.
+        let end = seq.wrapping_add(len).wrapping_add(u32::from(self.tcp_syn));
+        match self.http_next_seq.get(&flow).copied() {
+            Some(next) if (end.wrapping_sub(next) as i32) <= 0 => {}
+            _ => {
+                self.http_next_seq.insert(flow, end);
+            }
+        }
+    }
+
+    /// tshark 4.6.9 `dissect_http_on_stream` hands leftover after a complete
+    /// 101 with `Upgrade` or `SSTP_DUPLEX_POST` plus 200 to `next_handle`.
+    /// Complete headers on that 200 or 101 are enough: `try_desegment_body`
+    /// is false, so no Content-Length, a short Content-Length, or
+    /// Transfer-Encoding still switches. Those later Hosts are an unwalked
+    /// tunnel, including leftover in this same segment.
+    ///
+    /// CONNECT plus 2xx is different: `dissect_http_tcp` calls
+    /// `http_conversation_is_connect` on *later* segments and hands them
+    /// to `http_payload_subdissector` using the URI port. Same-segment
+    /// leftover on the 2xx frame stays HTTP. A 101 with no Upgrade stays
+    /// HTTP.
+    fn extend_http_hosts(&mut self, flow: TcpFlow, proved: HttpProved) {
+        self.note_http_switch(flow, &proved);
+        let status_2xx = proved.status_2xx;
+        let has_final_response = proved.has_final_response;
+        if !self.http_tunnel.contains(&flow.conversation()) {
+            self.http_host.extend(proved.hosts);
+            self.arm_connect_tunnel(flow, status_2xx, has_final_response);
+            return;
+        }
+        let leftover = if proved.switching_upgrade {
+            proved.leftover_after_upgrade
+        } else {
+            proved.leftover_after_response
+        };
+        if proved.switching_upgrade {
+            self.http_host.extend(proved.hosts);
+        } else {
+            let keep = proved
+                .hosts
+                .len()
+                .saturating_sub(proved.hosts_after_response.len());
+            self.http_host.extend(proved.hosts.into_iter().take(keep));
+        }
+        if leftover {
+            self.count("http-tunnel");
+        }
+        self.arm_connect_tunnel(flow, status_2xx, has_final_response);
+    }
+
+    fn note_http_switch(&mut self, flow: TcpFlow, proved: &HttpProved) {
+        let conv = flow.conversation();
+        if proved.switching_upgrade {
+            self.http_tunnel.insert(conv);
+        }
+        if proved.sstp_duplex_post {
+            self.http_sstp.insert(conv);
+        }
+        if proved.connect {
+            self.http_connect.insert(conv, proved.connect_port);
+        }
+        if proved.status_200 && self.http_sstp.contains(&conv) {
+            self.http_tunnel.insert(conv);
+        }
+        if proved.has_final_response {
+            self.http_sstp.remove(&conv);
+        }
+    }
+
+    /// tshark 4.6.9 `http_conversation_is_connect` is true after CONNECT
+    /// plus 2xx. `http_payload_subdissector` then `decode_tcp_ports` on
+    /// the URI port. `http` and `tls` still print a later GET (`tls`
+    /// rejects HTTP, then the HTTP heuristic claims). Any other port,
+    /// or a URI with no colon, is not HTTP.
+    fn arm_connect_tunnel(&mut self, flow: TcpFlow, status_2xx: bool, has_final_response: bool) {
+        let conv = flow.conversation();
+        if status_2xx {
+            if let Some(port) = self.http_connect.remove(&conv) {
+                if !self.connect_uri_stays_http(port) {
+                    self.http_tunnel.insert(conv);
+                }
+            }
+        } else if has_final_response {
+            self.http_connect.remove(&conv);
+        }
+    }
+
+    fn connect_uri_stays_http(&self, port: Option<u32>) -> bool {
+        let Some(port) = port.and_then(|port| u16::try_from(port).ok()) else {
+            return false;
+        };
+        let pick = self.tables.tcp(port, port);
+        pick.is_http() || pick.is_tls()
     }
 
     fn tls_from_tcp(&mut self, sport: u16, dport: u16, seq: u32, pick: PortPick, payload: &[u8]) {
@@ -1323,6 +1752,7 @@ mod tests {
         Cell {
             values: values.iter().map(|value| (*value).to_string()).collect(),
             tls_sni: Vec::new(),
+            http_host: Vec::new(),
             counted: None,
         }
     }
@@ -1331,6 +1761,7 @@ mod tests {
         Cell {
             values: Vec::new(),
             tls_sni: Vec::new(),
+            http_host: Vec::new(),
             counted: None,
         }
     }
@@ -1793,6 +2224,8 @@ mod tests {
 
     const CLIENT: [u8; 4] = [10, 0, 0, 1];
     const SERVER: [u8; 4] = [10, 255, 255, 1];
+    const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
     fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
         eth_ipv4_tcp_seq(src, sport, dport, 1, payload)
@@ -1810,10 +2243,26 @@ mod tests {
         seq: u32,
         payload: &[u8],
     ) -> Vec<u8> {
+        eth_ipv4_tcp_flow_flags(src, dst, sport, dport, seq, 0x18, payload)
+    }
+
+    fn eth_ipv4_tcp_fin(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        eth_ipv4_tcp_flow_flags(src, SERVER, sport, dport, 1, 0x19, payload)
+    }
+
+    fn eth_ipv4_tcp_flow_flags(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut tcp = Vec::from(sport.to_be_bytes());
         tcp.extend_from_slice(&dport.to_be_bytes());
         tcp.extend_from_slice(&seq.to_be_bytes());
-        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, flags, 0, 64, 0, 0, 0, 0]);
         tcp.extend_from_slice(payload);
         let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 6, 0, 0];
         let total = (20 + tcp.len()) as u16;
@@ -1902,6 +2351,16 @@ mod tests {
         )
     }
 
+    fn walk_http(captured: &[u8]) -> Cell {
+        walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured,
+            },
+            &mut IpSrc::fields(false, false, true),
+        )
+    }
+
     #[test]
     fn tls_sni_on_443() {
         let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &sni_hello("www.example.com"));
@@ -1946,6 +2405,2135 @@ mod tests {
         let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, b"GET / HTTP/1.1\r\nHost: x\r\n");
         let cell = walk_tls(&frame);
         assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_host_on_80() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: www.example.com\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+        assert_eq!(cell.values, [] as [&str; 0]);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn http_host_on_8080_and_3689() {
+        for port in [8080u16, 3689] {
+            let frame = eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                port,
+                b"GET / HTTP/1.1\r\nHost: alt.example\r\n\r\n",
+            );
+            let cell = walk_http(&frame);
+            assert_eq!(cell.http_host, ["alt.example"], "{port}");
+            assert_eq!(cell.counted, None, "{port}");
+        }
+    }
+
+    #[test]
+    fn http_on_443_is_counted_heuristic() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http-heuristic"));
+    }
+
+    #[test]
+    fn http_incomplete_headers_are_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cut.example",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+    }
+
+    #[test]
+    fn http_retransmit_prints_once() {
+        let payload = b"GET / HTTP/1.1\r\nHost: www.example.com\r\n\r\n";
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 80, 1, payload);
+        let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 80, 1, payload);
+        let mut session = IpSrc::fields(false, false, true);
+        let a = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let b = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(a.http_host, ["www.example.com"]);
+        assert_eq!(a.counted, None);
+        assert_eq!(b.http_host, [] as [&str; 0]);
+        assert_eq!(b.counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_longer_is_continuation() {
+        let first = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        let second = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+        assert_eq!(first.len(), 35);
+        assert_eq!(second.len(), 39);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_longer_after_handshake_is_continuation() {
+        let first = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        let second = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, second),
+        ]);
+        for cell in &cells[..3] {
+            assert_eq!(cell.http_host, [] as [&str; 0]);
+            assert_eq!(cell.counted, None);
+        }
+        assert_eq!(cells[3].http_host, ["a.example"]);
+        assert_eq!(cells[3].counted, None);
+        assert_eq!(cells[4].http_host, [] as [&str; 0]);
+        assert_eq!(cells[4].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_full_after_partial_prints_host() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, full),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, ["split.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_same_length_retransmit_stays_blank() {
+        let first = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        let second = b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n";
+        assert_eq!(first.len(), 35);
+        assert_eq!(second.len(), 35);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_shorter_is_retransmit() {
+        let first = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+        let second = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        assert_eq!(first.len(), 39);
+        assert_eq!(second.len(), 35);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, second),
+        ]);
+        assert_eq!(cells[0].http_host, ["inner.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_open_complete_plus_truncated_prints_suffix_host() {
+        let mut first = GET_A.to_vec();
+        first.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
+        let mut second = first.clone();
+        second.extend_from_slice(b"inner.example\r\n\r\n");
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_open_mid_header_then_two_requests_prints_suffix_host() {
+        let mut first = GET_A.to_vec();
+        first.extend_from_slice(b"GET / HTTP/1.1\r\nHos");
+        let mut second = GET_A.to_vec();
+        second.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_open_response_prefix_then_get_stays_blank() {
+        let resp = b"HTTP/1.1 200 OK\r\nHost: st.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, &resp[..20]),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_overlapping_later_seq_is_continuation() {
+        for seq in [2u32, 5, 35] {
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, INNER_GET),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "seq {seq}");
+            assert_eq!(cells[0].counted, None, "seq {seq}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "seq {seq}");
+            assert_eq!(cells[1].counted, None, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn http_in_order_seq_after_first_payload_prints_host() {
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 36, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_gap_after_nxtseq_is_not_http() {
+        for seq in [37u32, 100] {
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, INNER_GET),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "seq {seq}");
+            assert_eq!(cells[0].counted, None, "seq {seq}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "seq {seq}");
+            assert_eq!(cells[1].counted, None, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn http_overlap_past_nxtseq_with_complete_get_prints_host() {
+        for seq in [1u32, 2, 10, 20, 35] {
+            let second = overlap_past_nxtseq(seq, INNER_GET);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, &second),
+            ]);
+            assert_first_a_then_inner(&cells, &format!("seq {seq}"));
+        }
+    }
+
+    #[test]
+    fn http_overlap_past_nxtseq_ipv6_8080_and_handshake() {
+        let second = overlap_past_nxtseq(35, INNER_GET);
+        let ipv4 = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
+        ]);
+        assert_first_a_then_inner(&ipv4, "ipv4-80");
+        let port = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 8080, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 8080, 35, &second),
+        ]);
+        assert_first_a_then_inner(&port, "ipv4-8080");
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 1, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 35, &second),
+        ]);
+        assert_first_a_then_inner(&ipv6, "ipv6-80");
+        let handshake = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
+        ]);
+        for cell in &handshake[..3] {
+            assert_eq!(cell.http_host, [] as [&str; 0]);
+            assert_eq!(cell.counted, None);
+        }
+        assert_eq!(handshake[3].http_host, ["a.example"]);
+        assert_eq!(handshake[3].counted, None);
+        assert_eq!(handshake[4].http_host, ["inner.example"]);
+        assert_eq!(handshake[4].counted, None);
+    }
+
+    #[test]
+    fn http_syn_payload_nxtseq_skips_seq_plus_len() {
+        for (label, flags) in SYN_HTTP_FLAGS {
+            let cells = syn_http_then(flags, 35, 80);
+            assert_eq!(cells[0].http_host, ["a.example"], "{label} extra");
+            assert_eq!(cells[0].counted, None, "{label} extra");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} extra");
+            assert_eq!(cells[1].counted, None, "{label} extra");
+        }
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x1a, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 35, INNER_GET),
+        ]);
+        assert_eq!(ipv6[0].http_host, ["a.example"]);
+        assert_eq!(ipv6[0].counted, None);
+        assert_eq!(ipv6[1].http_host, [] as [&str; 0]);
+        assert_eq!(ipv6[1].counted, None);
+        let port = syn_http_then(0x1a, 35, 8080);
+        assert_eq!(port[0].http_host, ["a.example"]);
+        assert_eq!(port[0].counted, None);
+        assert_eq!(port[1].http_host, [] as [&str; 0]);
+        assert_eq!(port[1].counted, None);
+    }
+
+    #[test]
+    fn http_syn_payload_nxtseq_prints_in_order_after_syn() {
+        for (label, flags) in SYN_HTTP_FLAGS {
+            let cells = syn_http_then(flags, 36, 80);
+            assert_eq!(cells[0].http_host, ["a.example"], "{label} drop");
+            assert_eq!(cells[0].counted, None, "{label} drop");
+            assert_eq!(cells[1].http_host, ["inner.example"], "{label} drop");
+            assert_eq!(cells[1].counted, None, "{label} drop");
+        }
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x1a, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 36, INNER_GET),
+        ]);
+        assert_first_a_then_inner(&ipv6, "ipv6-syn");
+        let port = syn_http_then(0x1a, 36, 8080);
+        assert_first_a_then_inner(&port, "8080-syn");
+    }
+
+    #[test]
+    fn http_empty_syn_then_get_at_seq_1_prints_host() {
+        for (label, flags) in EMPTY_SYN_FLAGS {
+            let cells = empty_syn_then_get(flags, 1, 80, 0x18);
+            assert_eq!(cells[0].http_host, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, None, "{label}");
+            assert_eq!(cells[1].http_host, ["a.example"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+        let isn = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1001, GET_A),
+        ]);
+        assert_eq!(isn[0].http_host, [] as [&str; 0]);
+        assert_eq!(isn[0].counted, None);
+        assert_eq!(isn[1].http_host, ["a.example"]);
+        assert_eq!(isn[1].counted, None);
+        let handshake = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+        ]);
+        assert_eq!(handshake[3].http_host, ["a.example"]);
+        assert_eq!(handshake[3].counted, None);
+    }
+
+    #[test]
+    fn http_empty_syn_then_get_not_at_nxtseq_is_not_http() {
+        for (label, flags) in EMPTY_SYN_FLAGS {
+            for seq in [0u32, 2] {
+                let cells = empty_syn_then_get(flags, seq, 80, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
+            }
+        }
+        for seq in [0u32, 2] {
+            let psh = empty_syn_then_get(0x02, seq, 80, 0x08);
+            assert_empty_syn_then_blank(&psh, &format!("psh-no-ack seq {seq}"));
+            let v6 = walk_http_frames(&[
+                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x02, b""),
+                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
+            for dport in [8080u16, 3128] {
+                let cells = empty_syn_then_get(0x02, seq, dport, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
+            }
+            let src80 = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x02, b""),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
+            let isn = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+            let handshake = empty_syn_handshake_then_get(seq);
+            assert_eq!(handshake[0].http_host, [] as [&str; 0], "hs syn {seq}");
+            assert_eq!(handshake[0].counted, None, "hs syn {seq}");
+            assert_eq!(handshake[3].http_host, [] as [&str; 0], "hs get {seq}");
+            assert_eq!(handshake[3].counted, None, "hs get {seq}");
+        }
+    }
+
+    #[test]
+    fn http_empty_syn_rst_then_get_at_seq_1_prints_host() {
+        for (label, flags) in SYN_RST_FLAGS {
+            let cells = empty_syn_then_get(flags, 1, 80, 0x18);
+            assert_eq!(cells[0].http_host, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, None, "{label}");
+            assert_eq!(cells[1].http_host, ["a.example"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+        let isn = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1001, GET_A),
+        ]);
+        assert_eq!(isn[0].http_host, [] as [&str; 0]);
+        assert_eq!(isn[0].counted, None);
+        assert_eq!(isn[1].http_host, ["a.example"]);
+        assert_eq!(isn[1].counted, None);
+    }
+
+    #[test]
+    fn http_empty_syn_rst_then_get_not_at_nxtseq_is_not_http() {
+        for (label, flags) in SYN_RST_FLAGS {
+            for seq in [0u32, 2] {
+                let cells = empty_syn_then_get(flags, seq, 80, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
+            }
+        }
+        for seq in [0u32, 2] {
+            let v6 = walk_http_frames(&[
+                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, b""),
+                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
+            for dport in [8080u16, 3128] {
+                let cells = empty_syn_then_get(0x06, seq, dport, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
+            }
+            let src80 = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, b""),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
+            let isn = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+        }
+    }
+
+    #[test]
+    fn http_syn_rst_payload_then_later_get_is_not_http() {
+        for (label, flags) in SYN_RST_FLAGS {
+            for seq in [0u32, 35, 36, 37] {
+                let cells = syn_rst_payload_then(flags, seq, 80);
+                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
+            }
+        }
+        for seq in [0u32, 35, 36, 37] {
+            let v6 = walk_http_frames(&[
+                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, GET_A),
+                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, INNER_GET),
+            ]);
+            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
+            for dport in [8080u16, 3128] {
+                let cells = syn_rst_payload_then(0x06, seq, dport);
+                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
+            }
+            let src80 = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, GET_A),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, INNER_GET),
+            ]);
+            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
+            let isn = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, INNER_GET),
+            ]);
+            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+        }
+    }
+
+    #[test]
+    fn http_syn_rst_payload_then_get_at_seq_1_prints_host() {
+        for (label, flags) in SYN_RST_FLAGS {
+            let cells = syn_rst_payload_then(flags, 1, 80);
+            assert_eq!(cells[0].http_host, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, None, "{label}");
+            assert_eq!(cells[1].http_host, ["inner.example"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn http_get_fin_without_syn_still_prints_in_order() {
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x19, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 36, INNER_GET),
+        ]);
+        assert_first_a_then_inner(&cells, "get-fin");
+    }
+
+    #[test]
+    fn http_truncated_prefix_extend_then_complete_prints_host() {
+        for cut in [
+            b"GET / HTTP/1.1\r\nHost: ".as_slice(),
+            b"GET / HTTP/1.1\r\nHos",
+        ] {
+            let mut mid = GET_A.to_vec();
+            mid.extend_from_slice(cut);
+            let mut last = GET_A.to_vec();
+            last.extend_from_slice(INNER_GET);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &last),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "{cut:?}");
+            assert_eq!(cells[0].counted, None, "{cut:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{cut:?}");
+            assert_eq!(cells[1].counted, None, "{cut:?}");
+            assert_eq!(cells[2].http_host, ["inner.example"], "{cut:?}");
+            assert_eq!(cells[2].counted, None, "{cut:?}");
+        }
+    }
+
+    #[test]
+    fn http_unproved_prefix_extend_suffix_counts_in_order_inner() {
+        for n in [1usize, 2, 3, 17, 18, 19, 20] {
+            let cells = truncated_suffix_then_in_order(&INNER_GET[..n]);
+            assert_eq!(cells[0].http_host, ["a.example"], "cut {n}");
+            assert_eq!(cells[0].counted, None, "cut {n}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "cut {n}");
+            assert_eq!(cells[1].counted, None, "cut {n}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "cut {n}");
+            assert_eq!(cells[2].counted, Some("http"), "cut {n}");
+        }
+        let cut = b"GET / HTTP/1.1\r\nHost: ";
+        let cells = truncated_suffix_then_in_order(cut);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http"));
+        let second = overlap_past_nxtseq(35, b"GET / HTTP/1.1\r\nHos");
+        let nxtseq = 35 + second.len() as u32;
+        let overlap = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, nxtseq, INNER_GET),
+        ]);
+        assert_eq!(overlap[0].http_host, ["a.example"]);
+        assert_eq!(overlap[0].counted, None);
+        assert_eq!(overlap[1].http_host, [] as [&str; 0]);
+        assert_eq!(overlap[1].counted, None);
+        assert_eq!(overlap[2].http_host, [] as [&str; 0]);
+        assert_eq!(overlap[2].counted, Some("http"));
+    }
+
+    #[test]
+    fn http_unproved_prefix_extend_host_value_only_is_counted() {
+        let mut mid = GET_A.to_vec();
+        mid.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
+            eth_ipv4_tcp_seq(
+                CLIENT,
+                50000,
+                80,
+                1 + mid.len() as u32,
+                b"inner.example\r\n\r\n",
+            ),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http"));
+    }
+
+    #[test]
+    fn http_split_headers_then_overlap_at_seq_1_is_continuation() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 21, &full[20..]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_prints_suffix_host() {
+        let mut second = GET_A.to_vec();
+        second.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_after_handshake_prints_suffix_host() {
+        let mut second = GET_A.to_vec();
+        second.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        for cell in &cells[..3] {
+            assert_eq!(cell.http_host, [] as [&str; 0]);
+            assert_eq!(cell.counted, None);
+        }
+        assert_eq!(cells[3].http_host, ["a.example"]);
+        assert_eq!(cells[3].counted, None);
+        assert_eq!(cells[4].http_host, ["inner.example"]);
+        assert_eq!(cells[4].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_after_post_and_responses() {
+        let post = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\n\r\nxxxx";
+        let resp_200 = b"HTTP/1.1 200 OK\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+        let resp_204 = b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+        for (src, dst, sport, dport, first) in [
+            (CLIENT, SERVER, 50000, 80, post.as_slice()),
+            (SERVER, CLIENT, 80, 50000, resp_200.as_slice()),
+            (SERVER, CLIENT, 80, 50000, resp_204.as_slice()),
+        ] {
+            let mut second = first.to_vec();
+            second.extend_from_slice(INNER_GET);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_flow(src, dst, sport, dport, 1, first),
+                eth_ipv4_tcp_flow(src, dst, sport, dport, 1, &second),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "{first:?}");
+            assert_eq!(cells[0].counted, None, "{first:?}");
+            assert_eq!(cells[1].http_host, ["inner.example"], "{first:?}");
+            assert_eq!(cells[1].counted, None, "{first:?}");
+        }
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_after_two_pipelined_prints_third() {
+        let get_b = b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n";
+        let get_c = b"GET / HTTP/1.1\r\nHost: c.example\r\n\r\n";
+        let mut first = GET_A.to_vec();
+        first.extend_from_slice(get_b);
+        let mut second = first.clone();
+        second.extend_from_slice(get_c);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example", "b.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["c.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_partial_then_full_then_prefix_extension() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let mut third = full.to_vec();
+        third.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, full),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &third),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, ["split.example"]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, ["inner.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_non_request_stays_blank() {
+        for extra in [b"X".as_slice(), b"not a request".as_slice()] {
+            let mut second = GET_A.to_vec();
+            second.extend_from_slice(extra);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "{extra:?}");
+            assert_eq!(cells[0].counted, None, "{extra:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{extra:?}");
+            assert_eq!(cells[1].counted, None, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn http_rst_does_not_print_host() {
+        let payload = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        for flags in [0x04u8, 0x14, 0x1c, 0x05, 0x06] {
+            let frame = eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, flags, payload);
+            let cell = walk_http(&frame);
+            assert_eq!(cell.http_host, [] as [&str; 0], "{flags:#x}");
+            assert_eq!(cell.counted, None, "{flags:#x}");
+        }
+        for flags in [0x18u8, 0x10, 0x01, 0x02, 0x12] {
+            let frame = eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, flags, payload);
+            let cell = walk_http(&frame);
+            assert_eq!(cell.http_host, ["a.example"], "{flags:#x}");
+            assert_eq!(cell.counted, None, "{flags:#x}");
+        }
+    }
+
+    #[test]
+    fn http_no_host_is_blank_not_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_chunked_is_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"POST / HTTP/1.1\r\nHost: chunk.example\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+    }
+
+    #[test]
+    fn http_heuristic_split_counts_the_completing_segment() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let cut = full.len() / 2;
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 12345, 1, &full[..cut]);
+        let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 12345, 1 + cut as u32, &full[cut..]);
+        let mut session = IpSrc::fields(false, false, true);
+        let a = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let b = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(a.http_host, [] as [&str; 0]);
+        assert_eq!(a.counted, Some("http-heuristic"));
+        assert_eq!(b.http_host, [] as [&str; 0]);
+        assert_eq!(b.counted, Some("http-heuristic"));
+    }
+
+    #[test]
+    fn http_over_tls_on_443_is_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            &[
+                0x17, 0x03, 0x03, 0x00, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            ],
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http-over-tls"));
+    }
+
+    #[test]
+    fn http_udp_ssdp_is_counted() {
+        let payload = b"NOTIFY * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\n\r\n";
+        let mut udp = Vec::from(1900u16.to_be_bytes());
+        udp.extend_from_slice(&1900u16.to_be_bytes());
+        udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(payload);
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0];
+        let total = (20 + udp.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip.extend_from_slice(&[10, 0, 0, 1, 239, 255, 255, 250]);
+        ip.extend_from_slice(&udp);
+        let mut eth = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
+        ];
+        eth.extend_from_slice(&ip);
+        let cell = walk_http(&eth);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http-udp"));
+    }
+
+    fn walk_http_frames(frames: &[Vec<u8>]) -> Vec<Cell> {
+        let mut session = IpSrc::fields(false, false, true);
+        frames
+            .iter()
+            .map(|captured| {
+                walk_ip_src(
+                    &Frame {
+                        link_type: ETHERNET,
+                        captured,
+                    },
+                    &mut session,
+                )
+            })
+            .collect()
+    }
+
+    fn overlap_past_nxtseq(seq: u32, suffix: &[u8]) -> Vec<u8> {
+        let nxtseq = 1 + GET_A.len() as u32;
+        let pad = nxtseq.saturating_sub(seq) as usize;
+        let mut payload = vec![b'X'; pad];
+        payload.extend_from_slice(suffix);
+        payload
+    }
+
+    const SYN_HTTP_FLAGS: [(&str, u8); 5] = [
+        ("syn", 0x02),
+        ("syn-psh", 0x0a),
+        ("syn-ack", 0x12),
+        ("syn-psh-ack", 0x1a),
+        ("syn-psh-ack-fin", 0x1b),
+    ];
+
+    const EMPTY_SYN_FLAGS: [(&str, u8); 5] = [
+        ("syn", 0x02),
+        ("syn-psh", 0x0a),
+        ("syn-ack", 0x12),
+        ("syn-fin", 0x03),
+        ("syn-psh-ack", 0x1a),
+    ];
+
+    const SYN_RST_FLAGS: [(&str, u8); 4] = [
+        ("syn-rst", 0x06),
+        ("syn-rst-ack", 0x16),
+        ("syn-rst-psh", 0x0e),
+        ("syn-rst-fin", 0x07),
+    ];
+
+    fn syn_http_then(flags: u8, seq: u32, dport: u16) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, dport, seq, INNER_GET),
+        ])
+    }
+
+    fn empty_syn_then_get(flags: u8, seq: u32, dport: u16, get_flags: u8) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, seq, get_flags, GET_A),
+        ])
+    }
+
+    fn syn_rst_payload_then(flags: u8, seq: u32, dport: u16) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, dport, seq, INNER_GET),
+        ])
+    }
+
+    fn empty_syn_handshake_then_get(seq: u32) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, GET_A),
+        ])
+    }
+
+    fn assert_empty_syn_then_blank(cells: &[Cell], label: &str) {
+        assert_eq!(cells[0].http_host, [] as [&str; 0], "{label} syn");
+        assert_eq!(cells[0].counted, None, "{label} syn");
+        assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} get");
+        assert_eq!(cells[1].counted, None, "{label} get");
+    }
+
+    fn truncated_suffix_then_in_order(cut: &[u8]) -> Vec<Cell> {
+        let mut mid = GET_A.to_vec();
+        mid.extend_from_slice(cut);
+        walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1 + mid.len() as u32, INNER_GET),
+        ])
+    }
+
+    fn assert_first_a_then_inner(cells: &[Cell], label: &str) {
+        assert_eq!(cells[0].http_host, ["a.example"], "{label}");
+        assert_eq!(cells[0].counted, None, "{label}");
+        assert_eq!(cells[1].http_host, ["inner.example"], "{label}");
+        assert_eq!(cells[1].counted, None, "{label}");
+    }
+
+    fn http_req_resp_get(req: &[u8], resp: &[u8], later: &[u8]) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, resp),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + req.len() as u32, later),
+        ])
+    }
+
+    fn http_req_resp_same_dir(req: &[u8], resp: &[u8], later: &[u8]) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, resp),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1 + resp.len() as u32, later),
+        ])
+    }
+
+    fn http_req_interim_resp_get(
+        req: &[u8],
+        interim: &[u8],
+        resp: &[u8],
+        later: &[u8],
+    ) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, interim),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1 + interim.len() as u32, resp),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + req.len() as u32, later),
+        ])
+    }
+
+    fn assert_sstp_then_inner_is_tunnel(cells: &[Cell]) {
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    fn http_req_resp_get_ports(
+        sport: u16,
+        dport: u16,
+        req: &[u8],
+        resp: &[u8],
+        later: &[u8],
+    ) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, sport, dport, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, dport, sport, 1, resp),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, sport, dport, 1 + req.len() as u32, later),
+        ])
+    }
+
+    #[test]
+    fn http_sstp_200_counts_a_later_get() {
+        let cells = http_req_resp_get(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        );
+        assert_sstp_then_inner_is_tunnel(&cells);
+    }
+
+    #[test]
+    fn http_sstp_200_complete_headers_switch_without_a_body() {
+        let resps = [
+            b"HTTP/1.1 200 Connection Established\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 100\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: identity\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.0 200 Connection Established\r\n\r\n",
+            b"ICY 200 Connection Established\r\n\r\n",
+        ];
+        for resp in resps {
+            let cells = http_req_resp_get(SSTP_REQ, resp, INNER_GET);
+            assert_sstp_then_inner_is_tunnel(&cells);
+        }
+        let cells = http_req_resp_get(
+            SSTP_REQ,
+            b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            INNER_GET,
+        );
+        assert_sstp_then_inner_is_tunnel(&cells);
+        let fin = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, SSTP_REQ),
+            eth_ipv4_tcp_flow_flags(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1,
+                0x19,
+                b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            ),
+            eth_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + SSTP_REQ.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_sstp_then_inner_is_tunnel(&fin);
+        for port in [80u16, 8080, 3128] {
+            let to_port = http_req_resp_get_ports(50000, port, SSTP_REQ, resps[0], INNER_GET);
+            assert_sstp_then_inner_is_tunnel(&to_port);
+            let from_port = http_req_resp_get_ports(port, 50000, SSTP_REQ, resps[0], INNER_GET);
+            assert_sstp_then_inner_is_tunnel(&from_port);
+        }
+        const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 1, SSTP_REQ),
+            eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, resps[0]),
+            eth_ipv6_tcp_flow(
+                V6_CLIENT,
+                V6_SERVER,
+                50000,
+                80,
+                1 + SSTP_REQ.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_sstp_then_inner_is_tunnel(&ipv6);
+    }
+
+    const SSTP_REQ: &[u8] = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n";
+    const SSTP_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+    const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+    const INNER_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+
+    #[test]
+    fn http_sstp_1xx_then_200_counts_a_later_get() {
+        let interims = [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            b"HTTP/1.1 102 Processing\r\n\r\n",
+            b"HTTP/1.1 103 Early Hints\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+        ];
+        for interim in interims {
+            let cells = http_req_interim_resp_get(SSTP_REQ, interim, SSTP_200, INNER_GET);
+            assert_eq!(cells[0].http_host, ["sstp.example"], "{interim:?}");
+            assert_eq!(cells[0].counted, None, "{interim:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[1].counted, None, "{interim:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[2].counted, None, "{interim:?}");
+            assert_eq!(cells[3].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[3].counted, Some("http-tunnel"), "{interim:?}");
+        }
+    }
+
+    #[test]
+    fn http_sstp_1xx_then_200_same_segment_leftover_is_tunnel() {
+        let leftover = [SSTP_200, INNER_GET].concat();
+        let interims = [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            b"HTTP/1.1 102 Processing\r\n\r\n",
+            b"HTTP/1.1 103 Early Hints\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+        ];
+        for interim in interims {
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, SSTP_REQ),
+                eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, interim),
+                eth_ipv4_tcp_flow(
+                    SERVER,
+                    CLIENT,
+                    80,
+                    50000,
+                    1 + interim.len() as u32,
+                    &leftover,
+                ),
+            ]);
+            assert_eq!(cells[0].http_host, ["sstp.example"], "{interim:?}");
+            assert_eq!(cells[0].counted, None, "{interim:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[1].counted, None, "{interim:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[2].counted, Some("http-tunnel"), "{interim:?}");
+        }
+    }
+
+    #[test]
+    fn http_sstp_two_100s_then_200_counts_a_later_get() {
+        let c100 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, SSTP_REQ),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, c100),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1 + c100.len() as u32, c100),
+            eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1 + 2 * c100.len() as u32,
+                SSTP_200,
+            ),
+            eth_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + SSTP_REQ.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[4].http_host, [] as [&str; 0]);
+        assert_eq!(cells[4].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_and_100_same_segment_then_200_counts_a_later_get() {
+        let client = [SSTP_REQ, b"HTTP/1.1 100 Continue\r\n\r\n".as_slice()].concat();
+        let cells = http_req_resp_get(&client, SSTP_200, INNER_GET);
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_same_segment_100_and_200_leftover_is_tunnel() {
+        let leftover = [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            SSTP_200,
+            INNER_GET,
+        ]
+        .concat();
+        let cells = http_req_resp(SSTP_REQ, &leftover);
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_2xx_then_200_still_prints_a_later_host() {
+        let finals = [
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 203 Non-Authoritative Information\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\n\r\n",
+        ];
+        for resp in finals {
+            let cells = http_req_interim_resp_get(SSTP_REQ, resp, SSTP_200, INNER_GET);
+            assert_eq!(cells[0].http_host, ["sstp.example"], "{resp:?}");
+            assert_eq!(cells[0].counted, None, "{resp:?}");
+            assert_eq!(cells[3].http_host, ["inner.example"], "{resp:?}");
+            assert_eq!(cells[3].counted, None, "{resp:?}");
+        }
+    }
+
+    #[test]
+    fn http_101_upgrade_with_transfer_encoding_counts_a_later_get() {
+        let cells = http_req_resp_get(
+            b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nTransfer-Encoding: identity\r\n\r\n",
+            INNER_GET,
+        );
+        assert_eq!(cells[0].http_host, ["ws.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_101_upgrade_counts_a_later_get() {
+        let later = b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n";
+        for proto in [b"websocket".as_slice(), b"h2c"] {
+            let mut req = b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: ".to_vec();
+            req.extend_from_slice(proto);
+            req.extend_from_slice(b"\r\nConnection: Upgrade\r\n\r\n");
+            let mut resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ".to_vec();
+            resp.extend_from_slice(proto);
+            resp.extend_from_slice(b"\r\nConnection: Upgrade\r\nHost: sw.example\r\n\r\n");
+            let cells = http_req_resp_get(&req, &resp, later);
+            assert_eq!(
+                cells[0].http_host,
+                ["ws.example"],
+                "{}",
+                proto.escape_ascii()
+            );
+            assert_eq!(cells[0].counted, None, "{}", proto.escape_ascii());
+            assert_eq!(
+                cells[1].http_host,
+                ["sw.example"],
+                "{}",
+                proto.escape_ascii()
+            );
+            assert_eq!(cells[1].counted, None, "{}", proto.escape_ascii());
+            assert_eq!(
+                cells[2].http_host,
+                [] as [&str; 0],
+                "{}",
+                proto.escape_ascii()
+            );
+            assert_eq!(
+                cells[2].counted,
+                Some("http-tunnel"),
+                "{}",
+                proto.escape_ascii()
+            );
+        }
+    }
+
+    #[test]
+    fn http_101_without_upgrade_still_prints_a_later_host() {
+        let cells = http_req_resp_get(
+            b"GET /chat HTTP/1.1\r\nHost: ws.example\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nHost: sw.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["ws.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["sw.example"]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, ["after-upgrade.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_connect_200_still_prints_a_later_host() {
+        let cells = http_req_resp_get(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["example.com:443"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, ["after-connect.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_connect_200_without_content_length_still_prints_a_later_host() {
+        let cells = http_req_resp_get(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            INNER_GET,
+        );
+        assert_eq!(cells[0].http_host, ["example.com:443"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[2].http_host, ["inner.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    fn connect_req(uri: &str) -> Vec<u8> {
+        let mut req = b"CONNECT ".to_vec();
+        req.extend_from_slice(uri.as_bytes());
+        req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+        req.extend_from_slice(uri.as_bytes());
+        req.extend_from_slice(b"\r\n\r\n");
+        req
+    }
+
+    const CONNECT_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+    const CONNECT_201: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+
+    #[test]
+    fn http_connect_2xx_non_http_uri_port_counts_a_later_get() {
+        let ports = [
+            21u16, 22, 23, 25, 53, 110, 143, 587, 1194, 1883, 3306, 5060, 5432, 5900, 6379,
+        ];
+        for port in ports {
+            let uri = format!("example.com:{port}");
+            let cells = http_req_resp_get(&connect_req(&uri), CONNECT_200, INNER_GET);
+            assert_eq!(cells[0].http_host, [uri.as_str()], "{port}");
+            assert_eq!(cells[0].counted, None, "{port}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{port}");
+            assert_eq!(cells[1].counted, None, "{port}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{port}");
+            assert_eq!(cells[2].counted, Some("http-tunnel"), "{port}");
+        }
+    }
+
+    #[test]
+    fn http_connect_no_port_or_201_counts_a_later_get() {
+        let req = connect_req("example.com");
+        for resp in [CONNECT_200, CONNECT_201] {
+            let cells = http_req_resp_get(&req, resp, INNER_GET);
+            assert_eq!(cells[0].http_host, ["example.com"], "{resp:?}");
+            assert_eq!(cells[0].counted, None, "{resp:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{resp:?}");
+            assert_eq!(cells[2].counted, Some("http-tunnel"), "{resp:?}");
+        }
+        let cells = http_req_resp_get(&connect_req("example.com:22"), CONNECT_201, INNER_GET);
+        assert_eq!(cells[0].http_host, ["example.com:22"]);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+        let cells = http_req_resp_get(
+            &connect_req("example.com:22"),
+            b"HTTP/1.1 201 Created\r\n\r\n",
+            INNER_GET,
+        );
+        assert_eq!(cells[0].http_host, ["example.com:22"]);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_connect_http_or_tls_uri_port_still_prints_a_later_get() {
+        for port in [443u16, 80, 8080, 465, 993, 995] {
+            let uri = format!("example.com:{port}");
+            let cells = http_req_resp_get(&connect_req(&uri), CONNECT_200, INNER_GET);
+            assert_eq!(cells[0].http_host, [uri.as_str()], "{port}");
+            assert_eq!(cells[0].counted, None, "{port}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{port}");
+            assert_eq!(cells[1].counted, None, "{port}");
+            assert_eq!(cells[2].http_host, ["inner.example"], "{port}");
+            assert_eq!(cells[2].counted, None, "{port}");
+        }
+    }
+
+    #[test]
+    fn http_desegment_body_counts_a_later_same_direction_get() {
+        let get = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        let resps = [
+            b"HTTP/1.1 200 OK\r\nHost: resp.example\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ];
+        for resp in resps {
+            let cells = http_req_resp_same_dir(get, resp, INNER_GET);
+            assert_eq!(cells[0].http_host, ["a.example"], "{resp:?}");
+            assert_eq!(cells[0].counted, None, "{resp:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{resp:?}");
+            assert_eq!(cells[1].counted, Some("http"), "{resp:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{resp:?}");
+            assert_eq!(cells[2].counted, Some("http"), "{resp:?}");
+        }
+        let post = b"POST / HTTP/1.1\r\nHost: post.example\r\nContent-Length: 100\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, post),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + post.len() as u32, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+        let mut pipeline = get.to_vec();
+        pipeline.extend_from_slice(post);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &pipeline),
+            eth_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + pipeline.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    fn cl24_magic_then_get(start: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n");
+        payload.extend_from_slice(HTTP2_MAGIC);
+        payload.extend_from_slice(INNER_GET);
+        payload
+    }
+    const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
+    const HTTP2_FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
+    const HTTP2_V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const HTTP2_V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
+    fn http2_then_get(preface: &[u8], opposite: bool) -> Vec<Cell> {
+        http2_then_get_ipv4(CLIENT, SERVER, 50000, 80, preface, opposite)
+    }
+
+    fn http2_then_get_ipv4(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        preface: &[u8],
+        opposite: bool,
+    ) -> Vec<Cell> {
+        let later = eth_ipv4_tcp_flow(
+            if opposite { dst } else { src },
+            if opposite { src } else { dst },
+            if opposite { dport } else { sport },
+            if opposite { sport } else { dport },
+            if opposite {
+                1
+            } else {
+                1 + preface.len() as u32
+            },
+            INNER_GET,
+        );
+        walk_http_frames(&[eth_ipv4_tcp_flow(src, dst, sport, dport, 1, preface), later])
+    }
+
+    fn assert_http2_then_get_is_counted(cells: &[Cell]) {
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    fn eth_vlan_ipv4_tcp_flow(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let frame = eth_ipv4_tcp_flow(src, dst, sport, dport, seq, payload);
+        let mut tagged = Vec::with_capacity(frame.len() + 4);
+        tagged.extend_from_slice(&frame[..12]);
+        tagged.extend_from_slice(&[0x81, 0x00, 0x00, 0x01]);
+        tagged.extend_from_slice(&frame[12..]);
+        tagged
+    }
+
+    fn leading_crlf_magic() -> Vec<u8> {
+        let mut preface = b"\r\n".to_vec();
+        preface.extend_from_slice(HTTP2_MAGIC);
+        preface
+    }
+
+    #[test]
+    fn http2_preface_on_named_http_counts_later_segments() {
+        let crlf_magic = leading_crlf_magic();
+        for preface in [
+            HTTP2_MAGIC,
+            HTTP2_PREFIX,
+            HTTP2_FIRST_LINE,
+            crlf_magic.as_slice(),
+        ] {
+            assert_http2_then_get_is_counted(&http2_then_get(preface, false));
+            assert_http2_then_get_is_counted(&http2_then_get(preface, true));
+        }
+        for (src, dst, sport, dport) in [
+            (CLIENT, SERVER, 50000u16, 80u16),
+            (SERVER, CLIENT, 80, 50000),
+            (CLIENT, SERVER, 50000, 8080),
+        ] {
+            for preface in [HTTP2_FIRST_LINE, HTTP2_MAGIC] {
+                assert_http2_then_get_is_counted(&http2_then_get_ipv4(
+                    src, dst, sport, dport, preface, false,
+                ));
+                assert_http2_then_get_is_counted(&http2_then_get_ipv4(
+                    src, dst, sport, dport, preface, true,
+                ));
+            }
+        }
+        let v6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(
+                HTTP2_V6_CLIENT,
+                HTTP2_V6_SERVER,
+                50000,
+                80,
+                1,
+                HTTP2_FIRST_LINE,
+            ),
+            eth_ipv6_tcp_flow(
+                HTTP2_V6_CLIENT,
+                HTTP2_V6_SERVER,
+                50000,
+                80,
+                1 + HTTP2_FIRST_LINE.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http2_then_get_is_counted(&v6);
+        let vlan = walk_http_frames(&[
+            eth_vlan_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, HTTP2_FIRST_LINE),
+            eth_vlan_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + HTTP2_FIRST_LINE.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http2_then_get_is_counted(&vlan);
+        let crlf = walk_http_frames(&[
+            eth_vlan_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &crlf_magic),
+            eth_vlan_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + crlf_magic.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http2_then_get_is_counted(&crlf);
+        let mut leftover = HTTP2_MAGIC.to_vec();
+        leftover.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &leftover));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+    }
+
+    fn http1_then_http2_then_get(first: &[u8], leftover: &[u8]) -> Vec<Cell> {
+        http1_then_http2_then_get_ipv4(CLIENT, SERVER, 50000, 80, first, leftover)
+    }
+
+    fn http1_then_http2_then_get_ipv4(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        first: &[u8],
+        leftover: &[u8],
+    ) -> Vec<Cell> {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(leftover);
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(src, dst, sport, dport, 1, &payload),
+            eth_ipv4_tcp_flow(src, dst, sport, dport, 1 + payload.len() as u32, INNER_GET),
+        ])
+    }
+
+    fn assert_http1_http2_then_blank(cells: &[Cell], host: &str) {
+        assert_eq!(cells[0].http_host, [host]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    #[test]
+    fn http2_leftover_after_http1_counts_later_segments() {
+        let firsts = [
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n",
+            b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+        ];
+        for first in firsts {
+            for leftover in [HTTP2_MAGIC, HTTP2_FIRST_LINE] {
+                assert_http1_http2_then_blank(
+                    &http1_then_http2_then_get(first, leftover),
+                    "a.example",
+                );
+            }
+        }
+        let get = firsts[0];
+        for (src, dst, sport, dport) in [
+            (CLIENT, SERVER, 50000u16, 80u16),
+            (SERVER, CLIENT, 80, 50000),
+            (CLIENT, SERVER, 50000, 8080),
+        ] {
+            assert_http1_http2_then_blank(
+                &http1_then_http2_then_get_ipv4(src, dst, sport, dport, get, HTTP2_MAGIC),
+                "a.example",
+            );
+        }
+        let mut payload = get.to_vec();
+        payload.extend_from_slice(HTTP2_MAGIC);
+        let v6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(HTTP2_V6_CLIENT, HTTP2_V6_SERVER, 50000, 80, 1, &payload),
+            eth_ipv6_tcp_flow(
+                HTTP2_V6_CLIENT,
+                HTTP2_V6_SERVER,
+                50000,
+                80,
+                1 + payload.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http1_http2_then_blank(&v6, "a.example");
+        let vlan = walk_http_frames(&[
+            eth_vlan_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &payload),
+            eth_vlan_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + payload.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http1_http2_then_blank(&vlan, "a.example");
+    }
+
+    #[test]
+    fn http_content_length_magic_body_still_prints_leftover_get() {
+        assert_eq!(HTTP2_MAGIC.len(), 24);
+        let starts = [
+            b"GET / HTTP/1.1".as_slice(),
+            b"PUT / HTTP/1.1",
+            b"OPTIONS / HTTP/1.1",
+            b"POST / HTTP/1.1",
+            b"HTTP/1.1 200 OK",
+            b"HTTP/1.1 204 No Content",
+        ];
+        for start in starts {
+            let cell = walk_http(&eth_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1,
+                &cl24_magic_then_get(start),
+            ));
+            assert_eq!(
+                cell.http_host,
+                ["a.example", "inner.example"],
+                "{}",
+                start.escape_ascii()
+            );
+            assert_eq!(cell.counted, None, "{}", start.escape_ascii());
+        }
+        let cl0 = walk_http(&eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &{
+            let mut payload =
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n".to_vec();
+            payload.extend_from_slice(HTTP2_MAGIC);
+            payload.extend_from_slice(INNER_GET);
+            payload
+        }));
+        assert_eq!(cl0.http_host, ["a.example"]);
+        assert_eq!(cl0.counted, None);
+    }
+
+    #[test]
+    fn http_content_length_magic_body_later_frame_is_counted() {
+        let mut first =
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n".to_vec();
+        first.extend_from_slice(HTTP2_MAGIC);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &first),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + first.len() as u32, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        // A later frame after a CL-24 Magic body is a counted miss
+        // (allowed): the unbounded-body HTTP/2 stick also covers a
+        // Content-Length body that consumed the rest of the payload.
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    #[test]
+    fn http_desegment_body_opposite_direction_still_prints() {
+        let cells = http_req_resp_get(
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nHost: resp.example\r\n\r\n",
+            INNER_GET,
+        );
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[2].http_host, ["inner.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_head_200_still_prints_a_later_opposite_host() {
+        let cells = http_req_resp_get(
+            b"HEAD / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nHost: resp.example\r\n\r\n",
+            INNER_GET,
+        );
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[2].http_host, ["inner.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    fn http_req_resp(req: &[u8], resp: &[u8]) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, resp),
+        ])
+    }
+
+    #[test]
+    fn http_101_upgrade_same_segment_leftover_is_tunnel() {
+        let leftovers = [
+            (
+                b"websocket".as_slice(),
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n".as_slice(),
+                &["sw.example"][..],
+            ),
+            (
+                b"foo",
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: foo\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                &["sw.example"],
+            ),
+            (
+                b"websocket-no-host",
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                &[],
+            ),
+        ];
+        for (label, resp, hosts) in leftovers {
+            let cells = http_req_resp(
+                b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\n\r\n",
+                resp,
+            );
+            assert_eq!(
+                cells[0].http_host,
+                ["ws.example"],
+                "{}",
+                label.escape_ascii()
+            );
+            assert_eq!(cells[0].counted, None, "{}", label.escape_ascii());
+            assert_eq!(cells[1].http_host, hosts, "{}", label.escape_ascii());
+            assert_eq!(
+                cells[1].counted,
+                Some("http-tunnel"),
+                "{}",
+                label.escape_ascii()
+            );
+        }
+    }
+
+    #[test]
+    fn http_sstp_same_segment_leftover_is_tunnel() {
+        let cells = http_req_resp(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http-tunnel"));
+
+        let cells = http_req_resp(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 4\r\nHost: resp.example\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[1].http_host, ["resp.example"]);
+        assert_eq!(cells[1].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_connect_200_same_segment_leftover_still_prints() {
+        for uri in ["example.com:443", "example.com:22", "example.com:80"] {
+            let mut leftover = CONNECT_200.to_vec();
+            leftover.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n");
+            let cells = http_req_resp(&connect_req(uri), &leftover);
+            assert_eq!(cells[0].http_host, [uri], "{uri}");
+            assert_eq!(cells[0].counted, None, "{uri}");
+            assert_eq!(cells[1].http_host, ["after-connect.example"], "{uri}");
+            assert_eq!(cells[1].counted, None, "{uri}");
+        }
+    }
+
+    fn http_cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {
+        let mut payload = status.to_vec();
+        payload.extend_from_slice(b"\r\nHost: st.example\r\nContent-Length: 4\r\n\r\n");
+        payload.extend_from_slice(pad);
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after.example\r\n\r\n");
+        payload
+    }
+
+    #[test]
+    fn http_rfc_no_body_content_length_leftover_matches_tshark() {
+        let statuses = [
+            b"HTTP/1.1 100 Continue".as_slice(),
+            b"HTTP/1.1 101 Switching Protocols",
+            b"HTTP/1.1 102 Processing",
+            b"HTTP/1.1 204 No Content",
+            b"HTTP/1.1 304 Not Modified",
+            b"ICY 204 No Content",
+        ];
+        const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for status in statuses {
+            let extra = http_cl_then(status, b"");
+            let drop = http_cl_then(status, b"xxxx");
+            let frames = [
+                eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, &extra),
+                eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, &drop),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &extra),
+                eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, &extra),
+                eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, &drop),
+            ];
+            let expected = [
+                &["st.example"][..],
+                &["st.example", "after.example"],
+                &["st.example"],
+                &["st.example"],
+                &["st.example", "after.example"],
+            ];
+            for (frame, hosts) in frames.iter().zip(expected) {
+                let cell = walk_http(frame);
+                assert_eq!(cell.http_host, hosts, "{status:?}");
+                assert_eq!(cell.counted, None, "{status:?}");
+            }
+        }
+        for status in [
+            b"HTTP/1.1 200 OK".as_slice(),
+            b"HTTP/1.1 203 Non-Authoritative Information",
+        ] {
+            let extra = walk_http(&eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1,
+                &http_cl_then(status, b""),
+            ));
+            assert_eq!(extra.http_host, ["st.example"], "{status:?}");
+            assert_eq!(extra.counted, None, "{status:?}");
+            let drop = walk_http(&eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1,
+                &http_cl_then(status, b"xxxx"),
+            ));
+            assert_eq!(
+                drop.http_host,
+                ["st.example", "after.example"],
+                "{status:?}"
+            );
+            assert_eq!(drop.counted, None, "{status:?}");
+        }
+        let upgrade = walk_http(&eth_ipv4_tcp_flow(
+            SERVER,
+            CLIENT,
+            80,
+            50000,
+            1,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        ));
+        assert_eq!(upgrade.http_host, ["sw.example"]);
+        assert_eq!(upgrade.counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_request_and_200_same_segment_leftover_is_tunnel() {
+        let payload = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n";
+        let with_resp = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\nHost: resp.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n";
+        for (src, dst, sport, dport) in [
+            (CLIENT, SERVER, 50000u16, 80u16),
+            (SERVER, CLIENT, 80, 50000),
+        ] {
+            let cell = walk_http(&eth_ipv4_tcp_flow(src, dst, sport, dport, 1, payload));
+            assert_eq!(cell.http_host, ["sstp.example"], "{sport}->{dport}");
+            assert_eq!(cell.counted, Some("http-tunnel"), "{sport}->{dport}");
+            let cell = walk_http(&eth_ipv4_tcp_flow(src, dst, sport, dport, 1, with_resp));
+            assert_eq!(
+                cell.http_host,
+                ["sstp.example", "resp.example"],
+                "{sport}->{dport} resp"
+            );
+            assert_eq!(cell.counted, Some("http-tunnel"), "{sport}->{dport} resp");
+        }
+    }
+
+    #[test]
+    fn http_extra_crlf_pipeline_prints_both_hosts() {
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example", "b.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example", "b.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_long_status_token_without_fin_is_counted() {
+        let payloads = [
+            b"HTTP/1.1 1010 X\r\nHost: st.example\r\n\r\nhello".as_slice(),
+            b"HTTP/1.1 2040 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 3040 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 1000 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 101X X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 204X X\r\nHost: st.example\r\n\r\nhello",
+            b"ICY 1010 X\r\nHost: st.example\r\n\r\nhello",
+        ];
+        for payload in payloads {
+            let cell = walk_http(&eth_ipv4_tcp(SERVER, 80, 50000, payload));
+            assert_eq!(cell.http_host, [] as [&str; 0], "{payload:?}");
+            assert_eq!(cell.counted, Some("http"), "{payload:?}");
+            let cell = walk_http(&eth_ipv4_tcp_fin(SERVER, 80, 50000, payload));
+            assert_eq!(cell.http_host, ["st.example"], "{payload:?}");
+            assert_eq!(cell.counted, None, "{payload:?}");
+        }
+        let cell = walk_http(&eth_ipv4_tcp(
+            SERVER,
+            80,
+            50000,
+            b"HTTP/1.1 101 Switching Protocols\r\nHost: st.example\r\n\r\nhello",
+        ));
+        assert_eq!(cell.http_host, ["st.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_trailing_cr_blank_is_counted() {
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r",
+        ));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\rHost: cr.example\r\r",
+        ));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["cr.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cr.example\r",
+        ));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+    }
+
+    #[test]
+    fn http_content_length_vt_ff_and_nul_are_counted_without_a_body() {
+        let headers = [
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0c4\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x0c\r\n\r\n",
+        ];
+        for payload in headers {
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, payload));
+            assert_eq!(cell.http_host, [] as [&str; 0], "{payload:?}");
+            assert_eq!(cell.counted, Some("http"), "{payload:?}");
+            let mut with_body = payload.to_vec();
+            with_body.extend_from_slice(b"body");
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
+            assert_eq!(cell.http_host, ["cllead.example"], "{payload:?}");
+            assert_eq!(cell.counted, None, "{payload:?}");
+        }
+    }
+
+    fn http_junk_cl4(start: &[u8], after_junk: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 4\r\nnot-a-header\r\n");
+        payload.extend_from_slice(after_junk);
+        payload.extend_from_slice(INNER_GET);
+        payload
+    }
+
+    #[test]
+    fn http_no_colon_content_length_without_body_after_blank_is_counted() {
+        let starts = [
+            b"HTTP/1.1 200 OK".as_slice(),
+            b"HTTP/1.1 201 Created",
+            b"POST / HTTP/1.1",
+            b"GET / HTTP/1.1",
+        ];
+        for start in starts {
+            for pad in [b"xxxx".as_slice(), b""] {
+                let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &http_junk_cl4(start, pad)));
+                assert_eq!(cell.http_host, [] as [&str; 0], "{:?} {:?}", start, pad);
+                assert_eq!(cell.counted, Some("http"), "{:?} {:?}", start, pad);
+            }
+        }
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &http_junk_cl4(b"HTTP/1.1 200 OK", b"\r\nxxxx"),
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp_fin(
+            CLIENT,
+            50000,
+            80,
+            &http_junk_cl4(b"HTTP/1.1 200 OK", b"xxxx"),
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    fn http_after_junk(start: &[u8], rest: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nnot-a-header\r\n");
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    #[test]
+    fn http_no_colon_later_content_length_and_chunked_are_counted() {
+        let extras = [
+            http_after_junk(
+                b"POST / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            http_after_junk(b"GET / HTTP/1.1", b"Content-Length: 4\r\n\r\n"),
+            http_after_junk(b"POST / HTTP/1.1", b"junk2\r\nContent-Length: 50\r\n\r\n"),
+            b"POST / HTTP/1.1\r\nHost: a.example\r\n extra\r\nContent-Length: 50\r\n\r\n".to_vec(),
+            http_after_junk(
+                b"NOTIFY / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            http_after_junk(
+                b"OPTIONS / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            http_after_junk(b"POST / HTTP/1.1", b"Transfer-Encoding: chunked\r\n\r\n"),
+            http_after_junk(b"POST / HTTP/1.1", b"Transfer-Encoding: chunked\r\n\r\n1"),
+        ];
+        for payload in extras {
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &payload));
+            assert_eq!(
+                cell.http_host,
+                [] as [&str; 0],
+                "{}",
+                payload.escape_ascii()
+            );
+            assert_eq!(cell.counted, Some("http"), "{}", payload.escape_ascii());
+        }
+        let mut complete = http_after_junk(
+            b"POST / HTTP/1.1",
+            b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        );
+        complete.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &complete));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let mut with_body = http_after_junk(b"POST / HTTP/1.1", b"Content-Length: 4\r\n\r\nxxxx");
+        with_body.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &http_after_junk(
+                b"HTTP/1.1 204 No Content",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let mut fin = http_after_junk(b"POST / HTTP/1.1", b"Content-Length: 100\r\n\r\n");
+        fin.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp_fin(CLIENT, 50000, 80, &fin));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_content_length_trailing_vt_leftover_is_continuation() {
+        let mut payload =
+            b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nxxxx".to_vec();
+        payload.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &payload));
+        assert_eq!(cell.http_host, ["cl.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["cl.example"]);
+        assert_eq!(cell.counted, None);
+        let mut lead =
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\nxxxx"
+                .to_vec();
+        lead.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &lead));
+        assert_eq!(cell.http_host, ["cllead.example", "inner.example"]);
         assert_eq!(cell.counted, None);
     }
 
@@ -3831,10 +6419,22 @@ mod tests {
         seq: u32,
         payload: &[u8],
     ) -> Vec<u8> {
+        eth_ipv6_tcp_flow_flags(src, dst, sport, dport, seq, 0x18, payload)
+    }
+
+    fn eth_ipv6_tcp_flow_flags(
+        src: [u8; 16],
+        dst: [u8; 16],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut tcp = Vec::from(sport.to_be_bytes());
         tcp.extend_from_slice(&dport.to_be_bytes());
         tcp.extend_from_slice(&seq.to_be_bytes());
-        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, flags, 0, 64, 0, 0, 0, 0]);
         tcp.extend_from_slice(payload);
         let mut frame = vec![
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60, 0, 0, 0,

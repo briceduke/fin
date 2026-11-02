@@ -5,6 +5,7 @@
 //! seam does not prove. pcapng uses [`read_capture`].
 
 mod chunk;
+mod http_host;
 mod ip_src;
 mod options;
 mod pcap;
