@@ -1208,10 +1208,11 @@ enum HopDest<'a> {
     Count,
 }
 
-/// Pad1/PadN that fit in the capture walk next. Jumbo walks next when its
-/// 4-byte read consumes the rest of this header. Leftover TLV bytes after
-/// that read are counted so a later throw cannot print an inner `ip.src`.
-/// Any other option is counted.
+/// Pad1/PadN that fit in the capture walk next. Jumbo whose 2+opt_len
+/// overruns the captured payload is truncated like PadN. Jumbo walks next
+/// when its 4-byte read consumes the rest of this header. Leftover TLV
+/// bytes after that read are counted so a later throw cannot print an
+/// inner `ip.src`. Any other option is counted.
 fn hop_dest(bytes: &[u8]) -> HopDest<'_> {
     let Some((next, rest)) = take_ext8(bytes) else {
         return HopDest::Truncated;
@@ -1232,6 +1233,11 @@ fn hop_dest(bytes: &[u8]) -> HopDest<'_> {
         }
         let opt_len = bytes[offset + 1] as usize;
         if typ == 0xc2 {
+            // tshark 4.6.9 `dissect_opts` `proto_tree_add_none_format`s
+            // 2+opt_len from the hop/dest tvb before `dissect_opt_jumbo`.
+            if offset + 2 + opt_len > bytes.len() {
+                return HopDest::Truncated;
+            }
             // tshark 4.6.9 `dissect_opt_jumbo` always `proto_tree_add_item` 4.
             if offset + 6 > bytes.len() {
                 return HopDest::Truncated;
@@ -1761,6 +1767,32 @@ mod tests {
                 walk(&opts_frame(ext, &[0xc2, 4, 0, 1, 0, 0])),
                 proved(&["10.9.9.9"]),
                 "ext {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_jumbo_opt_len_overruns_capture_stays_blank() {
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame(ext, &[0xc2, 0xff, 0, 1, 0, 0])),
+                blank(),
+                "ext {ext} jumbo opt_len 255"
+            );
+            assert_eq!(
+                walk(&opts_frame(ext, &[0xc2, 41])),
+                blank(),
+                "ext {ext} jumbo opt_len 41"
+            );
+            assert_eq!(
+                walk(&opts_frame(ext, &[0, 0, 0, 0, 0xc2, 255])),
+                blank(),
+                "ext {ext} four Pad1 then jumbo opt_len 255"
+            );
+            assert_eq!(
+                walk(&opts_frame(ext, &[0, 0, 0, 0, 0, 0xc2])),
+                blank(),
+                "ext {ext} five Pad1 then jumbo as last header byte"
             );
         }
     }
