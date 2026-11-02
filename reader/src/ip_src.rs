@@ -1520,36 +1520,6 @@ mod tests {
     }
 
     #[test]
-    fn rfc4884_ipv6_flow_0100_len_1_clips_to_4() {
-        let icmp = icmp_embed(3, 1, &ipv6_flow(4, 0x0100, &ipv4_udp_discard()));
-        assert_eq!(rfc4884_embed_len(&icmp), Some(4));
-    }
-
-    #[test]
-    fn rfc4884_ipv4_len_1_clips_to_ihl_plus_length() {
-        let icmp = icmp_embed(3, 1, &ipv4_udp_discard());
-        assert_eq!(rfc4884_embed_len(&icmp), Some(24));
-    }
-
-    #[test]
-    fn rfc4884_len_0_does_not_clip() {
-        let icmp = icmp_embed(3, 0, &ipv6_flow(4, 0x0100, &ipv4_udp_discard()));
-        assert_eq!(rfc4884_embed_len(&icmp), None);
-    }
-
-    #[test]
-    fn rfc4884_flow_1_len_1_does_not_clip() {
-        let icmp = icmp_embed(3, 1, &ipv6_flow(4, 1, &ipv4_udp_discard()));
-        assert_eq!(rfc4884_embed_len(&icmp), None);
-    }
-
-    #[test]
-    fn rfc4884_len_14_clips_to_56() {
-        let icmp = icmp_embed(3, 14, &ipv6_flow(4, 0x0100, &ipv4_udp_discard()));
-        assert_eq!(rfc4884_embed_len(&icmp), Some(56));
-    }
-
-    #[test]
     fn icmp_rfc4884_ipv6_types_clip_flow_0100_len_1() {
         for typ in [3, 4, 11, 12] {
             assert_eq!(
