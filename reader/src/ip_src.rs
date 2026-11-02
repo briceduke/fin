@@ -1208,9 +1208,10 @@ enum HopDest<'a> {
     Count,
 }
 
-/// Pad1/PadN that fit in the capture walk next. Jumbo skips leftover TLVs
-/// in this header. Any other option is counted so a type-specific throw
-/// cannot print an inner `ip.src` tshark omitted.
+/// Pad1/PadN that fit in the capture walk next. Jumbo walks next when its
+/// 4-byte read consumes the rest of this header. Leftover TLV bytes after
+/// that read are counted so a later throw cannot print an inner `ip.src`.
+/// Any other option is counted.
 fn hop_dest(bytes: &[u8]) -> HopDest<'_> {
     let Some((next, rest)) = take_ext8(bytes) else {
         return HopDest::Truncated;
@@ -1231,6 +1232,13 @@ fn hop_dest(bytes: &[u8]) -> HopDest<'_> {
         }
         let opt_len = bytes[offset + 1] as usize;
         if typ == 0xc2 {
+            // tshark 4.6.9 `dissect_opt_jumbo` always `proto_tree_add_item` 4.
+            if offset + 6 > bytes.len() {
+                return HopDest::Truncated;
+            }
+            if offset + 6 < end {
+                return HopDest::Count;
+            }
             return HopDest::Next(next, rest);
         }
         if typ != 1 {
@@ -1743,6 +1751,38 @@ mod tests {
                 proved(&["10.9.9.9"]),
                 "ext {ext}"
             );
+        }
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_jumbo_first_tlv_of_8_walks_ipip() {
+        for ext in [0u8, 60] {
+            assert_eq!(
+                walk(&opts_frame(ext, &[0xc2, 4, 0, 1, 0, 0])),
+                proved(&["10.9.9.9"]),
+                "ext {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn hopopt_and_dstopts_jumbo_leftover_tlv_is_counted() {
+        let jumbo = [0xc2, 4, 0, 1, 0, 0];
+        let prefixes: [&[u8]; 4] = [&[0, 0], &[1, 0], &[0, 0, 0, 0, 0], &[0, 0, 0, 0, 0, 0, 0]];
+        for ext in [0u8, 60] {
+            for prefix in prefixes {
+                for leftover in [0x07u8, 0x13, 0x04, 0x05] {
+                    let mut options = prefix.to_vec();
+                    options.extend_from_slice(&jumbo);
+                    options.extend_from_slice(&[leftover, 0, 0, 0, 0, 0]);
+                    let hdrlen = (2 + options.len()).div_ceil(8).saturating_sub(1) as u8;
+                    assert_eq!(
+                        walk(&opts_frame_hdr(ext, hdrlen, &options)),
+                        counted("ipv6"),
+                        "ext {ext} prefix {prefix:?} leftover {leftover:#x}"
+                    );
+                }
+            }
         }
     }
 
