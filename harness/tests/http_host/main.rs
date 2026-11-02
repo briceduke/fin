@@ -827,6 +827,294 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 )],
             ),
         ),
+        (
+            "upgrade-websocket-same-segment-leftover",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1,
+                        b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\n\r\n",
+                    ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1,
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "upgrade-foo-same-segment-leftover",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1,
+                        b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: foo\r\n\r\n",
+                    ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1,
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: foo\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "upgrade-no-host-same-segment-leftover",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1,
+                        b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\n\r\n",
+                    ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1,
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "sstp-same-segment-leftover",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1,
+                        b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+                    ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1,
+                        b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "sstp-same-segment-leftover-cl4",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1,
+                        b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+                    ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1,
+                        b"HTTP/1.1 200 Connection Established\r\nContent-Length: 4\r\nHost: resp.example\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "extra-crlf-pipeline",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "extra-crlf-post-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "two-extra-crlf-pipeline",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "status-1010",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 1010 X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-2040",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 2040 X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-3040",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 3040 X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-1000",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 1000 X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-101x",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 101X X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-204x",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 204X X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "icy-1010",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"ICY 1010 X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-1010-fin",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_fin(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 1010 X\r\nHost: st.example\r\n\r\nhello",
+                )],
+            ),
+        ),
+        (
+            "status-101",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    PEER,
+                    80,
+                    50000,
+                    b"HTTP/1.1 101 Switching Protocols\r\nHost: st.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "trailing-cr-blank",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r",
+                )],
+            ),
+        ),
+        (
+            "trailing-cr-only-lines",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"GET / HTTP/1.1\rHost: cr.example\r\r",
+                )],
+            ),
+        ),
     ]
     .into_iter()
     .chain(on_disk())

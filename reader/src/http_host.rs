@@ -27,6 +27,12 @@ pub struct HttpProved {
     pub has_response: bool,
     /// Complete 101 response that listed `Upgrade`.
     pub switching_upgrade: bool,
+    /// Bytes remain after a complete 101 with `Upgrade`. Unwalked tunnel.
+    pub leftover_after_upgrade: bool,
+    /// Bytes remain after the first complete response.
+    pub leftover_after_response: bool,
+    /// Hosts from complete messages after the first complete response.
+    pub hosts_after_response: Vec<String>,
 }
 
 const TOKEN: &[u8] = b"!#$%&\\:*+-.^_`|~";
@@ -37,10 +43,7 @@ pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
     if payload.is_empty() {
         return HttpParse::Other;
     }
-    let mut offset = 0;
-    if payload.len() > 3 && payload[0] == b'\r' && payload[1] == b'\n' {
-        offset = 2;
-    }
+    let mut offset = skip_leading_crlf(payload);
     if offset >= payload.len() {
         return HttpParse::Other;
     }
@@ -64,6 +67,9 @@ pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
                 status,
                 upgrade,
             } => {
+                if proved.has_response {
+                    proved.hosts_after_response.extend(found.iter().cloned());
+                }
                 proved.hosts.extend(found);
                 if sstp_duplex_post {
                     proved.sstp_duplex_post = true;
@@ -75,9 +81,15 @@ pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
                     }
                     if status == 101 && upgrade {
                         proved.switching_upgrade = true;
+                        offset += next;
+                        proved.leftover_after_upgrade = offset < payload.len();
+                        break;
                     }
                 }
                 offset += next;
+                if proved.has_response && offset < payload.len() {
+                    proved.leftover_after_response = true;
+                }
             }
             Take::Incomplete if proved.hosts.is_empty() => return HttpParse::Unproved,
             Take::Incomplete => return HttpParse::Message(proved),
@@ -123,6 +135,11 @@ enum LineKind {
 }
 
 fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
+    if payload.is_empty() {
+        return Take::Done;
+    }
+    let skip = skip_leading_crlf(payload);
+    let payload = &payload[skip..];
     if payload.is_empty() {
         return Take::Done;
     }
@@ -200,7 +217,7 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
     }
     Take::Complete {
         hosts,
-        next: header_end + body_need as usize,
+        next: skip + header_end + body_need as usize,
         sstp_duplex_post: matches!(
             kind,
             LineKind::Request {
@@ -222,11 +239,12 @@ fn take_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
             return Some((&bytes[..i], i + 1));
         }
         if bytes[i] == b'\r' {
-            let next = if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                i + 2
-            } else {
-                i + 1
-            };
+            // tshark 4.6.9 `tvb_find_line_end(..., desegment=true)`
+            // returns -1 when this CR has no next byte in the tvbuff.
+            if i + 1 >= bytes.len() {
+                return None;
+            }
+            let next = if bytes[i + 1] == b'\n' { i + 2 } else { i + 1 };
             return Some((&bytes[..i], next));
         }
         i += 1;
@@ -307,6 +325,8 @@ fn is_request_method(method: &[u8]) -> bool {
     )
 }
 
+/// tshark 4.6.9 `parse_http_status_code`: the status token length must
+/// be exactly 3 digits, otherwise the code is 0.
 fn parse_status(line: &[u8]) -> u16 {
     let mut rest = line;
     if let Some(sp) = rest.iter().position(|b| *b == b' ') {
@@ -317,16 +337,28 @@ fn parse_status(line: &[u8]) -> u16 {
     } else {
         return 0;
     }
-    if rest.len() < 3 {
+    let token_len = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
+    let token = &rest[..token_len];
+    if token.len() != 3 {
         return 0;
     }
-    let a = rest[0];
-    let b = rest[1];
-    let c = rest[2];
+    let a = token[0];
+    let b = token[1];
+    let c = token[2];
     if !a.is_ascii_digit() || !b.is_ascii_digit() || !c.is_ascii_digit() {
         return 0;
     }
     u16::from(a - b'0') * 100 + u16::from(b - b'0') * 10 + u16::from(c - b'0')
+}
+
+/// tshark 4.6.9 `dissect_http_message` skips one leading CRLF when
+/// remaining > 3 and `tvb_get_ntohs == 0x0d0a`.
+fn skip_leading_crlf(payload: &[u8]) -> usize {
+    if payload.len() > 3 && payload[0] == b'\r' && payload[1] == b'\n' {
+        2
+    } else {
+        0
+    }
 }
 
 fn valid_header_name(name: &[u8]) -> bool {
@@ -593,10 +625,112 @@ mod tests {
             parse_http(b"GET / HTTP/1.0\r\nHost: ten.example\r\n\r\n", false),
             msg(&["ten.example"])
         );
+    }
+
+    #[test]
+    fn trailing_cr_blank_is_incomplete() {
+        assert_eq!(
+            parse_http(b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r", false),
+            HttpParse::Unproved
+        );
         assert_eq!(
             parse_http(b"GET / HTTP/1.1\rHost: cr.example\r\r", false),
+            HttpParse::Unproved
+        );
+        assert_eq!(
+            parse_http(b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r\n", false),
             msg(&["cr.example"])
         );
+        assert_eq!(
+            parse_http(b"GET / HTTP/1.1\r\nHost: cr.example\r", false),
+            HttpParse::Unproved
+        );
+    }
+
+    #[test]
+    fn extra_crlf_before_a_pipelined_request() {
+        assert_eq!(
+            parse_http(
+                b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                false
+            ),
+            msg(&["a.example", "b.example"])
+        );
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                false
+            ),
+            msg(&["a.example", "b.example"])
+        );
+        assert_eq!(
+            parse_http(
+                b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                false
+            ),
+            msg(&["a.example"])
+        );
+    }
+
+    #[test]
+    fn status_token_must_be_exactly_three_digits() {
+        let bodies = [
+            b"HTTP/1.1 1010 X\r\nHost: st.example\r\n\r\nhello".as_slice(),
+            b"HTTP/1.1 2040 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 3040 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 1000 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 101X X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 204X X\r\nHost: st.example\r\n\r\nhello",
+            b"ICY 1010 X\r\nHost: st.example\r\n\r\nhello",
+            b"ICY 2040 X\r\nHost: st.example\r\n\r\nhello",
+        ];
+        for payload in bodies {
+            assert_eq!(
+                parse_http(payload, false),
+                HttpParse::Unproved,
+                "{payload:?}"
+            );
+            assert_eq!(
+                parse_http(payload, true),
+                resp(&["st.example"], false, false),
+                "{payload:?}"
+            );
+        }
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 101 Switching Protocols\r\nHost: st.example\r\n\r\n",
+                false
+            ),
+            resp(&["st.example"], false, false)
+        );
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 204 No Content\r\nHost: st.example\r\n\r\n",
+                false
+            ),
+            resp(&["st.example"], false, false)
+        );
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 304 Not Modified\r\nHost: st.example\r\n\r\n",
+                false
+            ),
+            resp(&["st.example"], false, false)
+        );
+    }
+
+    #[test]
+    fn upgrade_101_stops_before_leftover() {
+        let HttpParse::Message(proved) = parse_http(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+            false,
+        ) else {
+            panic!("expected a proved 101");
+        };
+        assert_eq!(proved.hosts, ["sw.example"]);
+        assert!(proved.switching_upgrade);
+        assert!(proved.leftover_after_upgrade);
+        assert_eq!(proved.hosts_after_response, [] as [&str; 0]);
     }
 
     #[test]

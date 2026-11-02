@@ -712,9 +712,10 @@ impl Walk<'_> {
                         self.http_seen.insert(key);
                     }
                     if let Some(flow) = flow {
-                        self.note_http_switch(flow, &proved);
+                        self.extend_http_hosts(flow, proved);
+                    } else {
+                        self.http_host.extend(proved.hosts);
                     }
-                    self.http_host.extend(proved.hosts);
                 }
                 HttpParse::Partial(hosts) => {
                     if let Some(key) = key {
@@ -753,9 +754,35 @@ impl Walk<'_> {
         }
     }
 
-    /// tshark 4.6.9 `packet-http.c` sets `next_handle` after a complete
-    /// `SSTP_DUPLEX_POST` + 200 or a 101 with `Upgrade`. Unwalked tunnels
-    /// are counted; CONNECT + 200 and a 101 with no Upgrade stay HTTP.
+    /// tshark 4.6.9 `dissect_http_on_stream` hands leftover after a complete
+    /// 101 with `Upgrade` or `SSTP_DUPLEX_POST` plus 200 to `next_handle`.
+    /// Those later Hosts are an unwalked tunnel, including leftover in this
+    /// same segment. CONNECT + 200 and a 101 with no Upgrade stay HTTP.
+    fn extend_http_hosts(&mut self, flow: TcpFlow, proved: HttpProved) {
+        self.note_http_switch(flow, &proved);
+        if !self.http_tunnel.contains(&flow.conversation()) {
+            self.http_host.extend(proved.hosts);
+            return;
+        }
+        let leftover = if proved.switching_upgrade {
+            proved.leftover_after_upgrade
+        } else {
+            proved.leftover_after_response
+        };
+        if proved.switching_upgrade {
+            self.http_host.extend(proved.hosts);
+        } else {
+            let keep = proved
+                .hosts
+                .len()
+                .saturating_sub(proved.hosts_after_response.len());
+            self.http_host.extend(proved.hosts.into_iter().take(keep));
+        }
+        if leftover {
+            self.count("http-tunnel");
+        }
+    }
+
     fn note_http_switch(&mut self, flow: TcpFlow, proved: &HttpProved) {
         let conv = flow.conversation();
         if proved.switching_upgrade {
@@ -1964,10 +1991,26 @@ mod tests {
         seq: u32,
         payload: &[u8],
     ) -> Vec<u8> {
+        eth_ipv4_tcp_flow_flags(src, dst, sport, dport, seq, 0x18, payload)
+    }
+
+    fn eth_ipv4_tcp_fin(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        eth_ipv4_tcp_flow_flags(src, SERVER, sport, dport, 1, 0x19, payload)
+    }
+
+    fn eth_ipv4_tcp_flow_flags(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut tcp = Vec::from(sport.to_be_bytes());
         tcp.extend_from_slice(&dport.to_be_bytes());
         tcp.extend_from_slice(&seq.to_be_bytes());
-        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+        tcp.extend_from_slice(&[0, 0, 0, 0, 0x50, flags, 0, 64, 0, 0, 0, 0]);
         tcp.extend_from_slice(payload);
         let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 6, 0, 0];
         let total = (20 + tcp.len()) as u16;
@@ -2392,6 +2435,179 @@ mod tests {
         assert_eq!(cells[1].counted, None);
         assert_eq!(cells[2].http_host, ["after-connect.example"]);
         assert_eq!(cells[2].counted, None);
+    }
+
+    fn http_req_resp(req: &[u8], resp: &[u8]) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, resp),
+        ])
+    }
+
+    #[test]
+    fn http_101_upgrade_same_segment_leftover_is_tunnel() {
+        let leftovers = [
+            (
+                b"websocket".as_slice(),
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n".as_slice(),
+                &["sw.example"][..],
+            ),
+            (
+                b"foo",
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: foo\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                &["sw.example"],
+            ),
+            (
+                b"websocket-no-host",
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                &[],
+            ),
+        ];
+        for (label, resp, hosts) in leftovers {
+            let cells = http_req_resp(
+                b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\n\r\n",
+                resp,
+            );
+            assert_eq!(
+                cells[0].http_host,
+                ["ws.example"],
+                "{}",
+                label.escape_ascii()
+            );
+            assert_eq!(cells[0].counted, None, "{}", label.escape_ascii());
+            assert_eq!(cells[1].http_host, hosts, "{}", label.escape_ascii());
+            assert_eq!(
+                cells[1].counted,
+                Some("http-tunnel"),
+                "{}",
+                label.escape_ascii()
+            );
+        }
+    }
+
+    #[test]
+    fn http_sstp_same_segment_leftover_is_tunnel() {
+        let cells = http_req_resp(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http-tunnel"));
+
+        let cells = http_req_resp(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 4\r\nHost: resp.example\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[1].http_host, ["resp.example"]);
+        assert_eq!(cells[1].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_connect_200_same_segment_leftover_still_prints() {
+        let cells = http_req_resp(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["example.com:443"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["after-connect.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_extra_crlf_pipeline_prints_both_hosts() {
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example", "b.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example", "b.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n\r\n\r\nGET /b HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_long_status_token_without_fin_is_counted() {
+        let payloads = [
+            b"HTTP/1.1 1010 X\r\nHost: st.example\r\n\r\nhello".as_slice(),
+            b"HTTP/1.1 2040 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 3040 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 1000 X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 101X X\r\nHost: st.example\r\n\r\nhello",
+            b"HTTP/1.1 204X X\r\nHost: st.example\r\n\r\nhello",
+            b"ICY 1010 X\r\nHost: st.example\r\n\r\nhello",
+        ];
+        for payload in payloads {
+            let cell = walk_http(&eth_ipv4_tcp(SERVER, 80, 50000, payload));
+            assert_eq!(cell.http_host, [] as [&str; 0], "{payload:?}");
+            assert_eq!(cell.counted, Some("http"), "{payload:?}");
+            let cell = walk_http(&eth_ipv4_tcp_fin(SERVER, 80, 50000, payload));
+            assert_eq!(cell.http_host, ["st.example"], "{payload:?}");
+            assert_eq!(cell.counted, None, "{payload:?}");
+        }
+        let cell = walk_http(&eth_ipv4_tcp(
+            SERVER,
+            80,
+            50000,
+            b"HTTP/1.1 101 Switching Protocols\r\nHost: st.example\r\n\r\nhello",
+        ));
+        assert_eq!(cell.http_host, ["st.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_trailing_cr_blank_is_counted() {
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r",
+        ));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\rHost: cr.example\r\r",
+        ));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cr.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["cr.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cr.example\r",
+        ));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
     }
 
     #[test]
