@@ -311,6 +311,13 @@ fn empty_syn_then_get(flags: u8, seq: u32, dport: u16) -> Vec<Vec<u8>> {
     ]
 }
 
+fn syn_rst_then_inner(flags: u8, seq: u32, dport: u16) -> Vec<Vec<u8>> {
+    vec![
+        eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, dport, 0, flags, GET_A),
+        eth_ipv4_tcp_seq(OUTER, 50000, dport, seq, INNER_GET),
+    ]
+}
+
 fn truncated_suffix_then_inner(cut: &[u8]) -> Vec<Vec<u8>> {
     let mut mid = GET_A.to_vec();
     mid.extend_from_slice(cut);
@@ -3133,6 +3140,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(junk_header_cases())
     .chain(syn_nxtseq_cases())
     .chain(empty_syn_nxtseq_cases())
+    .chain(syn_rst_nxtseq_cases())
     .chain(prefix_extend_desegment_cases())
     .chain(on_disk())
     .filter(|(_, bytes)| !bytes.is_empty())
@@ -3289,6 +3297,117 @@ fn empty_syn_nxtseq_cases() -> Vec<(&'static str, Vec<u8>)> {
             ],
         ),
     ));
+    out
+}
+
+fn syn_rst_nxtseq_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let flags = [
+        ("syn-rst", 0x06u8),
+        ("syn-rst-ack", 0x16),
+        ("syn-rst-psh", 0x0e),
+        ("syn-rst-fin", 0x07),
+    ];
+    let mut out = Vec::new();
+    for (tag, flags) in flags {
+        for seq in [0u32, 1, 2] {
+            out.push((
+                leak(format!("empty-{tag}-then-get-seq-{seq}")),
+                pcap(LINK_ETHERNET, &empty_syn_then_get(flags, seq, 80)),
+            ));
+        }
+        for seq in [0u32, 1, 35, 36, 37] {
+            out.push((
+                leak(format!("{tag}-get-then-inner-seq-{seq}")),
+                pcap(LINK_ETHERNET, &syn_rst_then_inner(flags, seq, 80)),
+            ));
+        }
+    }
+    for seq in [0u32, 2] {
+        out.push((
+            leak(format!("empty-syn-rst-then-get-seq-{seq}-ipv6")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to_flags(OUTER_V6, PEER_V6, 50000, 80, 0, 0x06, b""),
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, seq, GET_A),
+                ],
+            ),
+        ));
+        for dport in [8080u16, 3128] {
+            out.push((
+                leak(format!("empty-syn-rst-then-get-seq-{seq}-{dport}")),
+                pcap(LINK_ETHERNET, &empty_syn_then_get(0x06, seq, dport)),
+            ));
+        }
+        out.push((
+            leak(format!("empty-syn-rst-src80-then-get-seq-{seq}")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 80, 50000, 0, 0x06, b""),
+                    eth_ipv4_tcp_to(OUTER, PEER, 80, 50000, seq, GET_A),
+                ],
+            ),
+        ));
+        out.push((
+            leak(format!("empty-syn-rst-isn-1000-then-get-{}", 1000 + seq)),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1000, 0x06, b""),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1000 + seq, GET_A),
+                ],
+            ),
+        ));
+    }
+    out.push((
+        "empty-syn-rst-isn-1000-then-get-1001",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1000, 0x06, b""),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1001, GET_A),
+            ],
+        ),
+    ));
+    for seq in [0u32, 35, 36, 37] {
+        out.push((
+            leak(format!("syn-rst-get-then-inner-seq-{seq}-ipv6")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to_flags(OUTER_V6, PEER_V6, 50000, 80, 0, 0x06, GET_A),
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, seq, INNER_GET),
+                ],
+            ),
+        ));
+        for dport in [8080u16, 3128] {
+            out.push((
+                leak(format!("syn-rst-get-then-inner-seq-{seq}-{dport}")),
+                pcap(LINK_ETHERNET, &syn_rst_then_inner(0x06, seq, dport)),
+            ));
+        }
+        out.push((
+            leak(format!("syn-rst-src80-get-then-inner-seq-{seq}")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 80, 50000, 0, 0x06, GET_A),
+                    eth_ipv4_tcp_to(OUTER, PEER, 80, 50000, seq, INNER_GET),
+                ],
+            ),
+        ));
+        out.push((
+            leak(format!("syn-rst-isn-1000-then-inner-{}", 1000 + seq)),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1000, 0x06, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1000 + seq, INNER_GET),
+                ],
+            ),
+        ));
+    }
     out
 }
 

@@ -704,8 +704,8 @@ impl Walk<'_> {
         let rst = flags & 0x04 != 0;
         self.tcp_syn = flags & 0x02 != 0;
         if bytes.len() == data_off {
-            // Empty payload: SYN still consumes a sequence number.
-            if self.want_http && !rst && self.tcp_syn {
+            // Empty SYN consumes a seq, including SYN+RST.
+            if self.want_http && self.tcp_syn {
                 self.note_http_next(self.tcp_flow(src, dst), seq, 0);
             }
             return;
@@ -715,7 +715,14 @@ impl Walk<'_> {
         if self.want_tls {
             self.tls_from_tcp(src, dst, seq, pick, payload);
         }
-        if self.want_http && !rst {
+        if self.want_http && rst {
+            // RST skips HTTP dissection. SYN still sets nxtseq to seq+1;
+            // tshark 4.6.9 never hands RST payload to dissect_tcp_payload,
+            // so that length does not advance HTTP's in-order seq.
+            if self.tcp_syn {
+                self.note_http_next(self.tcp_flow(src, dst), seq, 0);
+            }
+        } else if self.want_http {
             self.http_from_tcp(src, dst, seq, fin, pick, payload);
         }
         if self.want_ip {
@@ -2805,6 +2812,98 @@ mod tests {
     }
 
     #[test]
+    fn http_empty_syn_rst_then_get_at_seq_1_prints_host() {
+        for (label, flags) in SYN_RST_FLAGS {
+            let cells = empty_syn_then_get(flags, 1, 80, 0x18);
+            assert_eq!(cells[0].http_host, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, None, "{label}");
+            assert_eq!(cells[1].http_host, ["a.example"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+        let isn = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1001, GET_A),
+        ]);
+        assert_eq!(isn[0].http_host, [] as [&str; 0]);
+        assert_eq!(isn[0].counted, None);
+        assert_eq!(isn[1].http_host, ["a.example"]);
+        assert_eq!(isn[1].counted, None);
+    }
+
+    #[test]
+    fn http_empty_syn_rst_then_get_not_at_nxtseq_is_not_http() {
+        for (label, flags) in SYN_RST_FLAGS {
+            for seq in [0u32, 2] {
+                let cells = empty_syn_then_get(flags, seq, 80, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
+            }
+        }
+        for seq in [0u32, 2] {
+            let v6 = walk_http_frames(&[
+                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, b""),
+                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
+            for dport in [8080u16, 3128] {
+                let cells = empty_syn_then_get(0x06, seq, dport, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
+            }
+            let src80 = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, b""),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
+            let isn = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+        }
+    }
+
+    #[test]
+    fn http_syn_rst_payload_then_later_get_is_not_http() {
+        for (label, flags) in SYN_RST_FLAGS {
+            for seq in [0u32, 35, 36, 37] {
+                let cells = syn_rst_payload_then(flags, seq, 80);
+                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
+            }
+        }
+        for seq in [0u32, 35, 36, 37] {
+            let v6 = walk_http_frames(&[
+                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, GET_A),
+                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, INNER_GET),
+            ]);
+            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
+            for dport in [8080u16, 3128] {
+                let cells = syn_rst_payload_then(0x06, seq, dport);
+                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
+            }
+            let src80 = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, GET_A),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, INNER_GET),
+            ]);
+            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
+            let isn = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, INNER_GET),
+            ]);
+            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+        }
+    }
+
+    #[test]
+    fn http_syn_rst_payload_then_get_at_seq_1_prints_host() {
+        for (label, flags) in SYN_RST_FLAGS {
+            let cells = syn_rst_payload_then(flags, 1, 80);
+            assert_eq!(cells[0].http_host, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, None, "{label}");
+            assert_eq!(cells[1].http_host, ["inner.example"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+    }
+
+    #[test]
     fn http_get_fin_without_syn_still_prints_in_order() {
         let cells = walk_http_frames(&[
             eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x19, GET_A),
@@ -3167,6 +3266,13 @@ mod tests {
         ("syn-psh-ack", 0x1a),
     ];
 
+    const SYN_RST_FLAGS: [(&str, u8); 4] = [
+        ("syn-rst", 0x06),
+        ("syn-rst-ack", 0x16),
+        ("syn-rst-psh", 0x0e),
+        ("syn-rst-fin", 0x07),
+    ];
+
     fn syn_http_then(flags: u8, seq: u32, dport: u16) -> Vec<Cell> {
         walk_http_frames(&[
             eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, GET_A),
@@ -3178,6 +3284,13 @@ mod tests {
         walk_http_frames(&[
             eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, b""),
             eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, seq, get_flags, GET_A),
+        ])
+    }
+
+    fn syn_rst_payload_then(flags: u8, seq: u32, dport: u16) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, dport, seq, INNER_GET),
         ])
     }
 
