@@ -95,10 +95,13 @@ fn blocks(bytes: &[u8], mut big_endian: bool, mut offset: usize) -> Capture<'_> 
     Capture::ok(frames)
 }
 
+/// tshark 4.6.9 `!handler->internal`: these blocks are rows, and a fault on
+/// them is exit 14 even when no row was produced.
 fn is_packet(block_type: u32) -> bool {
-    BLOCKS
-        .iter()
-        .any(|&(id, packet)| id == block_type && packet)
+    matches!(
+        block_type,
+        OPB_TYPE | SPB_TYPE | EPB_TYPE | JOURNAL_TYPE | CB_COPY | CB_NO_COPY
+    )
 }
 
 fn packet_type_at(bytes: &[u8], offset: usize, big_endian: bool) -> bool {
@@ -171,7 +174,7 @@ fn consume<'a>(
     interfaces: &mut Vec<Interface>,
     frames: &mut Vec<Frame<'a>>,
 ) -> Result<(), Fault> {
-    // Same set as BLOCKS. Unknown types are skipped.
+    // Unknown types are skipped.
     match block_type {
         SHB_TYPE => {
             shb_version(bytes, offset, big_endian)?;
