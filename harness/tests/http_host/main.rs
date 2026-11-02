@@ -259,6 +259,18 @@ fn req_resp_get(req: &[u8], resp: &[u8], later: &[u8]) -> [Vec<u8>; 3] {
     ]
 }
 
+fn cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {
+    let mut payload = status.to_vec();
+    payload.extend_from_slice(b"\r\nHost: st.example\r\nContent-Length: 4\r\n\r\n");
+    payload.extend_from_slice(pad);
+    payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after.example\r\n\r\n");
+    payload
+}
+
+fn eth_ipv6_tcp(src: [u8; 16], dst: [u8; 16], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    eth(0x86dd, &ipv6_to(src, dst, 6, &tcp(sport, dport, payload)))
+}
+
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
     let req = get("www.example.com");
     let vlan_frame = vlan(0x0800, &ipv4(OUTER, 6, &tcp(50000, 80, &req)));
@@ -945,6 +957,345 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                         b"HTTP/1.1 200 Connection Established\r\nContent-Length: 4\r\nHost: resp.example\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
                     ),
                 ],
+            ),
+        ),
+        (
+            "sstp-request-and-200-same-segment-client",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    OUTER,
+                    PEER,
+                    50000,
+                    80,
+                    1,
+                    b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "sstp-request-and-200-same-segment-server",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "sstp-request-and-200-same-segment-resp-host-client",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    OUTER,
+                    PEER,
+                    50000,
+                    80,
+                    1,
+                    b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\nHost: resp.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "sstp-request-and-200-same-segment-resp-host-server",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\nHost: resp.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "204-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 204 No Content", b""),
+                )],
+            ),
+        ),
+        (
+            "204-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 204 No Content", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "100-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 100 Continue", b""),
+                )],
+            ),
+        ),
+        (
+            "100-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 100 Continue", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "101-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 101 Switching Protocols", b""),
+                )],
+            ),
+        ),
+        (
+            "101-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 101 Switching Protocols", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "102-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 102 Processing", b""),
+                )],
+            ),
+        ),
+        (
+            "102-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 102 Processing", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "304-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 304 Not Modified", b""),
+                )],
+            ),
+        ),
+        (
+            "304-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 304 Not Modified", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "icy-204-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"ICY 204 No Content", b""),
+                )],
+            ),
+        ),
+        (
+            "icy-204-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"ICY 204 No Content", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "204-cl-extra-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 80, 50000, &cl_then(b"HTTP/1.1 204 No Content", b""))],
+            ),
+        ),
+        (
+            "204-cl-drop-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    80,
+                    50000,
+                    &cl_then(b"HTTP/1.1 204 No Content", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "204-cl-extra-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv6_tcp(
+                    PEER_V6,
+                    OUTER_V6,
+                    80,
+                    50000,
+                    &cl_then(b"HTTP/1.1 204 No Content", b""),
+                )],
+            ),
+        ),
+        (
+            "204-cl-drop-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv6_tcp(
+                    PEER_V6,
+                    OUTER_V6,
+                    80,
+                    50000,
+                    &cl_then(b"HTTP/1.1 204 No Content", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "101-upgrade-same-segment-one-frame",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "200-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 200 OK", b""),
+                )],
+            ),
+        ),
+        (
+            "200-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 200 OK", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "203-cl-extra",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 203 Non-Authoritative Information", b""),
+                )],
+            ),
+        ),
+        (
+            "203-cl-drop",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &cl_then(b"HTTP/1.1 203 Non-Authoritative Information", b"xxxx"),
+                )],
             ),
         ),
         (

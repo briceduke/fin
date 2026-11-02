@@ -13,7 +13,7 @@ HTTP/1.x requests and responses over TCP on the snapshotted tshark 4.6.9 `tcp.po
 - Bytes 0x80–0xFF become U+FFFD. A NUL truncates the value. `-T fields` escaping is the same `ws_escape_csv` path as TLS SNI.
 - An in-order retransmission of a TCP sequence already consumed prints an empty line.
 - A request without a Host header prints an empty line.
-- A 1xx, 204, or 304 response, or a response with Content-Length that fits, prints Host if present. The status token must be exactly three digits, matching tshark 4.6.9 `parse_http_status_code`; a longer token is status 0 and a response without Content-Length waits for FIN.
+- A 1xx, 204, or 304 response, or a response with Content-Length that fits, prints Host if present. The status token must be exactly three digits, matching tshark 4.6.9 `parse_http_status_code`; a longer token is status 0 and a response without Content-Length waits for FIN. A Content-Length on 1xx/204/304 still consumes `min(remaining, CL)` body bytes before the next message, matching `dissect_http_message`; the RFC no-body arm (`datalen = 0`) runs only when there is no Content-Length.
 - Content-Length is tshark 4.6.9 `g_ascii_strtoll` on the ENC_ASCII C string: leading `g_ascii_isspace` (including VT and FF) is skipped, and trailing NUL or `g_ascii_isspace` is accepted. A request that then still needs body bytes is counted.
 - A response with no Content-Length prints Host only when this segment has TCP FIN, matching `IS_TH_FIN`.
 - Two complete requests in one segment print both Hosts. One leading CRLF is skipped at the start of every message when remaining > 3, matching tshark 4.6.9 `dissect_http_message`.
@@ -34,7 +34,7 @@ These frames are counted when they look like HTTP that v1 does not prove, and le
 | HTTP/2 (`PRI * HTTP/2.0`, h2c upgrade) | Not HTTP/1.x. |
 | HTTP over TLS | tshark may decrypt (pcapng secrets) or follow HTTP inside TLS; v1 counts `http-over-tls` on snapshotted TLS ports. |
 | HTTP-like UDP (SSDP) | Not TCP. Counted `http-udp`. |
-| Inner HTTP in a tunnel this walker does not follow (sFlow, SSTP after `SSTP_DUPLEX_POST`+200, 101 with `Upgrade`, including leftover in that same segment, …) | Counted `http-tunnel`. A 101 with no Upgrade stays HTTP. |
+| Inner HTTP in a tunnel this walker does not follow (sFlow, SSTP after `SSTP_DUPLEX_POST`+200 including the request and 200 in the same segment, 101 with `Upgrade`, including leftover in that same segment, …) | Counted `http-tunnel`. A 101 with no Upgrade stays HTTP. |
 | CONNECT plus 200 | Stays HTTP, matching tshark 4.6.9. The CONNECT request prints Host; a later GET after the 200 prints Host. |
 | Out-of-order TCP | Counted. |
 

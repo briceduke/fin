@@ -198,20 +198,21 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
         return Take::TransferEncoding;
     }
     let header_end = offset;
+    let available = (payload.len() - header_end) as u64;
+    // tshark 4.6.9 `dissect_http_message`: `have_content_length &&
+    // transfer_encoding == HTTP_TE_NONE` sets datalen to
+    // min(remaining, content_length) before the RFC no-body arm.
     let body_need = match kind {
         LineKind::Request { .. } => content_length.unwrap_or(0),
-        LineKind::Response { status }
-            if (100..200).contains(&status) || status == 204 || status == 304 =>
-        {
-            0
+        LineKind::Response { status } if rfc_no_body(status) => {
+            content_length.map(|n| n.min(available)).unwrap_or(0)
         }
         LineKind::Response { .. } => match content_length {
             Some(n) => n,
-            None if end_of_stream => (payload.len() - header_end) as u64,
+            None if end_of_stream => available,
             None => return Take::Incomplete,
         },
     };
-    let available = (payload.len() - header_end) as u64;
     if available < body_need {
         return Take::Incomplete;
     }
@@ -323,6 +324,12 @@ fn is_request_method(method: &[u8]) -> bool {
             | b"BASELINE-CONTROL"
             | b"SSTP_DUPLEX_POST"
     )
+}
+
+/// RFC 7230 §3.3 / tshark 4.6.9: 1xx, 204, and 304 have no body unless
+/// a Content-Length is present.
+fn rfc_no_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
 }
 
 /// tshark 4.6.9 `parse_http_status_code`: the status token length must
@@ -863,5 +870,88 @@ mod tests {
             ),
             resp(&["sw.example"], false, false)
         );
+    }
+
+    fn cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {
+        let mut payload = status.to_vec();
+        payload.extend_from_slice(b"\r\nHost: st.example\r\nContent-Length: 4\r\n\r\n");
+        payload.extend_from_slice(pad);
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after.example\r\n\r\n");
+        payload
+    }
+
+    fn message(payload: &[u8]) -> HttpProved {
+        match parse_http(payload, false) {
+            HttpParse::Message(proved) => proved,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rfc_no_body_content_length_skips_those_bytes() {
+        let statuses = [
+            b"HTTP/1.1 100 Continue".as_slice(),
+            b"HTTP/1.1 101 Switching Protocols",
+            b"HTTP/1.1 102 Processing",
+            b"HTTP/1.1 204 No Content",
+            b"HTTP/1.1 304 Not Modified",
+            b"ICY 204 No Content",
+        ];
+        for status in statuses {
+            let extra = message(&cl_then(status, b""));
+            assert_eq!(extra.hosts, ["st.example"], "{status:?}");
+            assert!(extra.has_response, "{status:?}");
+            assert!(!extra.switching_upgrade, "{status:?}");
+            assert_eq!(extra.hosts_after_response, [] as [&str; 0], "{status:?}");
+            let drop = message(&cl_then(status, b"xxxx"));
+            assert_eq!(drop.hosts, ["st.example", "after.example"], "{status:?}");
+            assert_eq!(drop.hosts_after_response, ["after.example"], "{status:?}");
+            assert!(!drop.switching_upgrade, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn rfc_no_body_short_content_length_still_prints() {
+        let proved = message(
+            b"HTTP/1.1 204 No Content\r\nHost: st.example\r\nContent-Length: 100\r\n\r\nGET ",
+        );
+        assert_eq!(proved.hosts, ["st.example"]);
+        assert!(!proved.leftover_after_response);
+    }
+
+    #[test]
+    fn upgrade_101_content_length_still_stops_before_leftover() {
+        for pad in [b"".as_slice(), b"xxxx"] {
+            let mut payload =
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\nContent-Length: 4\r\n\r\n"
+                    .to_vec();
+            payload.extend_from_slice(pad);
+            payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after.example\r\n\r\n");
+            let proved = message(&payload);
+            assert_eq!(proved.hosts, ["sw.example"], "{pad:?}");
+            assert!(proved.switching_upgrade, "{pad:?}");
+            assert!(proved.leftover_after_upgrade, "{pad:?}");
+            assert_eq!(proved.hosts_after_response, [] as [&str; 0], "{pad:?}");
+        }
+    }
+
+    #[test]
+    fn status_200_and_203_content_length_still_skip_those_bytes() {
+        for status in [
+            b"HTTP/1.1 200 OK".as_slice(),
+            b"HTTP/1.1 203 Non-Authoritative Information",
+        ] {
+            let extra = message(&cl_then(status, b""));
+            assert_eq!(extra.hosts, ["st.example"], "{status:?}");
+            assert_eq!(extra.hosts_after_response, [] as [&str; 0], "{status:?}");
+            assert_eq!(
+                extra.status_200,
+                status.starts_with(b"HTTP/1.1 200"),
+                "{status:?}"
+            );
+            let drop = message(&cl_then(status, b"xxxx"));
+            assert_eq!(drop.hosts, ["st.example", "after.example"], "{status:?}");
+            assert_eq!(drop.hosts_after_response, ["after.example"], "{status:?}");
+        }
     }
 }

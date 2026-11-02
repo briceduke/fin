@@ -788,14 +788,14 @@ impl Walk<'_> {
         if proved.switching_upgrade {
             self.http_tunnel.insert(conv);
         }
+        if proved.sstp_duplex_post {
+            self.http_sstp.insert(conv);
+        }
         if proved.status_200 && self.http_sstp.contains(&conv) {
             self.http_tunnel.insert(conv);
         }
         if proved.has_response {
             self.http_sstp.remove(&conv);
-        }
-        if proved.sstp_duplex_post {
-            self.http_sstp.insert(conv);
         }
     }
 
@@ -2515,6 +2515,111 @@ mod tests {
         assert_eq!(cells[0].counted, None);
         assert_eq!(cells[1].http_host, ["after-connect.example"]);
         assert_eq!(cells[1].counted, None);
+    }
+
+    fn http_cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {
+        let mut payload = status.to_vec();
+        payload.extend_from_slice(b"\r\nHost: st.example\r\nContent-Length: 4\r\n\r\n");
+        payload.extend_from_slice(pad);
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after.example\r\n\r\n");
+        payload
+    }
+
+    #[test]
+    fn http_rfc_no_body_content_length_leftover_matches_tshark() {
+        let statuses = [
+            b"HTTP/1.1 100 Continue".as_slice(),
+            b"HTTP/1.1 101 Switching Protocols",
+            b"HTTP/1.1 102 Processing",
+            b"HTTP/1.1 204 No Content",
+            b"HTTP/1.1 304 Not Modified",
+            b"ICY 204 No Content",
+        ];
+        const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for status in statuses {
+            let extra = http_cl_then(status, b"");
+            let drop = http_cl_then(status, b"xxxx");
+            let frames = [
+                eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, &extra),
+                eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, &drop),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &extra),
+                eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, &extra),
+                eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, &drop),
+            ];
+            let expected = [
+                &["st.example"][..],
+                &["st.example", "after.example"],
+                &["st.example"],
+                &["st.example"],
+                &["st.example", "after.example"],
+            ];
+            for (frame, hosts) in frames.iter().zip(expected) {
+                let cell = walk_http(frame);
+                assert_eq!(cell.http_host, hosts, "{status:?}");
+                assert_eq!(cell.counted, None, "{status:?}");
+            }
+        }
+        for status in [
+            b"HTTP/1.1 200 OK".as_slice(),
+            b"HTTP/1.1 203 Non-Authoritative Information",
+        ] {
+            let extra = walk_http(&eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1,
+                &http_cl_then(status, b""),
+            ));
+            assert_eq!(extra.http_host, ["st.example"], "{status:?}");
+            assert_eq!(extra.counted, None, "{status:?}");
+            let drop = walk_http(&eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1,
+                &http_cl_then(status, b"xxxx"),
+            ));
+            assert_eq!(
+                drop.http_host,
+                ["st.example", "after.example"],
+                "{status:?}"
+            );
+            assert_eq!(drop.counted, None, "{status:?}");
+        }
+        let upgrade = walk_http(&eth_ipv4_tcp_flow(
+            SERVER,
+            CLIENT,
+            80,
+            50000,
+            1,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        ));
+        assert_eq!(upgrade.http_host, ["sw.example"]);
+        assert_eq!(upgrade.counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_request_and_200_same_segment_leftover_is_tunnel() {
+        let payload = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n";
+        let with_resp = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\nHost: resp.example\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n";
+        for (src, dst, sport, dport) in [
+            (CLIENT, SERVER, 50000u16, 80u16),
+            (SERVER, CLIENT, 80, 50000),
+        ] {
+            let cell = walk_http(&eth_ipv4_tcp_flow(src, dst, sport, dport, 1, payload));
+            assert_eq!(cell.http_host, ["sstp.example"], "{sport}->{dport}");
+            assert_eq!(cell.counted, Some("http-tunnel"), "{sport}->{dport}");
+            let cell = walk_http(&eth_ipv4_tcp_flow(src, dst, sport, dport, 1, with_resp));
+            assert_eq!(
+                cell.http_host,
+                ["sstp.example", "resp.example"],
+                "{sport}->{dport} resp"
+            );
+            assert_eq!(cell.counted, Some("http-tunnel"), "{sport}->{dport} resp");
+        }
     }
 
     #[test]
