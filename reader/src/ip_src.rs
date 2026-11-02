@@ -749,6 +749,9 @@ impl Walk<'_> {
                 HttpParse::Message(proved) => {
                     self.note_http_seen(key, len);
                     if let Some(flow) = flow {
+                        if proved.http2 {
+                            self.http_claimed.insert(flow.conversation());
+                        }
                         if proved.desegment {
                             self.http_desegment.insert(flow);
                         }
@@ -2876,13 +2879,27 @@ mod tests {
 
     const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
+    const HTTP2_FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
+    const HTTP2_V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const HTTP2_V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
     fn http2_then_get(preface: &[u8], opposite: bool) -> Vec<Cell> {
+        http2_then_get_ipv4(CLIENT, SERVER, 50000, 80, preface, opposite)
+    }
+
+    fn http2_then_get_ipv4(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        preface: &[u8],
+        opposite: bool,
+    ) -> Vec<Cell> {
         let later = eth_ipv4_tcp_flow(
-            if opposite { SERVER } else { CLIENT },
-            if opposite { CLIENT } else { SERVER },
-            if opposite { 80 } else { 50000 },
-            if opposite { 50000 } else { 80 },
+            if opposite { dst } else { src },
+            if opposite { src } else { dst },
+            if opposite { dport } else { sport },
+            if opposite { sport } else { dport },
             if opposite {
                 1
             } else {
@@ -2890,10 +2907,7 @@ mod tests {
             },
             INNER_GET,
         );
-        walk_http_frames(&[
-            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, preface),
-            later,
-        ])
+        walk_http_frames(&[eth_ipv4_tcp_flow(src, dst, sport, dport, 1, preface), later])
     }
 
     fn assert_http2_then_get_is_counted(cells: &[Cell]) {
@@ -2903,17 +2917,184 @@ mod tests {
         assert_eq!(cells[1].counted, Some("http"));
     }
 
+    fn eth_vlan_ipv4_tcp_flow(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let frame = eth_ipv4_tcp_flow(src, dst, sport, dport, seq, payload);
+        let mut tagged = Vec::with_capacity(frame.len() + 4);
+        tagged.extend_from_slice(&frame[..12]);
+        tagged.extend_from_slice(&[0x81, 0x00, 0x00, 0x01]);
+        tagged.extend_from_slice(&frame[12..]);
+        tagged
+    }
+
+    fn leading_crlf_magic() -> Vec<u8> {
+        let mut preface = b"\r\n".to_vec();
+        preface.extend_from_slice(HTTP2_MAGIC);
+        preface
+    }
+
     #[test]
     fn http2_preface_on_named_http_counts_later_segments() {
-        for preface in [HTTP2_MAGIC, HTTP2_PREFIX] {
+        let crlf_magic = leading_crlf_magic();
+        for preface in [
+            HTTP2_MAGIC,
+            HTTP2_PREFIX,
+            HTTP2_FIRST_LINE,
+            crlf_magic.as_slice(),
+        ] {
             assert_http2_then_get_is_counted(&http2_then_get(preface, false));
             assert_http2_then_get_is_counted(&http2_then_get(preface, true));
         }
+        for (src, dst, sport, dport) in [
+            (CLIENT, SERVER, 50000u16, 80u16),
+            (SERVER, CLIENT, 80, 50000),
+            (CLIENT, SERVER, 50000, 8080),
+        ] {
+            for preface in [HTTP2_FIRST_LINE, HTTP2_MAGIC] {
+                assert_http2_then_get_is_counted(&http2_then_get_ipv4(
+                    src, dst, sport, dport, preface, false,
+                ));
+                assert_http2_then_get_is_counted(&http2_then_get_ipv4(
+                    src, dst, sport, dport, preface, true,
+                ));
+            }
+        }
+        let v6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(
+                HTTP2_V6_CLIENT,
+                HTTP2_V6_SERVER,
+                50000,
+                80,
+                1,
+                HTTP2_FIRST_LINE,
+            ),
+            eth_ipv6_tcp_flow(
+                HTTP2_V6_CLIENT,
+                HTTP2_V6_SERVER,
+                50000,
+                80,
+                1 + HTTP2_FIRST_LINE.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http2_then_get_is_counted(&v6);
+        let vlan = walk_http_frames(&[
+            eth_vlan_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, HTTP2_FIRST_LINE),
+            eth_vlan_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + HTTP2_FIRST_LINE.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http2_then_get_is_counted(&vlan);
+        let crlf = walk_http_frames(&[
+            eth_vlan_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &crlf_magic),
+            eth_vlan_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + crlf_magic.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http2_then_get_is_counted(&crlf);
         let mut leftover = HTTP2_MAGIC.to_vec();
         leftover.extend_from_slice(INNER_GET);
         let cell = walk_http(&eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &leftover));
         assert_eq!(cell.http_host, [] as [&str; 0]);
         assert_eq!(cell.counted, Some("http"));
+    }
+
+    fn http1_then_http2_then_get(first: &[u8], leftover: &[u8]) -> Vec<Cell> {
+        http1_then_http2_then_get_ipv4(CLIENT, SERVER, 50000, 80, first, leftover)
+    }
+
+    fn http1_then_http2_then_get_ipv4(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        first: &[u8],
+        leftover: &[u8],
+    ) -> Vec<Cell> {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(leftover);
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(src, dst, sport, dport, 1, &payload),
+            eth_ipv4_tcp_flow(src, dst, sport, dport, 1 + payload.len() as u32, INNER_GET),
+        ])
+    }
+
+    fn assert_http1_http2_then_blank(cells: &[Cell], host: &str) {
+        assert_eq!(cells[0].http_host, [host]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    #[test]
+    fn http2_leftover_after_http1_counts_later_segments() {
+        let firsts = [
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n",
+            b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+        ];
+        for first in firsts {
+            for leftover in [HTTP2_MAGIC, HTTP2_FIRST_LINE] {
+                assert_http1_http2_then_blank(
+                    &http1_then_http2_then_get(first, leftover),
+                    "a.example",
+                );
+            }
+        }
+        let get = firsts[0];
+        for (src, dst, sport, dport) in [
+            (CLIENT, SERVER, 50000u16, 80u16),
+            (SERVER, CLIENT, 80, 50000),
+            (CLIENT, SERVER, 50000, 8080),
+        ] {
+            assert_http1_http2_then_blank(
+                &http1_then_http2_then_get_ipv4(src, dst, sport, dport, get, HTTP2_MAGIC),
+                "a.example",
+            );
+        }
+        let mut payload = get.to_vec();
+        payload.extend_from_slice(HTTP2_MAGIC);
+        let v6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(HTTP2_V6_CLIENT, HTTP2_V6_SERVER, 50000, 80, 1, &payload),
+            eth_ipv6_tcp_flow(
+                HTTP2_V6_CLIENT,
+                HTTP2_V6_SERVER,
+                50000,
+                80,
+                1 + payload.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http1_http2_then_blank(&v6, "a.example");
+        let vlan = walk_http_frames(&[
+            eth_vlan_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &payload),
+            eth_vlan_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + payload.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_http1_http2_then_blank(&vlan, "a.example");
     }
 
     #[test]

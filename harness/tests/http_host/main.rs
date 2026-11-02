@@ -274,6 +274,11 @@ const INNER_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
 const CONTINUE_100: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
+const HTTP2_FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
+const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+const POST_CL0_A: &[u8] = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+const RESP_204_A: &[u8] = b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n";
+const NOTIFY_A: &[u8] = b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n";
 
 fn sstp_interim_leftover_get(interim: &[u8]) -> [Vec<u8>; 3] {
     let mut leftover = SSTP_200.to_vec();
@@ -313,6 +318,26 @@ fn req_resp_get_ports(
 
 fn sstp_then(resp: &[u8]) -> [Vec<u8>; 3] {
     req_resp_get(SSTP_REQ, resp, INNER_GET)
+}
+
+fn concat_bytes(first: &[u8], leftover: &[u8]) -> Vec<u8> {
+    let mut payload = first.to_vec();
+    payload.extend_from_slice(leftover);
+    payload
+}
+
+fn leading_crlf_magic() -> Vec<u8> {
+    concat_bytes(b"\r\n", HTTP2_MAGIC)
+}
+
+fn http2_then_inner(first: &[u8]) -> Vec<u8> {
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, first),
+            eth_ipv4_tcp_seq(OUTER, 50000, 80, 1 + first.len() as u32, INNER_GET),
+        ],
+    )
 }
 
 fn req_resp_same_dir(req: &[u8], resp: &[u8], later: &[u8]) -> [Vec<u8>; 3] {
@@ -2334,6 +2359,271 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                         payload
                     },
                 )],
+            ),
+        ),
+        (
+            "http2-first-line-then-get",
+            http2_then_inner(HTTP2_FIRST_LINE),
+        ),
+        (
+            "http2-first-line-then-opposite-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, HTTP2_FIRST_LINE),
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "http2-leading-crlf-magic-then-get",
+            http2_then_inner(&leading_crlf_magic()),
+        ),
+        (
+            "http2-leading-crlf-magic-then-opposite-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, &leading_crlf_magic()),
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "http2-get-leftover-magic-then-get",
+            http2_then_inner(&concat_bytes(GET_A, HTTP2_MAGIC)),
+        ),
+        (
+            "http2-get-leftover-first-line-then-get",
+            http2_then_inner(&concat_bytes(GET_A, HTTP2_FIRST_LINE)),
+        ),
+        (
+            "http2-post-cl0-leftover-magic-then-get",
+            http2_then_inner(&concat_bytes(POST_CL0_A, HTTP2_MAGIC)),
+        ),
+        (
+            "http2-204-leftover-magic-then-get",
+            http2_then_inner(&concat_bytes(RESP_204_A, HTTP2_MAGIC)),
+        ),
+        (
+            "http2-notify-leftover-magic-then-get",
+            http2_then_inner(&concat_bytes(NOTIFY_A, HTTP2_MAGIC)),
+        ),
+        (
+            "http2-get-leftover-magic-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 1, &concat_bytes(GET_A, HTTP2_MAGIC)),
+                    eth_ipv6_tcp_to(
+                        OUTER_V6,
+                        PEER_V6,
+                        50000,
+                        80,
+                        1 + GET_A.len() as u32 + HTTP2_MAGIC.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-get-leftover-magic-vlan",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    vlan(
+                        0x0800,
+                        &ipv4(OUTER, 6, &tcp_seq(50000, 80, 1, &concat_bytes(GET_A, HTTP2_MAGIC))),
+                    ),
+                    vlan(
+                        0x0800,
+                        &ipv4(
+                            OUTER,
+                            6,
+                            &tcp_seq(
+                                50000,
+                                80,
+                                1 + GET_A.len() as u32 + HTTP2_MAGIC.len() as u32,
+                                INNER_GET,
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-get-leftover-magic-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, &concat_bytes(GET_A, HTTP2_MAGIC)),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1 + GET_A.len() as u32 + HTTP2_MAGIC.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-get-leftover-magic-8080",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 8080, 1, &concat_bytes(GET_A, HTTP2_MAGIC)),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        8080,
+                        1 + GET_A.len() as u32 + HTTP2_MAGIC.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-first-line-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 1, HTTP2_FIRST_LINE),
+                    eth_ipv6_tcp_to(
+                        OUTER_V6,
+                        PEER_V6,
+                        50000,
+                        80,
+                        1 + HTTP2_FIRST_LINE.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-first-line-vlan",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    vlan(0x0800, &ipv4(OUTER, 6, &tcp_seq(50000, 80, 1, HTTP2_FIRST_LINE))),
+                    vlan(
+                        0x0800,
+                        &ipv4(
+                            OUTER,
+                            6,
+                            &tcp_seq(50000, 80, 1 + HTTP2_FIRST_LINE.len() as u32, INNER_GET),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-first-line-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, HTTP2_FIRST_LINE),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1 + HTTP2_FIRST_LINE.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-first-line-8080",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 8080, 1, HTTP2_FIRST_LINE),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        8080,
+                        1 + HTTP2_FIRST_LINE.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-leading-crlf-magic-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 1, &leading_crlf_magic()),
+                    eth_ipv6_tcp_to(
+                        OUTER_V6,
+                        PEER_V6,
+                        50000,
+                        80,
+                        1 + leading_crlf_magic().len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-leading-crlf-magic-vlan",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    vlan(
+                        0x0800,
+                        &ipv4(OUTER, 6, &tcp_seq(50000, 80, 1, &leading_crlf_magic())),
+                    ),
+                    vlan(
+                        0x0800,
+                        &ipv4(
+                            OUTER,
+                            6,
+                            &tcp_seq(
+                                50000,
+                                80,
+                                1 + leading_crlf_magic().len() as u32,
+                                INNER_GET,
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-leading-crlf-magic-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, &leading_crlf_magic()),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1 + leading_crlf_magic().len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-leading-crlf-magic-8080",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 8080, 1, &leading_crlf_magic()),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        8080,
+                        1 + leading_crlf_magic().len() as u32,
+                        INNER_GET,
+                    ),
+                ],
             ),
         ),
     ]

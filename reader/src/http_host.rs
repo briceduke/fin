@@ -40,6 +40,9 @@ pub struct HttpProved {
     /// `http.desegment_body` keeps the next in-order payload on this
     /// TCP direction as continuation, not a new HTTP message.
     pub desegment: bool,
+    /// Leftover after this payload, or leftover treated as body, is an
+    /// HTTP/2 preface. Named `http` later Hosts are counted, not printed.
+    pub http2: bool,
 }
 
 const TOKEN: &[u8] = b"!#$%&\\:*+-.^_`|~";
@@ -82,6 +85,7 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
                 sstp_duplex_post,
                 status,
                 upgrade,
+                http2,
             } => {
                 if proved.has_response {
                     proved.hosts_after_response.extend(found.iter().cloned());
@@ -89,6 +93,9 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
                 proved.hosts.extend(found);
                 if sstp_duplex_post {
                     proved.sstp_duplex_post = true;
+                }
+                if http2 {
+                    proved.http2 = true;
                 }
                 if let Some(status) = status {
                     proved.has_response = true;
@@ -109,6 +116,9 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
                 if proved.has_response && offset < payload.len() {
                     proved.leftover_after_response = true;
                 }
+                if proved.http2 {
+                    break;
+                }
             }
             Take::Incomplete if proved.hosts.is_empty() => return HttpParse::Unproved,
             Take::Incomplete => {
@@ -123,11 +133,13 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
     HttpParse::Message(proved)
 }
 
-/// tshark 4.6.9 HTTP/2 client magic prefix (`PRI * HTTP/2.0` and two CRLFs).
-/// The 24-byte magic adds `SM` and two more CRLFs; either claims the conversation.
+/// tshark 4.6.9 `dissect_http2_heur_http` `kMagicHello` first line:
+/// 16 bytes `PRI * HTTP/2.0\r\n`. One leading CRLF is skipped when
+/// remaining > 3, matching `dissect_http_message`.
 pub fn looks_like_http2_preface(payload: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
-    payload.len() >= PREFIX.len() && payload.starts_with(PREFIX)
+    const FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
+    let rest = &payload[skip_leading_crlf(payload)..];
+    rest.len() >= FIRST_LINE.len() && rest.starts_with(FIRST_LINE)
 }
 
 /// tshark 4.6.9 `dissect_http_heur_tcp`: a CRLF line that starts or ends
@@ -151,6 +163,7 @@ enum Take {
         sstp_duplex_post: bool,
         status: Option<u16>,
         upgrade: bool,
+        http2: bool,
     },
     Incomplete,
     TransferEncoding,
@@ -271,9 +284,11 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
     if available < body_need {
         return Take::Incomplete;
     }
+    let after_headers = &payload[header_end..];
+    let body_end = header_end + body_need as usize;
     Take::Complete {
         hosts,
-        next: skip + header_end + body_need as usize,
+        next: skip + body_end,
         sstp_duplex_post: matches!(
             kind,
             LineKind::Request {
@@ -285,6 +300,8 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
             LineKind::Request { .. } | LineKind::Notification => None,
         },
         upgrade,
+        http2: looks_like_http2_preface(after_headers)
+            || looks_like_http2_preface(&payload[body_end..]),
     }
 }
 
@@ -915,7 +932,37 @@ mod tests {
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
         ));
         assert!(looks_like_http2_preface(b"PRI * HTTP/2.0\r\n\r\n"));
-        assert!(!looks_like_http2_preface(b"PRI * HTTP/2.0\r\n"));
+        assert!(looks_like_http2_preface(b"PRI * HTTP/2.0\r\n"));
+        assert!(looks_like_http2_preface(
+            b"\r\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        ));
+        assert!(!looks_like_http2_preface(b"PRI * HTTP/2.0"));
+        assert!(!looks_like_http2_preface(b"GET / HTTP/1.1\r\n"));
+    }
+
+    fn http2_leftover(first: &[u8], leftover: &[u8]) -> HttpProved {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(leftover);
+        message(&payload)
+    }
+
+    #[test]
+    fn leftover_http2_preface_after_a_complete_message() {
+        const MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
+        let firsts = [
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n",
+            b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+        ];
+        for first in firsts {
+            for leftover in [MAGIC, FIRST_LINE] {
+                let proved = http2_leftover(first, leftover);
+                assert_eq!(proved.hosts, ["a.example"], "{}", first.escape_ascii());
+                assert!(proved.http2, "{}", first.escape_ascii());
+            }
+        }
     }
 
     #[test]
