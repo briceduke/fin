@@ -421,20 +421,28 @@ impl Walk<'_> {
                     next = nxt;
                     rest = body;
                 }
-                IPV6_HOP | IPV6_DEST => {
-                    let Some((nxt, body)) = take_opts(rest) else {
+                IPV6_HOP | IPV6_DEST => match hop_dest(rest) {
+                    HopDest::Next(nxt, body) => {
+                        next = nxt;
+                        rest = body;
+                    }
+                    HopDest::Truncated => return,
+                    HopDest::Count => {
+                        self.count("ipv6");
                         return;
-                    };
-                    next = nxt;
-                    rest = body;
-                }
-                IPV6_ROUTE => {
-                    let Some((nxt, body)) = take_routing(rest) else {
+                    }
+                },
+                IPV6_ROUTE => match take_routing(rest) {
+                    HopDest::Next(nxt, body) => {
+                        next = nxt;
+                        rest = body;
+                    }
+                    HopDest::Truncated => return,
+                    HopDest::Count => {
+                        self.count("ipv6");
                         return;
-                    };
-                    next = nxt;
-                    rest = body;
-                }
+                    }
+                },
                 IPV6_FRAG => {
                     if rest.len() < 8 {
                         return;
@@ -1194,233 +1202,61 @@ fn take_ext8(bytes: &[u8]) -> Option<(u8, &[u8])> {
     Some((bytes[0], &bytes[len..]))
 }
 
-/// tshark 4.6.9 `dissect_opts` reads option type at `offset` and length at
-/// `offset + 1` from the remaining IPv6 payload tvbuff, then
-/// `proto_tree_add_item` of `opt_len` bytes. Pad1 still reads the length byte
-/// but only consumes 1. A claimed non-Pad1 option longer than the remaining
-/// captured payload throws BoundsError, so `ipv6_dissect_next` is not called.
-/// Type dissectors that ignore `opt_len` leave `offset` where they stopped;
-/// leftover header bytes are not a new TLV. CALIPSO / SMF_DPD / APN6 reads
-/// that overrun the captured payload still throw.
-fn take_opts(bytes: &[u8]) -> Option<(u8, &[u8])> {
-    let (next, rest) = take_ext8(bytes)?;
-    if opts_bounds_error(bytes) {
-        return None;
-    }
-    Some((next, rest))
+enum HopDest<'a> {
+    Next(u8, &'a [u8]),
+    Truncated,
+    Count,
 }
 
-fn opts_bounds_error(payload: &[u8]) -> bool {
-    if payload.len() < 2 {
-        return false;
-    }
-    let end = (payload[1] as usize + 1) * 8;
+/// Pad1/PadN that fit in the capture walk next. Jumbo skips leftover TLVs
+/// in this header. Any other option is counted so a type-specific throw
+/// cannot print an inner `ip.src` tshark omitted.
+fn hop_dest(bytes: &[u8]) -> HopDest<'_> {
+    let Some((next, rest)) = take_ext8(bytes) else {
+        return HopDest::Truncated;
+    };
+    let end = (bytes[1] as usize + 1) * 8;
     let mut offset = 2;
     while offset < end {
-        if offset + 1 >= payload.len() {
-            return true;
+        if offset >= bytes.len() {
+            return HopDest::Truncated;
         }
-        let typ = payload[offset];
-        let opt_len = payload[offset + 1] as usize;
+        let typ = bytes[offset];
         if typ == 0 {
             offset += 1;
             continue;
         }
-        if offset + 2 + opt_len > payload.len() {
-            return true;
+        if offset + 1 >= bytes.len() {
+            return HopDest::Truncated;
         }
-        let Some(read) = opt_data_read(typ, &payload[offset + 2..], opt_len) else {
-            return true;
-        };
-        offset = (offset + 2 + read).max(offset + 2 + opt_len);
+        let opt_len = bytes[offset + 1] as usize;
+        if typ == 0xc2 {
+            return HopDest::Next(next, rest);
+        }
+        if typ != 1 {
+            return HopDest::Count;
+        }
+        if offset + 2 + opt_len > bytes.len() {
+            return HopDest::Truncated;
+        }
+        offset += 2 + opt_len;
     }
-    false
+    HopDest::Next(next, rest)
 }
 
-/// Bytes of option data tshark 4.6.9 actually advances, or None on BoundsError.
-fn opt_data_read(typ: u8, data: &[u8], opt_len: usize) -> Option<usize> {
-    match typ {
-        0x04 => need(data, 1),
-        0x05 => need(data, 2),
-        0x07 => calipso_read(data),
-        0x08 => smf_dpd_read(data, opt_len),
-        0x0f => need(data, 10),
-        0x13 => apn6_read(data),
-        0x23 | 0x63 => need(data, 4),
-        0x26 => quickstart_read(data),
-        0x30 | 0x41 | 0xc2 => need(data, 4),
-        0x31 => ioam_read(data),
-        0x6d => mpl_read(data),
-        0xc9 => need(data, 16),
-        0xee => need(data, 3),
-        _ => Some(opt_len),
-    }
-}
-
-fn need(data: &[u8], n: usize) -> Option<usize> {
-    (data.len() >= n).then_some(n)
-}
-
-/// tshark 4.6.9 `dissect_opt_calipso` always reads DOI (4), cmpt_length (1),
-/// sens (1), checksum (2), then `cmpt_length * 4` bitmap bytes.
-fn calipso_read(data: &[u8]) -> Option<usize> {
-    if data.len() < 8 {
-        return None;
-    }
-    need(data, 8 + data[4] as usize * 4)
-}
-
-/// tshark 4.6.9 `dissect_opt_smf_dpd` I-DPD with tid bits reads `hash_tid`
-/// then `(hash_tid & 0x0f) + 1` tagger-id bytes from the parent payload.
-fn smf_dpd_read(data: &[u8], opt_len: usize) -> Option<usize> {
-    let hash_tid = *data.first()?;
-    if hash_tid & 0x80 != 0 {
-        return need(data, opt_len);
-    }
-    let mut n = 1;
-    if hash_tid & 0x70 != 0 {
-        n += (hash_tid & 0x0f) as usize + 1;
-    }
-    need(data, n)
-}
-
-/// tshark 4.6.9 `dissect_opt_apn6` always reads id-type (1) + flags (1) +
-/// param (2), then 4/8/16 more when `apn_id_type` is 1/2/≥3.
-fn apn6_read(data: &[u8]) -> Option<usize> {
-    let id_type = *data.first()?;
-    let n = match id_type {
-        0 => 4,
-        1 => 8,
-        2 => 12,
-        _ => 20,
+/// Type 0 and unknown routing walk next. Types 2–6 have throw paths
+/// tshark 4.6.9 uses to skip `ipv6_dissect_next`; count instead of matching.
+fn take_routing(bytes: &[u8]) -> HopDest<'_> {
+    let Some((next, rest)) = take_ext8(bytes) else {
+        return HopDest::Truncated;
     };
-    need(data, n)
-}
-
-/// tshark 4.6.9 `dissect_opt_quickstart`: Rate Request/Report consume 6.
-fn quickstart_read(data: &[u8]) -> Option<usize> {
-    let cmd = *data.first()?;
-    match cmd >> 4 {
-        0 | 8 => need(data, 6),
-        _ => Some(0),
+    if bytes.len() < 3 {
+        return HopDest::Truncated;
     }
-}
-
-/// tshark 4.6.9 `dissect_opt_ioam` reads 2, then trace/DEX type-specific bytes.
-fn ioam_read(data: &[u8]) -> Option<usize> {
-    if data.len() < 2 {
-        return None;
+    if (2..=6).contains(&bytes[2]) {
+        return HopDest::Count;
     }
-    match data[1] {
-        0 | 1 | 4 => need(data, 10),
-        _ => Some(2),
-    }
-}
-
-/// tshark 4.6.9 `dissect_opt_mpl` reads flags+sequence, then `seed_id_len`
-/// from `flags >> 6` (0 / 2 / 8 / 16).
-fn mpl_read(data: &[u8]) -> Option<usize> {
-    let flags = *data.first()?;
-    let seed = [0u8, 2, 8, 16][(flags >> 6) as usize] as usize;
-    need(data, 2 + seed)
-}
-
-/// tshark 4.6.9 `dissect_routing6` still calls `ipv6_dissect_next`, but type
-/// dissectors read past the type-specific tvbuff (`total_len - 4`) and throw
-/// BoundsError, so the next header is not dissected.
-fn take_routing(bytes: &[u8]) -> Option<(u8, &[u8])> {
-    let (next, rest) = take_ext8(bytes)?;
-    let total = (bytes[1] as usize + 1) * 8;
-    if routing_bounds_error(bytes[2], bytes[3], bytes[1], &bytes[4..total]) {
-        return None;
-    }
-    Some((next, rest))
-}
-
-fn routing_bounds_error(typ: u8, segs_left: u8, hdrlen: u8, body: &[u8]) -> bool {
-    match typ {
-        2 => body.len() < 20,
-        3 => rpl_bounds_error(hdrlen, body),
-        4 => match body.first() {
-            None => true,
-            Some(&last_entry) => body.len() < 4 + 16 * (last_entry as usize + 1),
-        },
-        5 => crh_bounds_error(2, hdrlen as usize * 4 + 2, segs_left, body),
-        6 => crh_bounds_error(4, hdrlen as usize * 2 + 1, segs_left, body),
-        _ => false,
-    }
-}
-
-/// tshark 4.6.9 `dissect_routing6_rpl`: 4-byte Cmpr/Pad, then `hdrlen > 0`
-/// addresses of size `16 - CmprI` (last uses `CmprE`).
-fn rpl_bounds_error(hdrlen: u8, body: &[u8]) -> bool {
-    if body.len() < 4 {
-        return true;
-    }
-    if hdrlen == 0 {
-        return false;
-    }
-    let cmpr_i = body[0] >> 4;
-    let cmpr_e = body[0] & 0x0f;
-    let pad = body[1] >> 4;
-    let numer = i32::from(hdrlen) * 8 - i32::from(pad) - (16 - i32::from(cmpr_e));
-    let denom = 16 - i32::from(cmpr_i);
-    let addr_count = numer / denom + 1;
-    if addr_count <= 0 {
-        return false;
-    }
-    let mut offset = 4;
-    for idx in 1..=addr_count {
-        let size = if idx == addr_count {
-            16 - cmpr_e as usize
-        } else {
-            16 - cmpr_i as usize
-        };
-        if offset + size > body.len() {
-            return true;
-        }
-        offset += size;
-    }
-    false
-}
-
-/// tshark 4.6.9 `dissect_routing6_crh`: `current_sid` at
-/// `octets_per_sid * segments_left`, then SID words until a zero SID, always
-/// reading one word past the last nonzero SID.
-fn crh_bounds_error(octets_per_sid: usize, sid_count: usize, segs_left: u8, body: &[u8]) -> bool {
-    let current = octets_per_sid * segs_left as usize;
-    if current + octets_per_sid > body.len() {
-        return true;
-    }
-    if body.len() < octets_per_sid {
-        return true;
-    }
-    let mut offset = 0;
-    let mut sid = crh_sid(body, offset, octets_per_sid);
-    for _ in 0..sid_count {
-        if sid == 0 {
-            break;
-        }
-        offset += octets_per_sid;
-        if offset + octets_per_sid > body.len() {
-            return true;
-        }
-        sid = crh_sid(body, offset, octets_per_sid);
-    }
-    false
-}
-
-fn crh_sid(body: &[u8], offset: usize, octets: usize) -> u32 {
-    if octets == 2 {
-        u16::from_be_bytes([body[offset], body[offset + 1]]).into()
-    } else {
-        u32::from_be_bytes([
-            body[offset],
-            body[offset + 1],
-            body[offset + 2],
-            body[offset + 3],
-        ])
-    }
+    HopDest::Next(next, rest)
 }
 
 fn take_ah(bytes: &[u8]) -> Option<(u8, &[u8])> {
@@ -1567,6 +1403,15 @@ mod tests {
             tls_sni: Vec::new(),
             http_host: Vec::new(),
             counted: None,
+        }
+    }
+
+    fn counted(reason: &'static str) -> Cell {
+        Cell {
+            values: Vec::new(),
+            tls_sni: Vec::new(),
+            http_host: Vec::new(),
+            counted: Some(reason),
         }
     }
 
@@ -1774,7 +1619,7 @@ mod tests {
         ] {
             assert_eq!(
                 walk(&route_frame(hdrlen, typ, specific)),
-                blank(),
+                counted("ipv6"),
                 "type {typ} hdrlen {hdrlen}"
             );
         }
@@ -1782,28 +1627,19 @@ mod tests {
 
     #[test]
     fn routing_hdrlen0_types_that_walk() {
-        for typ in [0, 3, 99] {
+        for typ in [0, 99] {
             assert_eq!(
                 walk(&route_frame(0, typ, &[])),
                 proved(&["10.9.9.9"]),
                 "type {typ}"
             );
         }
-    }
-
-    #[test]
-    fn routing_type2_hdrlen2_walks_ipip() {
-        assert_eq!(walk(&route_frame(2, 2, &[])), proved(&["10.9.9.9"]));
-    }
-
-    #[test]
-    fn routing_type4_hdrlen2_last_entry0_walks_ipip() {
-        assert_eq!(walk(&route_frame(2, 4, &[0])), proved(&["10.9.9.9"]));
+        assert_eq!(walk(&route_frame(0, 3, &[])), counted("ipv6"));
     }
 
     #[test]
     fn routing_type4_hdrlen2_last_entry1_stays_blank() {
-        assert_eq!(walk(&route_frame(2, 4, &[1])), blank());
+        assert_eq!(walk(&route_frame(2, 4, &[1])), counted("ipv6"));
     }
 
     #[test]
@@ -1811,45 +1647,16 @@ mod tests {
         for cmpr in [0u8, 0x11] {
             assert_eq!(
                 walk(&route_frame(1, 3, &[cmpr])),
-                blank(),
+                counted("ipv6"),
                 "cmpr {cmpr:#04x}"
             );
         }
     }
 
     #[test]
-    fn routing_type3_hdrlen2_walks_ipip() {
-        assert_eq!(walk(&route_frame(2, 3, &[])), proved(&["10.9.9.9"]));
-    }
-
-    #[test]
-    fn routing_type3_hdrlen1_cmpr_ff_walks_ipip() {
-        assert_eq!(walk(&route_frame(1, 3, &[0xff])), proved(&["10.9.9.9"]));
-    }
-
-    #[test]
     fn routing_type5_type6_nonzero_sids_stays_blank() {
-        assert_eq!(walk(&route_frame(0, 5, &[0, 1, 0, 1])), blank());
-        assert_eq!(walk(&route_frame(0, 6, &[0, 1, 0, 1])), blank());
-    }
-
-    #[test]
-    fn routing_type5_type6_zero_sids_walks_ipip() {
-        for typ in [5u8, 6] {
-            assert_eq!(
-                walk(&route_frame(0, typ, &[0, 0, 0, 0])),
-                proved(&["10.9.9.9"]),
-                "type {typ}"
-            );
-        }
-    }
-
-    #[test]
-    fn routing_type5_first_sid_nonzero_second_zero_walks_ipip() {
-        assert_eq!(
-            walk(&route_frame(0, 5, &[0, 1, 0, 0])),
-            proved(&["10.9.9.9"])
-        );
+        assert_eq!(walk(&route_frame(0, 5, &[0, 1, 0, 1])), counted("ipv6"));
+        assert_eq!(walk(&route_frame(0, 6, &[0, 1, 0, 1])), counted("ipv6"));
     }
 
     #[test]
@@ -1857,7 +1664,7 @@ mod tests {
         for typ in [5u8, 6] {
             assert_eq!(
                 walk(&route_frame_segs(1, typ, 255, &[])),
-                blank(),
+                counted("ipv6"),
                 "type {typ}"
             );
         }
@@ -1868,7 +1675,7 @@ mod tests {
         for ext in [0u8, 60] {
             assert_eq!(
                 walk(&opts_frame(ext, &[0x05, 255])),
-                blank(),
+                counted("ipv6"),
                 "ext {ext} rtalert 255"
             );
             assert_eq!(
@@ -1909,22 +1716,16 @@ mod tests {
         for ext in [0u8, 60] {
             assert_eq!(
                 walk(&opts_frame(ext, &[0x07])),
-                blank(),
+                counted("ipv6"),
                 "ext {ext} CALIPSO on 8-byte header"
             );
         }
     }
 
     #[test]
-    fn hopopt_calipso_cmpt0_walks_ipip() {
-        let options = [0x07, 8, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(walk(&opts_frame_hdr(0, 1, &options)), proved(&["10.9.9.9"]));
-    }
-
-    #[test]
     fn hopopt_calipso_cmpt255_stays_blank() {
         let options = [0x07, 8, 0, 0, 0, 0, 255, 0, 0, 0];
-        assert_eq!(walk(&opts_frame_hdr(0, 1, &options)), blank());
+        assert_eq!(walk(&opts_frame_hdr(0, 1, &options)), counted("ipv6"));
     }
 
     #[test]
@@ -1933,7 +1734,7 @@ mod tests {
         for ext in [0u8, 60] {
             assert_eq!(
                 walk(&opts_frame_ip(ext, 0, &last_tlv(0x13), &ip)),
-                blank(),
+                counted("ipv6"),
                 "ext {ext}"
             );
         }
@@ -1944,19 +1745,11 @@ mod tests {
                 &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x13],
                 &ip
             )),
-            blank()
+            counted("ipv6")
         );
         assert_eq!(
             walk(&opts_frame_ip(0, 0, &last_tlv(0x13), &ipv4_tso(0x45, 19))),
-            blank()
-        );
-    }
-
-    #[test]
-    fn hopopt_apn6_last_tlv_20_walks_ipip() {
-        assert_eq!(
-            walk(&opts_frame_ip(0, 0, &last_tlv(0x13), &ipv4_tso(0x45, 20))),
-            proved(&["10.9.9.9"])
+            counted("ipv6")
         );
     }
 
@@ -1966,18 +1759,10 @@ mod tests {
         for ext in [0u8, 60] {
             assert_eq!(
                 walk(&opts_frame_ip(ext, 0, &last_tlv(0x08), &ip)),
-                blank(),
+                counted("ipv6"),
                 "ext {ext}"
             );
         }
-    }
-
-    #[test]
-    fn hopopt_smf_last_tlv_17_walks_ipip() {
-        assert_eq!(
-            walk(&opts_frame_ip(0, 0, &last_tlv(0x08), &ipv4_tso(0x4f, 17))),
-            proved(&["10.9.9.9"])
-        );
     }
 
     #[test]
@@ -1992,37 +1777,15 @@ mod tests {
     }
 
     #[test]
-    fn hopopt_first_tlv_len0_trailing_0x40_walks_ipip() {
-        for typ in [0x0fu8, 0x13, 0x23, 0x26, 0x30, 0x31, 0x41, 0x63, 0xc9] {
-            assert_eq!(
-                walk(&opts_frame(0, &[typ, 0, 0, 0, 0, 0x40])),
-                proved(&["10.9.9.9"]),
-                "typ {typ:#x}"
-            );
-        }
-    }
-
-    #[test]
     fn hopopt_and_dstopts_tel_rtalert_dff_leftover_jumbo_stays_blank() {
         for ext in [0u8, 60] {
             for typ in [0x04u8, 0x05, 0xee] {
                 assert_eq!(
                     walk(&opts_frame(ext, &[typ, 0, 0xc2, 0, 0, 0x40])),
-                    blank(),
+                    counted("ipv6"),
                     "ext {ext} typ {typ:#x}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn hopopt_mpl_len0_seed_walks_ipip() {
-        for flags in [0x40u8, 0x45, 0x4f, 0x80, 0xc0, 0xff] {
-            assert_eq!(
-                walk(&opts_frame(0, &[0x6d, 0, flags, 0, 0, 0x40])),
-                proved(&["10.9.9.9"]),
-                "flags {flags:#x}"
-            );
         }
     }
 
