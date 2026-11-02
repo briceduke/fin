@@ -272,6 +272,8 @@ const SSTP_REQ: &[u8] = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\
 const SSTP_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
 const INNER_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
 const CONTINUE_100: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
 
 fn sstp_interim_leftover_get(interim: &[u8]) -> [Vec<u8>; 3] {
     let mut leftover = SSTP_200.to_vec();
@@ -2167,6 +2169,170 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                     50000,
                     80,
                     b"GET / HTTP/1.1\rHost: cr.example\r\r",
+                )],
+            ),
+        ),
+        (
+            "notify-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "subscribe-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"SUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "unsubscribe-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"UNSUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "m-notify-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"M-NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "notify-leftover-notify",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n2.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "notify-cl0-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "search-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"SEARCH / HTTP/1.1\r\nHost: n.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "poll-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POLL / HTTP/1.1\r\nHost: n.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "http2-magic-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, HTTP2_MAGIC),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        80,
+                        1 + HTTP2_MAGIC.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-magic-then-opposite-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, HTTP2_MAGIC),
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "http2-prefix-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, HTTP2_PREFIX),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        80,
+                        1 + HTTP2_PREFIX.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "http2-prefix-then-opposite-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, HTTP2_PREFIX),
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "http2-magic-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &{
+                        let mut payload = HTTP2_MAGIC.to_vec();
+                        payload.extend_from_slice(INNER_GET);
+                        payload
+                    },
                 )],
             ),
         ),

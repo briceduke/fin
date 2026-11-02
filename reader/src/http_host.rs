@@ -123,6 +123,13 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
     HttpParse::Message(proved)
 }
 
+/// tshark 4.6.9 HTTP/2 client magic prefix (`PRI * HTTP/2.0` and two CRLFs).
+/// The 24-byte magic adds `SM` and two more CRLFs; either claims the conversation.
+pub fn looks_like_http2_preface(payload: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
+    payload.len() >= PREFIX.len() && payload.starts_with(PREFIX)
+}
+
 /// tshark 4.6.9 `dissect_http_heur_tcp`: a CRLF line that starts or ends
 /// with `HTTP/1.`, except a line of length 8.
 pub fn looks_like_http_heuristic(payload: &[u8]) -> bool {
@@ -152,8 +159,14 @@ enum Take {
 }
 
 enum LineKind {
-    Request { sstp_duplex_post: bool },
-    Response { status: u16 },
+    Request {
+        sstp_duplex_post: bool,
+    },
+    /// tshark 4.6.9 `MEDIA_CONTAINER_HTTP_NOTIFICATION`.
+    Notification,
+    Response {
+        status: u16,
+    },
 }
 
 fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take {
@@ -235,6 +248,13 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
     // min(remaining, content_length) before the RFC no-body arm.
     let body_need = match kind {
         LineKind::Request { .. } => content_length.unwrap_or(0),
+        // tshark 4.6.9 `is_http_request_or_reply` sets NOTIFY /
+        // SUBSCRIBE / UNSUBSCRIBE to `MEDIA_CONTAINER_HTTP_NOTIFICATION`,
+        // not `HTTP_REQUEST`. Without Content-Length, `dissect_http_message`
+        // takes the default datalen arm (`reported_datalen = -1`): leftover
+        // is the notification body. `desegment_until_fin` is only for
+        // `HTTP_RESPONSE`, so this segment is complete.
+        LineKind::Notification => content_length.unwrap_or(available),
         LineKind::Response { status } if rfc_no_body(status) => {
             content_length.map(|n| n.min(available)).unwrap_or(0)
         }
@@ -262,7 +282,7 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
         ),
         status: match kind {
             LineKind::Response { status } => Some(status),
-            LineKind::Request { .. } => None,
+            LineKind::Request { .. } | LineKind::Notification => None,
         },
         upgrade,
     }
@@ -304,13 +324,20 @@ fn classify_line(line: &[u8]) -> Option<LineKind> {
         });
     }
     let method_len = data.iter().position(|b| *b == b' ').unwrap_or(data.len());
-    if is_request_method(&data[..method_len]) {
+    let method = &data[..method_len];
+    if is_notification_method(method) {
+        Some(LineKind::Notification)
+    } else if is_request_method(method) {
         Some(LineKind::Request {
-            sstp_duplex_post: data[..method_len] == b"SSTP_DUPLEX_POST"[..],
+            sstp_duplex_post: method == b"SSTP_DUPLEX_POST",
         })
     } else {
         None
     }
+}
+
+fn is_notification_method(method: &[u8]) -> bool {
+    matches!(method, b"NOTIFY" | b"SUBSCRIBE" | b"UNSUBSCRIBE")
 }
 
 fn is_request_method(method: &[u8]) -> bool {
@@ -590,6 +617,65 @@ mod tests {
         );
     }
 
+    fn leftover_after(first: &[u8]) -> Vec<u8> {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n");
+        payload
+    }
+
+    #[test]
+    fn notification_without_content_length_keeps_leftover_as_body() {
+        assert_eq!(
+            parse_http(b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n", false),
+            msg(&["n.example"])
+        );
+        let methods = [
+            b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n".as_slice(),
+            b"SUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"UNSUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"M-NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+        ];
+        for first in methods {
+            let HttpParse::Message(proved) = parse_http(&leftover_after(first), false) else {
+                panic!("{}", first.escape_ascii());
+            };
+            assert_eq!(proved.hosts, ["n.example"], "{}", first.escape_ascii());
+            assert!(!proved.desegment, "{}", first.escape_ascii());
+        }
+        let second = b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n2.example\r\n\r\n";
+        let HttpParse::Message(proved) = parse_http(second, false) else {
+            panic!("expected a proved NOTIFY");
+        };
+        assert_eq!(proved.hosts, ["n.example"]);
+        assert!(!proved.desegment);
+    }
+
+    #[test]
+    fn notification_content_length_zero_still_pipelines() {
+        assert_eq!(
+            parse_http(
+                b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                false
+            ),
+            msg(&["n.example", "inner.example"])
+        );
+    }
+
+    #[test]
+    fn search_and_poll_leftover_still_pipelines() {
+        for first in [
+            b"SEARCH / HTTP/1.1\r\nHost: n.example\r\n\r\n".as_slice(),
+            b"POLL / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+        ] {
+            assert_eq!(
+                parse_http(&leftover_after(first), false),
+                msg(&["n.example", "inner.example"]),
+                "{}",
+                first.escape_ascii()
+            );
+        }
+    }
+
     #[test]
     fn complete_then_incomplete_marks_desegment() {
         let HttpParse::Message(proved) = parse_http(
@@ -825,6 +911,11 @@ mod tests {
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
         ));
         assert!(!looks_like_http_heuristic(b"GET / HTTP/1.1"));
+        assert!(looks_like_http2_preface(
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        ));
+        assert!(looks_like_http2_preface(b"PRI * HTTP/2.0\r\n\r\n"));
+        assert!(!looks_like_http2_preface(b"PRI * HTTP/2.0\r\n"));
     }
 
     #[test]

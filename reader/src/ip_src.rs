@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
-use crate::http_host::{looks_like_http_heuristic, parse_http_pending, HttpParse, HttpProved};
+use crate::http_host::{
+    looks_like_http2_preface, looks_like_http_heuristic, parse_http_pending, HttpParse, HttpProved,
+};
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake,
@@ -128,7 +130,8 @@ pub struct IpSrc {
     http_seen: HashMap<TcpSeq, u32>,
     /// Direction waiting for `http.desegment_body` continuation.
     http_desegment: HashSet<TcpFlow>,
-    /// Heuristic `http_tcp` sticks the TCP conversation, matching tshark 4.6.9.
+    /// Heuristic `http_tcp` or an HTTP/2 preface on a named `http` port
+    /// sticks the TCP conversation, matching tshark 4.6.9.
     http_claimed: HashSet<TcpFlow>,
     /// `SSTP_DUPLEX_POST` waiting for a complete 200, matching packet-http.c.
     /// A 1xx does not clear this; tshark 4.6.9 `push_res` keeps `request_method`.
@@ -727,6 +730,21 @@ impl Walk<'_> {
             .map(|flow| self.http_sstp.contains(&flow.conversation()))
             .unwrap_or(false);
         if pick.is_http() {
+            if let Some(flow) = flow {
+                if self.http_claimed.contains(&flow.conversation()) {
+                    self.note_http_seen(key, len);
+                    self.count("http");
+                    return;
+                }
+            }
+            if looks_like_http2_preface(payload) {
+                if let Some(flow) = flow {
+                    self.http_claimed.insert(flow.conversation());
+                }
+                self.note_http_seen(key, len);
+                self.count("http");
+                return;
+            }
             match parse_http_pending(payload, fin, sstp_pending) {
                 HttpParse::Message(proved) => {
                     self.note_http_seen(key, len);
@@ -2854,6 +2872,48 @@ mod tests {
         assert_eq!(cells[0].counted, None);
         assert_eq!(cells[1].http_host, [] as [&str; 0]);
         assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
+
+    fn http2_then_get(preface: &[u8], opposite: bool) -> Vec<Cell> {
+        let later = eth_ipv4_tcp_flow(
+            if opposite { SERVER } else { CLIENT },
+            if opposite { CLIENT } else { SERVER },
+            if opposite { 80 } else { 50000 },
+            if opposite { 50000 } else { 80 },
+            if opposite {
+                1
+            } else {
+                1 + preface.len() as u32
+            },
+            INNER_GET,
+        );
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, preface),
+            later,
+        ])
+    }
+
+    fn assert_http2_then_get_is_counted(cells: &[Cell]) {
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    #[test]
+    fn http2_preface_on_named_http_counts_later_segments() {
+        for preface in [HTTP2_MAGIC, HTTP2_PREFIX] {
+            assert_http2_then_get_is_counted(&http2_then_get(preface, false));
+            assert_http2_then_get_is_counted(&http2_then_get(preface, true));
+        }
+        let mut leftover = HTTP2_MAGIC.to_vec();
+        leftover.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &leftover));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
     }
 
     #[test]
