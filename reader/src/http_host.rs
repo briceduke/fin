@@ -36,6 +36,10 @@ pub struct HttpProved {
     pub leftover_after_response: bool,
     /// Hosts from complete messages after the first complete response.
     pub hosts_after_response: Vec<String>,
+    /// A later message in this payload is incomplete. tshark 4.6.9
+    /// `http.desegment_body` keeps the next in-order payload on this
+    /// TCP direction as continuation, not a new HTTP message.
+    pub desegment: bool,
 }
 
 const TOKEN: &[u8] = b"!#$%&\\:*+-.^_`|~";
@@ -107,7 +111,10 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
                 }
             }
             Take::Incomplete if proved.hosts.is_empty() => return HttpParse::Unproved,
-            Take::Incomplete => return HttpParse::Message(proved),
+            Take::Incomplete => {
+                proved.desegment = true;
+                return HttpParse::Message(proved);
+            }
             Take::TransferEncoding if proved.hosts.is_empty() => return HttpParse::Unproved,
             Take::TransferEncoding => return HttpParse::Partial(proved.hosts),
             Take::Other => break,
@@ -584,11 +591,26 @@ mod tests {
     }
 
     #[test]
+    fn complete_then_incomplete_marks_desegment() {
+        let HttpParse::Message(proved) = parse_http(
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\nPOST / HTTP/1.1\r\nHost: post.example\r\nContent-Length: 100\r\n\r\n",
+            false,
+        ) else {
+            panic!("expected a proved GET before the incomplete POST");
+        };
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(proved.desegment);
+    }
+
+    #[test]
     fn junk_after_get_keeps_the_first_host() {
-        assert_eq!(
-            parse_http(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\njunk", false),
-            msg(&["a.example"])
-        );
+        let HttpParse::Message(proved) =
+            parse_http(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\njunk", false)
+        else {
+            panic!("expected a proved GET before leftover junk");
+        };
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(proved.desegment);
     }
 
     #[test]

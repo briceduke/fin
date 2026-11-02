@@ -165,10 +165,37 @@ pub fn eth_ipv4_tcp_to(
     seq: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    eth_ipv4_tcp_to_flags(src, dst, sport, dport, seq, 0x18, payload)
+}
+
+pub fn eth_ipv4_tcp_to_flags(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     eth(
         0x0800,
-        &ipv4_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+        &ipv4_to(
+            src,
+            dst,
+            6,
+            &tcp_seq_flags(sport, dport, seq, flags, payload),
+        ),
     )
+}
+
+pub fn eth_ipv4_tcp_flags(
+    src: [u8; 4],
+    sport: u16,
+    dport: u16,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    eth_ipv4_tcp_to_flags(src, PEER, sport, dport, 1, flags, payload)
 }
 
 pub fn eth_ipv4_tcp_fin(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {

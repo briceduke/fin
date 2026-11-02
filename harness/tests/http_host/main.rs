@@ -313,6 +313,14 @@ fn sstp_then(resp: &[u8]) -> [Vec<u8>; 3] {
     req_resp_get(SSTP_REQ, resp, INNER_GET)
 }
 
+fn req_resp_same_dir(req: &[u8], resp: &[u8], later: &[u8]) -> [Vec<u8>; 3] {
+    [
+        eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, req),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, resp),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1 + resp.len() as u32, later),
+    ]
+}
+
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
     let req = get("www.example.com");
     let vlan_frame = vlan(0x0800, &ipv4(OUTER, 6, &tcp(50000, 80, &req)));
@@ -1901,6 +1909,241 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                     eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"),
                     eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n"),
                 ],
+            ),
+        ),
+        (
+            "same-seq-shorter-retransmit",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        80,
+                        1,
+                        b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                    ),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        80,
+                        1,
+                        b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "desegment-200-no-cl-same-dir",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_same_dir(
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nHost: resp.example\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "desegment-200-cl100-same-dir",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_same_dir(
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "desegment-200-te-identity-same-dir",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_same_dir(
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "desegment-200-te-chunked-same-dir",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_same_dir(
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "desegment-post-cl100-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let post =
+                        b"POST / HTTP/1.1\r\nHost: post.example\r\nContent-Length: 100\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, post),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1 + post.len() as u32, INNER_GET),
+                    ]
+                },
+            ),
+        ),
+        (
+            "desegment-get-then-post-cl100-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let mut pipeline = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n".to_vec();
+                    pipeline.extend_from_slice(
+                        b"POST / HTTP/1.1\r\nHost: post.example\r\nContent-Length: 100\r\n\r\n",
+                    );
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &pipeline),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1 + pipeline.len() as u32, INNER_GET),
+                    ]
+                },
+            ),
+        ),
+        (
+            "desegment-200-opposite-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nHost: resp.example\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "head-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"HEAD / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nHost: resp.example\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "rst-ack-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x14,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "rst-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x04,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "rst-psh-ack-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x1c,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "fin-rst-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x05,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "syn-rst-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x06,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "ack-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x10,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "fin-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x01,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "syn-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x02,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "syn-ack-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flags(
+                    OUTER,
+                    50000,
+                    80,
+                    0x12,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                )],
             ),
         ),
         (
