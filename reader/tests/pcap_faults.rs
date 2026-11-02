@@ -24,46 +24,32 @@ fn record(seconds: u32, fraction: u32, included: u32, original: u32, body: &[u8]
 }
 
 #[test]
-fn empty_file_is_not_a_capture() {
-    let capture = read_capture(b"");
-    assert_eq!(capture.frames.len(), 0);
-    let fault = capture.fault.unwrap();
-    assert_eq!(fault, Fault::NotACaptureFile);
-    assert_eq!(capture.exit_code(), 3);
-    assert_eq!(fault.phrase(), "isn't a capture file");
-}
-
-#[test]
-fn unrecognized_bytes_are_not_a_capture() {
-    let capture = read_capture(b"abc");
-    assert_eq!(capture.frames.len(), 0);
-    let fault = capture.fault.unwrap();
-    assert_eq!(fault, Fault::NotACaptureFile);
-    assert_eq!(capture.exit_code(), 3);
-    assert_eq!(fault.phrase(), "isn't a capture file");
-}
-
-#[test]
-fn truncated_magic_tail() {
-    let capture = read_capture(&[0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00]);
-    assert_eq!(capture.frames.len(), 0);
-    let fault = capture.fault.unwrap();
-    assert_eq!(fault, Fault::TruncatedHeader);
-    assert_eq!(capture.exit_code(), 3);
-    assert!(fault.phrase().contains("or other data"));
+fn not_a_capture() {
+    for bytes in [&b""[..], b"abc"] {
+        let capture = read_capture(bytes);
+        assert_eq!(capture.frames.len(), 0);
+        let fault = capture.fault.unwrap();
+        assert_eq!(fault, Fault::NotACaptureFile);
+        assert_eq!(capture.exit_code(), 3);
+        assert_eq!(fault.phrase(), "isn't a capture file");
+    }
 }
 
 #[test]
 fn truncated_global_header() {
-    let mut bytes = header(1);
-    bytes.pop();
-    assert_eq!(bytes.len(), 23);
-    let capture = read_capture(&bytes);
-    assert_eq!(capture.frames.len(), 0);
-    let fault = capture.fault.unwrap();
-    assert_eq!(fault, Fault::TruncatedHeader);
-    assert_eq!(capture.exit_code(), 3);
-    assert!(fault.phrase().contains("or other data"));
+    let mut short_header = header(1);
+    short_header.pop();
+    for bytes in [
+        &[0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00][..],
+        short_header.as_slice(),
+    ] {
+        let capture = read_capture(bytes);
+        assert_eq!(capture.frames.len(), 0);
+        let fault = capture.fault.unwrap();
+        assert_eq!(fault, Fault::TruncatedHeader);
+        assert_eq!(capture.exit_code(), 3);
+        assert!(fault.phrase().contains("or other data"));
+    }
 }
 
 #[test]
