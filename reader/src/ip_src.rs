@@ -128,6 +128,7 @@ pub struct IpSrc {
     /// Heuristic `http_tcp` sticks the TCP conversation, matching tshark 4.6.9.
     http_claimed: HashSet<TcpFlow>,
     /// `SSTP_DUPLEX_POST` waiting for a complete 200, matching packet-http.c.
+    /// A 1xx does not clear this; tshark 4.6.9 `push_res` keeps `request_method`.
     http_sstp: HashSet<TcpFlow>,
     /// Conversation switched off HTTP; later Hosts are counted `http-tunnel`.
     http_tunnel: HashSet<TcpFlow>,
@@ -794,7 +795,7 @@ impl Walk<'_> {
         if proved.status_200 && self.http_sstp.contains(&conv) {
             self.http_tunnel.insert(conv);
         }
-        if proved.has_response {
+        if proved.has_final_response {
             self.http_sstp.remove(&conv);
         }
     }
@@ -2352,6 +2353,20 @@ mod tests {
         ])
     }
 
+    fn http_req_interim_resp_get(
+        req: &[u8],
+        interim: &[u8],
+        resp: &[u8],
+        later: &[u8],
+    ) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, interim),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1 + interim.len() as u32, resp),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + req.len() as u32, later),
+        ])
+    }
+
     #[test]
     fn http_sstp_200_counts_a_later_get() {
         let cells = http_req_resp_get(
@@ -2365,6 +2380,134 @@ mod tests {
         assert_eq!(cells[1].counted, None);
         assert_eq!(cells[2].http_host, [] as [&str; 0]);
         assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    const SSTP_REQ: &[u8] = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n";
+    const SSTP_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+    const INNER_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+
+    #[test]
+    fn http_sstp_1xx_then_200_counts_a_later_get() {
+        let interims = [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            b"HTTP/1.1 102 Processing\r\n\r\n",
+            b"HTTP/1.1 103 Early Hints\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+        ];
+        for interim in interims {
+            let cells = http_req_interim_resp_get(SSTP_REQ, interim, SSTP_200, INNER_GET);
+            assert_eq!(cells[0].http_host, ["sstp.example"], "{interim:?}");
+            assert_eq!(cells[0].counted, None, "{interim:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[1].counted, None, "{interim:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[2].counted, None, "{interim:?}");
+            assert_eq!(cells[3].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[3].counted, Some("http-tunnel"), "{interim:?}");
+        }
+    }
+
+    #[test]
+    fn http_sstp_1xx_then_200_same_segment_leftover_is_tunnel() {
+        let leftover = [SSTP_200, INNER_GET].concat();
+        let interims = [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            b"HTTP/1.1 102 Processing\r\n\r\n",
+            b"HTTP/1.1 103 Early Hints\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+        ];
+        for interim in interims {
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, SSTP_REQ),
+                eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, interim),
+                eth_ipv4_tcp_flow(
+                    SERVER,
+                    CLIENT,
+                    80,
+                    50000,
+                    1 + interim.len() as u32,
+                    &leftover,
+                ),
+            ]);
+            assert_eq!(cells[0].http_host, ["sstp.example"], "{interim:?}");
+            assert_eq!(cells[0].counted, None, "{interim:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[1].counted, None, "{interim:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{interim:?}");
+            assert_eq!(cells[2].counted, Some("http-tunnel"), "{interim:?}");
+        }
+    }
+
+    #[test]
+    fn http_sstp_two_100s_then_200_counts_a_later_get() {
+        let c100 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, SSTP_REQ),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, c100),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1 + c100.len() as u32, c100),
+            eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                80,
+                50000,
+                1 + 2 * c100.len() as u32,
+                SSTP_200,
+            ),
+            eth_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1 + SSTP_REQ.len() as u32,
+                INNER_GET,
+            ),
+        ]);
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[4].http_host, [] as [&str; 0]);
+        assert_eq!(cells[4].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_and_100_same_segment_then_200_counts_a_later_get() {
+        let client = [SSTP_REQ, b"HTTP/1.1 100 Continue\r\n\r\n".as_slice()].concat();
+        let cells = http_req_resp_get(&client, SSTP_200, INNER_GET);
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_same_segment_100_and_200_leftover_is_tunnel() {
+        let leftover = [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            SSTP_200,
+            INNER_GET,
+        ]
+        .concat();
+        let cells = http_req_resp(SSTP_REQ, &leftover);
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_sstp_2xx_then_200_still_prints_a_later_host() {
+        let finals = [
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 203 Non-Authoritative Information\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\n\r\n",
+        ];
+        for resp in finals {
+            let cells = http_req_interim_resp_get(SSTP_REQ, resp, SSTP_200, INNER_GET);
+            assert_eq!(cells[0].http_host, ["sstp.example"], "{resp:?}");
+            assert_eq!(cells[0].counted, None, "{resp:?}");
+            assert_eq!(cells[3].http_host, ["inner.example"], "{resp:?}");
+            assert_eq!(cells[3].counted, None, "{resp:?}");
+        }
     }
 
     #[test]

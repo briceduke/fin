@@ -34,7 +34,7 @@ These frames are counted when they look like HTTP that v1 does not prove, and le
 | HTTP/2 (`PRI * HTTP/2.0`, h2c upgrade) | Not HTTP/1.x. |
 | HTTP over TLS | tshark may decrypt (pcapng secrets) or follow HTTP inside TLS; v1 counts `http-over-tls` on snapshotted TLS ports. |
 | HTTP-like UDP (SSDP) | Not TCP. Counted `http-udp`. |
-| Inner HTTP in a tunnel this walker does not follow (sFlow, SSTP after `SSTP_DUPLEX_POST`+200 including the request and 200 in the same segment, 101 with `Upgrade`, including leftover in that same segment, …) | Counted `http-tunnel`. A 101 with no Upgrade stays HTTP. |
+| Inner HTTP in a tunnel this walker does not follow (sFlow, SSTP after `SSTP_DUPLEX_POST`+200 including a 1xx before that 200, the request and 200 in the same segment, 101 with `Upgrade`, including leftover in that same segment, …) | Counted `http-tunnel`. A 101 with no Upgrade stays HTTP. |
 | CONNECT plus 200 | Stays HTTP, matching tshark 4.6.9. The CONNECT request prints Host; a later GET after the 200 prints Host. |
 | Out-of-order TCP | Counted. |
 

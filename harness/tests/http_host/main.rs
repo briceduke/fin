@@ -259,6 +259,30 @@ fn req_resp_get(req: &[u8], resp: &[u8], later: &[u8]) -> [Vec<u8>; 3] {
     ]
 }
 
+fn req_interim_resp_get(req: &[u8], interim: &[u8], resp: &[u8], later: &[u8]) -> [Vec<u8>; 4] {
+    [
+        eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, req),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, interim),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1 + interim.len() as u32, resp),
+        eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1 + req.len() as u32, later),
+    ]
+}
+
+const SSTP_REQ: &[u8] = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n";
+const SSTP_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+const INNER_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+const CONTINUE_100: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+fn sstp_interim_leftover_get(interim: &[u8]) -> [Vec<u8>; 3] {
+    let mut leftover = SSTP_200.to_vec();
+    leftover.extend_from_slice(INNER_GET);
+    [
+        eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, SSTP_REQ),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, interim),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1 + interim.len() as u32, &leftover),
+    ]
+}
+
 fn cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {
     let mut payload = status.to_vec();
     payload.extend_from_slice(b"\r\nHost: st.example\r\nContent-Length: 4\r\n\r\n");
@@ -728,6 +752,181 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                     b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
                     b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
                     b"GET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "sstp-100-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(SSTP_REQ, CONTINUE_100, SSTP_200, INNER_GET),
+            ),
+        ),
+        (
+            "sstp-100-then-200-leftover-get",
+            pcap(LINK_ETHERNET, &sstp_interim_leftover_get(CONTINUE_100)),
+        ),
+        (
+            "sstp-102-then-200-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_interim_leftover_get(b"HTTP/1.1 102 Processing\r\n\r\n"),
+            ),
+        ),
+        (
+            "sstp-103-then-200-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_interim_leftover_get(b"HTTP/1.1 103 Early Hints\r\n\r\n"),
+            ),
+        ),
+        (
+            "sstp-101-no-upgrade-then-200-leftover-get",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_interim_leftover_get(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
+            ),
+        ),
+        (
+            "sstp-102-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(
+                    SSTP_REQ,
+                    b"HTTP/1.1 102 Processing\r\n\r\n",
+                    SSTP_200,
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-103-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(
+                    SSTP_REQ,
+                    b"HTTP/1.1 103 Early Hints\r\n\r\n",
+                    SSTP_200,
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-101-no-upgrade-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(
+                    SSTP_REQ,
+                    b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+                    SSTP_200,
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-two-100s-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, SSTP_REQ),
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, CONTINUE_100),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1 + CONTINUE_100.len() as u32,
+                        CONTINUE_100,
+                    ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1 + 2 * CONTINUE_100.len() as u32,
+                        SSTP_200,
+                    ),
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1 + SSTP_REQ.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "sstp-and-100-same-segment-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    &{
+                        let mut payload = SSTP_REQ.to_vec();
+                        payload.extend_from_slice(CONTINUE_100);
+                        payload
+                    },
+                    SSTP_200,
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-same-segment-100-and-200-leftover",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, SSTP_REQ),
+                    eth_ipv4_tcp_to(
+                        PEER,
+                        OUTER,
+                        80,
+                        50000,
+                        1,
+                        &{
+                            let mut payload = CONTINUE_100.to_vec();
+                            payload.extend_from_slice(SSTP_200);
+                            payload.extend_from_slice(INNER_GET);
+                            payload
+                        },
+                    ),
+                ],
+            ),
+        ),
+        (
+            "sstp-201-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(
+                    SSTP_REQ,
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n",
+                    SSTP_200,
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-203-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(
+                    SSTP_REQ,
+                    b"HTTP/1.1 203 Non-Authoritative Information\r\nContent-Length: 0\r\n\r\n",
+                    SSTP_200,
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-204-then-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_interim_resp_get(
+                    SSTP_REQ,
+                    b"HTTP/1.1 204 No Content\r\n\r\n",
+                    SSTP_200,
+                    INNER_GET,
                 ),
             ),
         ),

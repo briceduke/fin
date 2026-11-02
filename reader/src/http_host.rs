@@ -25,6 +25,9 @@ pub struct HttpProved {
     pub status_200: bool,
     /// Complete response of any status in this payload.
     pub has_response: bool,
+    /// Complete response with status >= 200. tshark 4.6.9 `push_res`
+    /// keeps `request_method` after a 1xx.
+    pub has_final_response: bool,
     /// Complete 101 response that listed `Upgrade`.
     pub switching_upgrade: bool,
     /// Bytes remain after a complete 101 with `Upgrade`. Unwalked tunnel.
@@ -76,6 +79,9 @@ pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
                 }
                 if let Some(status) = status {
                     proved.has_response = true;
+                    if status >= 200 {
+                        proved.has_final_response = true;
+                    }
                     if status == 200 {
                         proved.status_200 = true;
                     }
@@ -445,11 +451,12 @@ mod tests {
         })
     }
 
-    fn resp(hosts: &[&str], status_200: bool, switching_upgrade: bool) -> HttpParse {
+    fn resp(hosts: &[&str], status: u16, switching_upgrade: bool) -> HttpParse {
         HttpParse::Message(HttpProved {
             hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
-            status_200,
+            status_200: status == 200,
             has_response: true,
+            has_final_response: status >= 200,
             switching_upgrade,
             ..HttpProved::default()
         })
@@ -566,7 +573,7 @@ mod tests {
     fn response_204_prints_host() {
         assert_eq!(
             parse_http(b"HTTP/1.1 204 No Content\r\nHost: x\r\n\r\n", false),
-            resp(&["x"], false, false)
+            resp(&["x"], 204, false)
         );
     }
 
@@ -578,7 +585,7 @@ mod tests {
         );
         assert_eq!(
             parse_http(b"HTTP/1.1 200 OK\r\nHost: x\r\n\r\nhello", true),
-            resp(&["x"], true, false)
+            resp(&["x"], 200, false)
         );
     }
 
@@ -699,7 +706,7 @@ mod tests {
             );
             assert_eq!(
                 parse_http(payload, true),
-                resp(&["st.example"], false, false),
+                resp(&["st.example"], 0, false),
                 "{payload:?}"
             );
         }
@@ -708,21 +715,21 @@ mod tests {
                 b"HTTP/1.1 101 Switching Protocols\r\nHost: st.example\r\n\r\n",
                 false
             ),
-            resp(&["st.example"], false, false)
+            resp(&["st.example"], 101, false)
         );
         assert_eq!(
             parse_http(
                 b"HTTP/1.1 204 No Content\r\nHost: st.example\r\n\r\n",
                 false
             ),
-            resp(&["st.example"], false, false)
+            resp(&["st.example"], 204, false)
         );
         assert_eq!(
             parse_http(
                 b"HTTP/1.1 304 Not Modified\r\nHost: st.example\r\n\r\n",
                 false
             ),
-            resp(&["st.example"], false, false)
+            resp(&["st.example"], 304, false)
         );
     }
 
@@ -780,7 +787,7 @@ mod tests {
     fn icy_is_a_response() {
         assert_eq!(
             parse_http(b"ICY 200 OK\r\nHost: icy.example\r\n\r\n", true),
-            resp(&["icy.example"], true, false)
+            resp(&["icy.example"], 200, false)
         );
     }
 
@@ -845,6 +852,27 @@ mod tests {
         assert_eq!(proved.hosts, ["sstp.example"]);
         assert!(proved.sstp_duplex_post);
         assert!(!proved.has_response);
+        assert!(!proved.has_final_response);
+    }
+
+    #[test]
+    fn a_1xx_is_not_a_final_response() {
+        let proved = message(b"HTTP/1.1 100 Continue\r\n\r\n");
+        assert!(proved.has_response);
+        assert!(!proved.has_final_response);
+        assert!(!proved.status_200);
+        let proved = message(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n",
+        );
+        assert!(proved.sstp_duplex_post);
+        assert!(proved.has_response);
+        assert!(!proved.has_final_response);
+        let proved = message(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(proved.has_response);
+        assert!(proved.has_final_response);
+        assert!(proved.status_200);
     }
 
     #[test]
@@ -854,21 +882,21 @@ mod tests {
                 b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\n",
                 false
             ),
-            resp(&["sw.example"], false, true)
+            resp(&["sw.example"], 101, true)
         );
         assert_eq!(
             parse_http(
                 b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nHost: sw.example\r\n\r\n",
                 false
             ),
-            resp(&["sw.example"], false, true)
+            resp(&["sw.example"], 101, true)
         );
         assert_eq!(
             parse_http(
                 b"HTTP/1.1 101 Switching Protocols\r\nHost: sw.example\r\n\r\n",
                 false
             ),
-            resp(&["sw.example"], false, false)
+            resp(&["sw.example"], 101, false)
         );
     }
 
