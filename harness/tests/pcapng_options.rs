@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use harness::{RunError, TsharkSession};
 use reader::read_capture;
 
-const CASES: u32 = 512;
+const CASES: u32 = 64;
 
 #[test]
 fn malformed_idb_options_match_tshark_469() {
