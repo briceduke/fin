@@ -138,12 +138,7 @@ impl Role<'_> {
     }
 }
 
-fn idb_option(
-    code: u16,
-    length: u16,
-    content: &[u8],
-    resol: &mut Option<u8>,
-) -> Result<(), Fault> {
+fn idb_option(code: u16, length: u16, content: &[u8], resol: &mut Option<u8>) -> Result<(), Fault> {
     match code {
         IF_TSRESOL if length == 1 && resol.is_none() => {
             *resol = Some(content[0]);
