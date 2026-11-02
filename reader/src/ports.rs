@@ -12,33 +12,8 @@ use std::sync::OnceLock;
 const DECODES: &str = include_str!("../ports/udp-tcp-decodes.txt");
 const TLS_DECODES: &str = include_str!("../ports/tls-port-decodes.txt");
 
-/// Port dissectors proved in 4.6.9 to always claim the payload.
-const ALWAYS_CLAIM: &[&str] = &[
-    "acdr",
-    "amt",
-    "ayiya",
-    "capwap",
-    "capwap.data",
-    "discard",
-    "dns",
-    "echo",
-    "geneve",
-    "gre",
-    "gtpprime",
-    "lisp",
-    "llc",
-    "lwapp",
-    "mip",
-    "mpls",
-    "msrcp",
-    "openflow",
-    "teredo",
-    "tzsp",
-    "udpencap",
-    "vxlan",
-    "vxlan_gpe",
-    "wassp",
-];
+/// Port dissectors proved in 4.6.9 to always claim and not reach IP.
+const ALWAYS_CLAIM: &[&str] = &["discard", "dns", "echo", "gtpprime"];
 
 /// Port names that can call the IPv4 dissector, including unproven names
 /// treated as reaches-IP so a miss stays a count.
@@ -104,13 +79,13 @@ impl PortPick {
     pub fn must_count(self) -> bool {
         match self.name {
             None => true,
-            Some("vxlan") => self.may_reject,
+            Some("vxlan") => false,
             Some(_) => self.may_reject || self.reaches_ip,
         }
     }
 
     pub fn is_vxlan(self) -> bool {
-        self.name == Some("vxlan") && !self.may_reject
+        self.name == Some("vxlan")
     }
 
     pub fn is_tls(self) -> bool {
