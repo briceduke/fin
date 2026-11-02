@@ -16,8 +16,7 @@ mod tls_sni;
 pub use chunk::read_capture_chunked;
 #[doc(hidden)]
 pub use chunk::read_capture_seams;
-pub use ip_src::{walk_ip_src, Cell, IpSrc};
-pub use tls_sni::{parse_tcp_tls, parse_tcp_tls_on_tls_port, truncated_handshake_need, TlsParse};
+pub use ip_src::{Cell, IpSrc};
 
 /// Largest captured length tshark 4.6.9 will read.
 pub const MAX_CAPTURED_LENGTH: u32 = 262144;
