@@ -27,20 +27,12 @@ fn u32_bytes(value: u32, big: bool) -> [u8; 4] {
     }
 }
 
-fn i32_bytes(value: i32, big: bool) -> [u8; 4] {
-    if big {
-        value.to_be_bytes()
-    } else {
-        value.to_le_bytes()
-    }
-}
-
 fn header(magic: [u8; 4], snaplen: u32, link_type: u32) -> Vec<u8> {
     let big = magic[0] == 0xa1;
     let mut file = magic.to_vec();
     file.extend_from_slice(&u16_bytes(2, big));
     file.extend_from_slice(&u16_bytes(4, big));
-    file.extend_from_slice(&i32_bytes(0, big));
+    file.extend_from_slice(&u32_bytes(0, big));
     file.extend_from_slice(&u32_bytes(0, big));
     file.extend_from_slice(&u32_bytes(snaplen, big));
     file.extend_from_slice(&u32_bytes(link_type, big));
@@ -60,50 +52,27 @@ fn assert_clean(capture: &Capture<'_>) {
     assert_eq!(capture.fault, None::<Fault>);
 }
 
-fn assert_frame(frame: &Frame<'_>, bytes: &[u8], link_type: u32, captured: &[u8]) {
+fn assert_frame(frame: &Frame<'_>, link_type: u32, captured: &[u8]) {
     assert_eq!(frame.link_type, link_type);
     assert_eq!(frame.captured, captured);
-    assert!(is_subslice(bytes, frame.captured));
 }
 
 #[test]
-fn little_endian_microseconds_yield_one_frame() {
-    let mut bytes = header(LE_USEC, 65535, 1);
-    push_packet(&mut bytes, 5, 6, 2, &[0x09, 0x08, 0x07, 0x06]);
-    let capture = read_capture(&bytes);
-    assert_clean(&capture);
-    assert_eq!(capture.frames.len(), 1);
-    assert_frame(&capture.frames[0], &bytes, 1, &[0x09, 0x08, 0x07, 0x06]);
-}
-
-#[test]
-fn big_endian_microseconds_yield_one_frame() {
-    let mut bytes = header(BE_USEC, 65535, 1);
-    push_packet(&mut bytes, 11, 12, 2, &[0xde, 0xad]);
-    let capture = read_capture(&bytes);
-    assert_clean(&capture);
-    assert_eq!(capture.frames.len(), 1);
-    assert_frame(&capture.frames[0], &bytes, 1, &[0xde, 0xad]);
-}
-
-#[test]
-fn little_endian_nanosecond_magic_opens() {
-    let mut bytes = header(LE_NSEC, 65535, 1);
-    push_packet(&mut bytes, 9, 1000, 1, &[0x01]);
-    let capture = read_capture(&bytes);
-    assert_clean(&capture);
-    assert_eq!(capture.frames.len(), 1);
-    assert_frame(&capture.frames[0], &bytes, 1, &[0x01]);
-}
-
-#[test]
-fn big_endian_nanosecond_magic_opens() {
-    let mut bytes = header(BE_NSEC, 65535, 1);
-    push_packet(&mut bytes, 3, 250, 9, &[0xff]);
-    let capture = read_capture(&bytes);
-    assert_clean(&capture);
-    assert_eq!(capture.frames.len(), 1);
-    assert_frame(&capture.frames[0], &bytes, 1, &[0xff]);
+fn four_magics_yield_one_frame() {
+    for (magic, seconds, fraction, original, body) in [
+        (LE_USEC, 5, 6, 2, &[0x09, 0x08, 0x07, 0x06][..]),
+        (BE_USEC, 11, 12, 2, &[0xde, 0xad][..]),
+        (LE_NSEC, 9, 1000, 1, &[0x01][..]),
+        (BE_NSEC, 3, 250, 9, &[0xff][..]),
+    ] {
+        let mut bytes = header(magic, 65535, 1);
+        push_packet(&mut bytes, seconds, fraction, original, body);
+        let capture = read_capture(&bytes);
+        assert_clean(&capture);
+        assert_eq!(capture.frames.len(), 1);
+        assert_frame(&capture.frames[0], 1, body);
+        assert!(is_subslice(&bytes, capture.frames[0].captured));
+    }
 }
 
 #[test]
@@ -114,8 +83,8 @@ fn two_packets_stay_in_file_order() {
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 2);
-    assert_frame(&capture.frames[0], &bytes, 1, &[0x11]);
-    assert_frame(&capture.frames[1], &bytes, 1, &[0x22]);
+    assert_frame(&capture.frames[0], 1, &[0x11]);
+    assert_frame(&capture.frames[1], 1, &[0x22]);
 }
 
 #[test]
@@ -126,8 +95,8 @@ fn captured_length_steps_past_snaplen_and_original_length() {
     let capture = read_capture(&bytes);
     assert_clean(&capture);
     assert_eq!(capture.frames.len(), 2);
-    assert_frame(&capture.frames[0], &bytes, 1, &[0x09, 0x08, 0x07, 0x06]);
-    assert_frame(&capture.frames[1], &bytes, 1, &[0xab]);
+    assert_frame(&capture.frames[0], 1, &[0x09, 0x08, 0x07, 0x06]);
+    assert_frame(&capture.frames[1], 1, &[0xab]);
 }
 
 #[test]
@@ -151,23 +120,15 @@ fn captured_length_262144_is_a_frame() {
 }
 
 #[test]
-fn linux_cooked_capture_opens() {
-    let mut bytes = header(LE_USEC, 65535, 113);
-    push_packet(&mut bytes, 1, 0, 1, &[0x01]);
-    let capture = read_capture(&bytes);
-    assert_clean(&capture);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].link_type, 113);
-}
-
-#[test]
-fn linux_cooked_capture_v2_opens() {
-    let mut bytes = header(LE_USEC, 65535, 276);
-    push_packet(&mut bytes, 1, 0, 1, &[0x01]);
-    let capture = read_capture(&bytes);
-    assert_clean(&capture);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].link_type, 276);
+fn linux_cooked_link_types_open() {
+    for link_type in [113, 276] {
+        let mut bytes = header(LE_USEC, 65535, link_type);
+        push_packet(&mut bytes, 1, 0, 1, &[0x01]);
+        let capture = read_capture(&bytes);
+        assert_clean(&capture);
+        assert_eq!(capture.frames.len(), 1);
+        assert_eq!(capture.frames[0].link_type, link_type);
+    }
 }
 
 #[test]

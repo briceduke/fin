@@ -19,23 +19,6 @@ const JOURNAL_MIN: usize = 23;
 const LE_ORDER: [u8; 4] = [0x4d, 0x3c, 0x2b, 0x1a];
 const BE_ORDER: [u8; 4] = [0x1a, 0x2b, 0x3c, 0x4d];
 
-/// tshark 4.6.9 `register_pcapng_block_type_information`. `packet` is
-/// `!handler->internal`: those blocks are rows, and a fault on them is
-/// exit 14 even when no row was produced.
-const BLOCKS: &[(u32, bool)] = &[
-    (SHB_TYPE, false),
-    (IDB_TYPE, false),
-    (OPB_TYPE, true),
-    (SPB_TYPE, true),
-    (NRB_TYPE, false),
-    (ISB_TYPE, false),
-    (EPB_TYPE, true),
-    (JOURNAL_TYPE, true),
-    (DSB_TYPE, false),
-    (CB_COPY, true),
-    (CB_NO_COPY, true),
-];
-
 struct Interface {
     link_type: u32,
     snaplen: u32,
@@ -64,7 +47,7 @@ fn open_section(bytes: &[u8]) -> Result<(bool, usize), Fault> {
     };
     let total = block_total(bytes, 0, big_endian, SHB_MIN, Fault::NotACaptureFile, true)?;
     shb_version(bytes, 0, big_endian)?;
-    options::walk_shb(bytes, 24, total - 4, big_endian)?;
+    options::walk_common(bytes, 24, total - 4, big_endian)?;
     Ok((big_endian, total))
 }
 
@@ -112,10 +95,13 @@ fn blocks(bytes: &[u8], mut big_endian: bool, mut offset: usize) -> Capture<'_> 
     Capture::ok(frames)
 }
 
+/// tshark 4.6.9 `!handler->internal`: these blocks are rows, and a fault on
+/// them is exit 14 even when no row was produced.
 fn is_packet(block_type: u32) -> bool {
-    BLOCKS
-        .iter()
-        .any(|&(id, packet)| id == block_type && packet)
+    matches!(
+        block_type,
+        OPB_TYPE | SPB_TYPE | EPB_TYPE | JOURNAL_TYPE | CB_COPY | CB_NO_COPY
+    )
 }
 
 fn packet_type_at(bytes: &[u8], offset: usize, big_endian: bool) -> bool {
@@ -188,11 +174,11 @@ fn consume<'a>(
     interfaces: &mut Vec<Interface>,
     frames: &mut Vec<Frame<'a>>,
 ) -> Result<(), Fault> {
-    // Same set as BLOCKS. Unknown types are skipped.
+    // Unknown types are skipped.
     match block_type {
         SHB_TYPE => {
             shb_version(bytes, offset, big_endian)?;
-            options::walk_shb(bytes, offset + 24, offset + total - 4, big_endian)?;
+            options::walk_common(bytes, offset + 24, offset + total - 4, big_endian)?;
             interfaces.clear();
         }
         IDB_TYPE => interfaces.push(interface(bytes, offset, total, big_endian)?),

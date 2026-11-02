@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::diff::PairOutput;
@@ -15,18 +17,8 @@ const TSHARK_VERSION: &str = "4.6.9";
 /// tshark gets a fresh empty directory in `WIRESHARK_CONFIG_DIR`. The
 /// tshark binary must report version 4.6.9.
 pub fn run_pair(tshark: &Path, fin: &Path, args: &[OsString]) -> Result<PairOutput, RunError> {
+    ensure_version(tshark)?;
     let config = ConfigDir::create()?;
-    let version = spawn(
-        "tshark",
-        tshark,
-        &[OsString::from("--version")],
-        Some(config.path()),
-    )?;
-    if !accepts_version(&version.stdout) {
-        return Err(RunError::Version {
-            found: version_line(&version.stdout),
-        });
-    }
     let tshark_run = spawn("tshark", tshark, args, Some(config.path()))?;
     let fin_run = spawn("fin", fin, args, None)?;
     Ok(PairOutput {
@@ -45,11 +37,6 @@ pub struct ToolOutput {
     pub exit_code: i32,
 }
 
-/// Run tshark 4.6.9 with a fresh empty `WIRESHARK_CONFIG_DIR`.
-pub fn run_tshark(tshark: &Path, args: &[OsString]) -> Result<ToolOutput, RunError> {
-    TsharkSession::open(tshark)?.run(args)
-}
-
 /// A tshark 4.6.9 binary, version-checked once.
 pub struct TsharkSession {
     path: PathBuf,
@@ -58,18 +45,7 @@ pub struct TsharkSession {
 impl TsharkSession {
     /// Reject anything that is not tshark 4.6.9.
     pub fn open(tshark: &Path) -> Result<Self, RunError> {
-        let config = ConfigDir::create()?;
-        let version = spawn(
-            "tshark",
-            tshark,
-            &[OsString::from("--version")],
-            Some(config.path()),
-        )?;
-        if !accepts_version(&version.stdout) {
-            return Err(RunError::Version {
-                found: version_line(&version.stdout),
-            });
-        }
+        ensure_version(tshark)?;
         Ok(Self {
             path: tshark.to_path_buf(),
         })
@@ -85,6 +61,37 @@ impl TsharkSession {
             exit_code: run.exit_code,
         })
     }
+}
+
+static VERIFIED_TSHARK: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn ensure_version(tshark: &Path) -> Result<(), RunError> {
+    {
+        let verified = VERIFIED_TSHARK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if verified.contains(tshark) {
+            return Ok(());
+        }
+    }
+    let config = ConfigDir::create()?;
+    let version = spawn(
+        "tshark",
+        tshark,
+        &[OsString::from("--version")],
+        Some(config.path()),
+    )?;
+    if !accepts_version(&version.stdout) {
+        return Err(RunError::Version {
+            found: version_line(&version.stdout),
+        });
+    }
+    VERIFIED_TSHARK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(tshark.to_path_buf());
+    Ok(())
 }
 
 fn accepts_version(stdout: &str) -> bool {
