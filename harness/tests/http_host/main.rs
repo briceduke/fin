@@ -2630,6 +2630,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .into_iter()
     .chain(connect_cases())
     .chain(http2_cl24_cases())
+    .chain(junk_header_cases())
     .chain(on_disk())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
@@ -2743,6 +2744,139 @@ fn connect_cases() -> Vec<(&'static str, Vec<u8>)> {
         ));
     }
     out
+}
+
+fn junk_then_inner(first: &[u8]) -> Vec<u8> {
+    let mut payload = first.to_vec();
+    payload.extend_from_slice(INNER_GET);
+    payload
+}
+
+fn junk_header_frame(sport: u16, dport: u16, first: &[u8]) -> Vec<u8> {
+    pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(OUTER, sport, dport, &junk_then_inner(first))],
+    )
+}
+
+fn junk_header_cases() -> Vec<(&'static str, Vec<u8>)> {
+    const JUNK: &[u8] = b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\n\r\n";
+    vec![
+        ("junk-header-then-get", junk_header_frame(50000, 80, JUNK)),
+        (
+            "junk-obs-fold-then-get",
+            junk_header_frame(50000, 80, b"GET / HTTP/1.1\r\nHost: ab\r\n cd\r\n\r\n"),
+        ),
+        (
+            "junk-tab-fold-then-get",
+            junk_header_frame(50000, 80, b"GET / HTTP/1.1\r\nHost: ab\r\n\tcd\r\n\r\n"),
+        ),
+        (
+            "junk-space-only-then-get",
+            junk_header_frame(50000, 80, b"GET / HTTP/1.1\r\nHost: a.example\r\n \r\n\r\n"),
+        ),
+        (
+            "junk-x-foo-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nX-Foo\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-post-cl0-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\nnot-a-header\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-204-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-200-cl0-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"HTTP/1.1 200 OK\r\nHost: a.example\r\nContent-Length: 0\r\nnot-a-header\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-two-lines-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\njunk2\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-header-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(
+                    PEER,
+                    OUTER,
+                    80,
+                    50000,
+                    1,
+                    &junk_then_inner(JUNK),
+                )],
+            ),
+        ),
+        ("junk-header-8080", junk_header_frame(50000, 8080, JUNK)),
+        (
+            "junk-header-later-frame-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, JUNK),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1 + JUNK.len() as u32, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "notify-leftover-junk-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\nnot-a-header\r\n",
+            ),
+        ),
+        (
+            "junk-colon-value-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"GET / HTTP/1.1\r\nHost: a.example\r\n:value\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-foo-bar-colon-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nFoo Bar: x\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-header-no-blank",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"GET / HTTP/1.1\r\nHost: fuzz.example\r\nnot-a-header\r\n",
+                )],
+            ),
+        ),
+    ]
 }
 
 fn cl24_magic_then_get(start: &[u8]) -> Vec<u8> {

@@ -235,28 +235,29 @@ fn take_message(
     let mut content_length = None;
     let mut transfer_encoding = false;
     let mut upgrade = false;
-    let mut ignore_headers = false;
     loop {
         let Some((line, next)) = take_line(&payload[offset..]) else {
             return Take::Incomplete;
         };
-        offset += next;
         if line.is_empty() {
+            offset += next;
             break;
         }
         if classify_line(line).is_some() {
             return Take::Incomplete;
         }
-        if ignore_headers {
-            continue;
-        }
         let Some(colon) = line.iter().position(|b| *b == b':') else {
-            // tshark 4.6.9 stops adding headers on a complete line
-            // that is not a request, response, or `name:`, then still
-            // needs the blank line `http.desegment_headers` waits for.
-            ignore_headers = true;
-            continue;
+            // tshark 4.6.9 `dissect_http_message` breaks when `memchr`
+            // finds no colon; offset stays on this line. For a request,
+            // `datalen` is 0, so leftover starting here is Continuation,
+            // not a new HTTP message. `http.desegment_headers` still
+            // needs a later blank line before Host is emitted.
+            if !has_blank_line(&payload[offset + next..]) {
+                return Take::Incomplete;
+            }
+            break;
         };
+        offset += next;
         if !valid_header_name(&line[..colon]) {
             continue;
         }
@@ -355,6 +356,19 @@ fn take_message(
         http2: looks_like_http2_preface(&payload[body_end..])
             || (body_end == payload.len() && looks_like_http2_preface(&payload[header_end..])),
     }
+}
+
+/// tshark 4.6.9 `req_resp_hdrs_do_reassembly` waits for a blank line
+/// (`linelen == 0`) before `dissect_http_message` emits Host.
+fn has_blank_line(bytes: &[u8]) -> bool {
+    let mut offset = 0;
+    while let Some((line, next)) = take_line(&bytes[offset..]) {
+        if line.is_empty() {
+            return true;
+        }
+        offset += next;
+    }
+    false
 }
 
 fn take_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
@@ -1003,10 +1017,106 @@ mod tests {
         );
     }
 
+    fn first_host_without_inner(payload: &[u8], host: &str) {
+        let HttpParse::Message(proved) = parse_http(payload, false) else {
+            panic!("{}", payload.escape_ascii());
+        };
+        assert_eq!(proved.hosts, [host], "{}", payload.escape_ascii());
+        assert!(!proved.desegment, "{}", payload.escape_ascii());
+    }
+
+    #[test]
+    fn no_colon_header_line_does_not_pipeline_leftover() {
+        let cases: [(&[u8], &str); 9] = [
+            (
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+                "a.example",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: ab\r\n cd\r\n\r\n", "ab"),
+            (b"GET / HTTP/1.1\r\nHost: ab\r\n\tcd\r\n\r\n", "ab"),
+            (
+                b"GET / HTTP/1.1\r\nHost: a.example\r\n \r\n\r\n",
+                "a.example",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nX-Foo\r\n\r\n",
+                "a.example",
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\nnot-a-header\r\n\r\n",
+                "a.example",
+            ),
+            (
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+                "a.example",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nHost: a.example\r\nContent-Length: 0\r\nnot-a-header\r\n\r\n",
+                "a.example",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\njunk2\r\n\r\n",
+                "a.example",
+            ),
+        ];
+        for (first, host) in cases {
+            first_host_without_inner(&leftover_after(first), host);
+        }
+    }
+
+    #[test]
+    fn colon_header_line_still_pipelines_leftover() {
+        assert_eq!(
+            parse_http(
+                &leftover_after(b"GET / HTTP/1.1\r\nHost: a.example\r\n:value\r\n\r\n"),
+                false
+            ),
+            msg(&["a.example", "inner.example"])
+        );
+        assert_eq!(
+            parse_http(
+                &leftover_after(b"GET / HTTP/1.1\r\nHost: a.example\r\nFoo Bar: x\r\n\r\n"),
+                false
+            ),
+            msg(&["a.example", "inner.example"])
+        );
+    }
+
+    #[test]
+    fn notify_leftover_junk_stays_body() {
+        first_host_without_inner(
+            &leftover_after(b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\nnot-a-header\r\n"),
+            "n.example",
+        );
+        first_host_without_inner(
+            &leftover_after(b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\nnot-a-header\r\n\r\n"),
+            "n.example",
+        );
+    }
+
+    #[test]
+    fn junk_headers_without_leftover_get_are_not_desegment() {
+        let HttpParse::Message(proved) = parse_http(
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+            false,
+        ) else {
+            panic!("expected a proved GET before leftover junk headers");
+        };
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(!proved.desegment);
+    }
+
     #[test]
     fn junk_line_without_a_blank_is_unproved() {
         assert_eq!(
             parse_http(b"GET / HTTP/1.1\r\nHost: fuzz.example\r\n\xd8\n", false),
+            HttpParse::Unproved
+        );
+        assert_eq!(
+            parse_http(
+                b"GET / HTTP/1.1\r\nHost: fuzz.example\r\nnot-a-header\r\n",
+                false
+            ),
             HttpParse::Unproved
         );
     }
