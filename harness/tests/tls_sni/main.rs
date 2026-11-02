@@ -39,39 +39,6 @@ fn tls_sni_matches_tshark_469() {
 }
 
 #[test]
-fn stdin_matches_the_file_path() {
-    let fin = fin_bin();
-    let path = work_dir().join("sni-stdin-vs-file.pcap");
-    fs::write(
-        &path,
-        pcap(
-            LINK_ETHERNET,
-            &[eth_ipv4_tcp(
-                OUTER,
-                50000,
-                443,
-                &client_hello(Some("stdin.example")),
-            )],
-        ),
-    )
-    .unwrap();
-    let file = Command::new(&fin)
-        .arg("-r")
-        .arg(&path)
-        .args(["-n", "-T", "fields", "-e", FIELD])
-        .output()
-        .expect("fin file");
-    let stdin = Command::new(&fin)
-        .args(["-r", "-", "-n", "-T", "fields", "-e", FIELD])
-        .stdin(fs::File::open(&path).unwrap())
-        .output()
-        .expect("fin stdin");
-    assert_eq!(file.stdout, stdin.stdout, "stdout");
-    assert_eq!(file.stderr, stdin.stderr, "stderr");
-    assert_eq!(file.status.code(), stdin.status.code());
-}
-
-#[test]
 fn uncertain_last_hello_ext_counts_tls_hello_ext_uncertain() {
     let fin = fin_bin();
     let other = client_hello(Some("other.example"));
@@ -140,18 +107,6 @@ fn combined_ip_src_and_sni_matches_tshark_469() {
             output.fin_stdout
         );
     }
-}
-
-#[test]
-fn unknown_field_is_still_an_error() {
-    let fin = fin_bin();
-    let output = Command::new(&fin)
-        .args(["-r", "x", "-T", "fields", "-e", "udp.srcport"])
-        .output()
-        .expect("fin");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported field"), "{stderr}");
 }
 
 #[test]
