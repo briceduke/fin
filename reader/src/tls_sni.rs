@@ -93,6 +93,7 @@ pub struct TlsOutcome {
 
 /// Parse SNI from one TCP payload on an unnamed port. The first record must
 /// pass tshark 4.6.9 `is_sslv3_or_tls`.
+#[cfg(test)]
 pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
     parse_tls(payload, TlsSession::Unknown, true).kind
 }
@@ -101,17 +102,19 @@ pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
 /// session uses `ssl_looks_like_sslv3`; after an authoritative SSLv3/TLS 1.0–1.2
 /// or TLCP record, later records follow `dissect_ssl3_record`. TLS 1.3 stays
 /// on the default arm.
+#[cfg(test)]
 pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
     parse_tls(payload, TlsSession::Unknown, false).kind
 }
 
 /// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate. `session` is
 /// `SslSession.version`: unknown, sticky pre-1.3, or TLS 1.3.
+#[cfg(test)]
 pub fn parse_tls(payload: &[u8], session: TlsSession, heuristic: bool) -> TlsOutcome {
     parse_tls_after_ccs(payload, session, heuristic, false)
 }
 
-/// Like [`parse_tls`], with this packet's `ssl_packet_from_server` CCS
+/// Like `parse_tls`, with this packet's `ssl_packet_from_server` CCS
 /// frame already set from an earlier packet (`pinfo->num > ccs_frame`).
 pub fn parse_tls_after_ccs(
     payload: &[u8],
@@ -692,14 +695,16 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 /// is shorter than 4 bytes, or whose u24 length overruns, is also buffered.
 /// The next in-order payload on that flow is continuation, not a new
 /// ClientHello.
+#[cfg(test)]
 pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
     truncated_handshake_need_known(payload, TlsSession::Unknown)
 }
 
-/// Like [`truncated_handshake_need`], but a sticky session accepts any record
+/// Like `truncated_handshake_need`, but a sticky session accepts any record
 /// version the way `dissect_ssl3_record` does. Complete records, including
 /// length-0 CCS/alert/app-data/heartbeat, are skipped so a following truncated
 /// record is buffered, matching tshark 4.6.9 `dissect_ssl`.
+#[cfg(test)]
 pub fn truncated_handshake_need_known(payload: &[u8], session: TlsSession) -> Option<usize> {
     record_tail(payload, session).map(|tail| tail.more)
 }
@@ -715,6 +720,7 @@ pub fn truncated_handshake_prefix(payload: &[u8], session: TlsSession) -> Option
 
 struct RecordTail {
     start: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     more: usize,
 }
 
