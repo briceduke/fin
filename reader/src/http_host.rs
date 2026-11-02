@@ -42,7 +42,15 @@ const TOKEN: &[u8] = b"!#$%&\\:*+-.^_`|~";
 
 /// Parse Host from one TCP payload. `end_of_stream` is TCP FIN, matching
 /// tshark 4.6.9 `IS_TH_FIN` for a response with no Content-Length.
+#[cfg(test)]
 pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
+    parse_http_pending(payload, end_of_stream, false)
+}
+
+/// `sstp_pending` is a prior complete `SSTP_DUPLEX_POST` on this TCP
+/// conversation. tshark 4.6.9 then sets `try_desegment_body = false`
+/// for a 2xx, so complete headers are a complete response.
+pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> HttpParse {
     if payload.is_empty() {
         return HttpParse::Other;
     }
@@ -61,7 +69,8 @@ pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
     }
     let mut proved = HttpProved::default();
     while offset < payload.len() {
-        match take_message(&payload[offset..], end_of_stream) {
+        let sstp = sstp_pending || proved.sstp_duplex_post;
+        match take_message(&payload[offset..], end_of_stream, sstp) {
             Take::Done => break,
             Take::Complete {
                 hosts: found,
@@ -140,7 +149,7 @@ enum LineKind {
     Response { status: u16 },
 }
 
-fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
+fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take {
     if payload.is_empty() {
         return Take::Done;
     }
@@ -200,7 +209,16 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
             content_length = parse_content_length(value);
         }
     }
-    if transfer_encoding {
+    let sstp_2xx = matches!(
+        kind,
+        LineKind::Response { status } if sstp_pending && (200..300).contains(&status)
+    );
+    // tshark 4.6.9 `try_desegment_body = false` for 1xx / 204 / 304
+    // and for a 2xx to `SSTP_DUPLEX_POST`. Headers complete means the
+    // message is complete, including Transfer-Encoding.
+    let skip_body =
+        sstp_2xx || matches!(kind, LineKind::Response { status } if rfc_no_body(status));
+    if transfer_encoding && !skip_body {
         return Take::TransferEncoding;
     }
     let header_end = offset;
@@ -213,6 +231,10 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
         LineKind::Response { status } if rfc_no_body(status) => {
             content_length.map(|n| n.min(available)).unwrap_or(0)
         }
+        LineKind::Response { .. } if sstp_2xx => match (transfer_encoding, content_length) {
+            (false, Some(n)) => n.min(available),
+            _ => available,
+        },
         LineKind::Response { .. } => match content_length {
             Some(n) => n,
             None if end_of_stream => available,
@@ -981,5 +1003,82 @@ mod tests {
             assert_eq!(drop.hosts, ["st.example", "after.example"], "{status:?}");
             assert_eq!(drop.hosts_after_response, ["after.example"], "{status:?}");
         }
+    }
+
+    fn pending(payload: &[u8]) -> HttpProved {
+        match parse_http_pending(payload, false, true) {
+            HttpParse::Message(proved) => proved,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn sstp_pending_2xx_headers_are_a_complete_response() {
+        let bodies = [
+            b"HTTP/1.1 200 Connection Established\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 100\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: identity\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.0 200 Connection Established\r\n\r\n",
+            b"ICY 200 Connection Established\r\n\r\n",
+        ];
+        for payload in bodies {
+            assert_eq!(
+                parse_http(payload, false),
+                HttpParse::Unproved,
+                "{payload:?}"
+            );
+            let proved = pending(payload);
+            assert!(proved.status_200, "{payload:?}");
+            assert!(proved.has_final_response, "{payload:?}");
+            assert!(proved.hosts.is_empty(), "{payload:?}");
+        }
+        let cl0 = pending(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n");
+        assert!(cl0.status_200);
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+                false
+            ),
+            resp(&[], 200, false)
+        );
+    }
+
+    #[test]
+    fn sstp_pending_200_without_length_consumes_same_segment_leftover() {
+        let proved = pending(
+            b"HTTP/1.1 200 Connection Established\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert!(proved.status_200);
+        assert!(proved.hosts.is_empty());
+        assert!(!proved.leftover_after_response);
+        assert_eq!(proved.hosts_after_response, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn upgrade_101_with_transfer_encoding_still_switches() {
+        let proved = message(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nTransfer-Encoding: identity\r\n\r\n",
+        );
+        assert!(proved.switching_upgrade);
+        assert!(proved.has_response);
+        assert!(!proved.has_final_response);
+        let leftover = message(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nTransfer-Encoding: identity\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert!(leftover.switching_upgrade);
+        assert!(leftover.leftover_after_upgrade);
+        assert_eq!(leftover.hosts_after_response, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn same_segment_sstp_request_and_200_without_length_switches() {
+        let proved = message(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\nHTTP/1.1 200 Connection Established\r\n\r\nGET / HTTP/1.1\r\nHost: after.example\r\n\r\n",
+        );
+        assert_eq!(proved.hosts, ["sstp.example"]);
+        assert!(proved.sstp_duplex_post);
+        assert!(proved.status_200);
+        assert_eq!(proved.hosts_after_response, [] as [&str; 0]);
     }
 }

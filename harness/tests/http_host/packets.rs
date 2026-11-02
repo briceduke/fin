@@ -178,6 +178,20 @@ pub fn eth_ipv4_tcp_fin(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) ->
     )
 }
 
+pub fn eth_ipv6_tcp_to(
+    src: [u8; 16],
+    dst: [u8; 16],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    eth(
+        0x86dd,
+        &ipv6_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+    )
+}
+
 pub fn get(host: &str) -> Vec<u8> {
     let mut req = b"GET / HTTP/1.1\r\nHost: ".to_vec();
     req.extend_from_slice(host.as_bytes());

@@ -292,7 +292,25 @@ fn cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {
 }
 
 fn eth_ipv6_tcp(src: [u8; 16], dst: [u8; 16], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
-    eth(0x86dd, &ipv6_to(src, dst, 6, &tcp(sport, dport, payload)))
+    eth_ipv6_tcp_to(src, dst, sport, dport, 1, payload)
+}
+
+fn req_resp_get_ports(
+    sport: u16,
+    dport: u16,
+    req: &[u8],
+    resp: &[u8],
+    later: &[u8],
+) -> [Vec<u8>; 3] {
+    [
+        eth_ipv4_tcp_to(OUTER, PEER, sport, dport, 1, req),
+        eth_ipv4_tcp_to(PEER, OUTER, dport, sport, 1, resp),
+        eth_ipv4_tcp_to(OUTER, PEER, sport, dport, 1 + req.len() as u32, later),
+    ]
+}
+
+fn sstp_then(resp: &[u8]) -> [Vec<u8>; 3] {
+    req_resp_get(SSTP_REQ, resp, INNER_GET)
 }
 
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
@@ -1639,6 +1657,250 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                     50000,
                     b"HTTP/1.1 101 Switching Protocols\r\nHost: st.example\r\n\r\n",
                 )],
+            ),
+        ),
+        (
+            "sstp-200-no-cl",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_then(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+            ),
+        ),
+        (
+            "sstp-200-cl100",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_then(
+                    b"HTTP/1.1 200 Connection Established\r\nContent-Length: 100\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "sstp-200-te-identity",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_then(
+                    b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: identity\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "sstp-200-te-chunked",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_then(
+                    b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: chunked\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "sstp-icy-200",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_then(b"ICY 200 Connection Established\r\n\r\n"),
+            ),
+        ),
+        (
+            "sstp-http10-200",
+            pcap(
+                LINK_ETHERNET,
+                &sstp_then(b"HTTP/1.0 200 Connection Established\r\n\r\n"),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-dport-80",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get_ports(
+                    50000,
+                    80,
+                    SSTP_REQ,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-dport-8080",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get_ports(
+                    50000,
+                    8080,
+                    SSTP_REQ,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-dport-3128",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get_ports(
+                    50000,
+                    3128,
+                    SSTP_REQ,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-src-80",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get_ports(
+                    80,
+                    50000,
+                    SSTP_REQ,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-src-8080",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get_ports(
+                    8080,
+                    50000,
+                    SSTP_REQ,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-src-3128",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get_ports(
+                    3128,
+                    50000,
+                    SSTP_REQ,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "sstp-200-no-cl-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 1, SSTP_REQ),
+                    eth_ipv6_tcp_to(
+                        PEER_V6,
+                        OUTER_V6,
+                        80,
+                        50000,
+                        1,
+                        b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    ),
+                    eth_ipv6_tcp_to(
+                        OUTER_V6,
+                        PEER_V6,
+                        50000,
+                        80,
+                        1 + SSTP_REQ.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "sstp-200-fin-no-cl",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, SSTP_REQ),
+                    eth(
+                        0x0800,
+                        &ipv4_to(
+                            PEER,
+                            OUTER,
+                            6,
+                            &tcp_seq_flags(
+                                80,
+                                50000,
+                                1,
+                                0x19,
+                                b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                            ),
+                        ),
+                    ),
+                    eth_ipv4_tcp_to(
+                        OUTER,
+                        PEER,
+                        50000,
+                        80,
+                        1 + SSTP_REQ.len() as u32,
+                        INNER_GET,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "connect-200-no-cl-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "upgrade-101-te-identity-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nTransfer-Encoding: identity\r\n\r\n",
+                    INNER_GET,
+                ),
+            ),
+        ),
+        (
+            "same-seq-longer",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        80,
+                        1,
+                        b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "same-seq-partial-then-full",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &full[..20]),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, full),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-same-length-retransmit",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n"),
+                ],
             ),
         ),
         (
