@@ -45,11 +45,6 @@ pub struct ToolOutput {
     pub exit_code: i32,
 }
 
-/// Run tshark 4.6.9 with a fresh empty `WIRESHARK_CONFIG_DIR`.
-pub fn run_tshark(tshark: &Path, args: &[OsString]) -> Result<ToolOutput, RunError> {
-    TsharkSession::open(tshark)?.run(args)
-}
-
 /// A tshark 4.6.9 binary, version-checked once.
 pub struct TsharkSession {
     path: PathBuf,
