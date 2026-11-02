@@ -73,26 +73,6 @@ Each step is checked against the one before it.
 
 After HTTP, QUIC Initials are decrypted and read with the same ClientHello parser. The index, the Parquet export, and the desktop app follow.
 
-## Preliminary experiments
-
-These figures come from a throwaway prototype on 9 Oct 2026. They are not a product benchmark, and the prototype has been removed.
-
-| Query | Capture | tshark 4.6.9 | prototype |
-| --- | --- | ---: | ---: |
-| TLS server name | bigFlows.pcap, 368 MB, 791,615 packets | 7.87 s | 0.226 s |
-| `ip.src` | 1,000,000 Ethernet + IPv4 + UDP packets, 74 MB | 7.97 s | 0.056 s |
-| `ip.src` | 1,000,000 QinQ + IPv4 + UDP packets, 82 MB | 8.83 s | 0.057 s |
-
-TShark 4.6.9 (`v4.6.9-0-g2d548b197c75`). Intel Core i9-14900HX, 32 GB RAM, Windows 11. One warmup, then the median of three runs, so files were read from a warm cache. Stdout discarded. tshark was passed `-n`.
-
-The prototype's `ip.src` output matched tshark on both million-packet files. The TLS names matched too, including tshark's blank line for a retransmitted ClientHello.
-
-The prototype did not reassemble split TLS handshakes. The v1 reader prints the name on the in-order completing segment of one TLS record; out-of-order and multi-record stitches are counted. bigFlows.pcap is older traffic, where every handshake fits in one packet. Modern browsers often split them out of order, so those files will show counted misses.
-
-Inside tshark, the `ip.src` query costs about the same as printing the packet number. Disabling UDP, TCP, DNS, HTTP, TLS, and data dissection in tshark saves only 22%. The cost is tshark's per-packet engine itself.
-
-Notes: `study/mechanism.md`, `study/benchmark.md`, `study/spike.md`.
-
 ## ip.src, 13 Oct 2026
 
 Same machine and method as the table above. Release `fin`, stdout and stderr discarded, one warmup, median of three.
