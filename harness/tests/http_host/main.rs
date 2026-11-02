@@ -304,6 +304,13 @@ fn syn_then_inner(flags: u8, seq: u32, dport: u16) -> Vec<Vec<u8>> {
     ]
 }
 
+fn empty_syn_then_get(flags: u8, seq: u32, dport: u16) -> Vec<Vec<u8>> {
+    vec![
+        eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, dport, 0, flags, b""),
+        eth_ipv4_tcp_seq(OUTER, 50000, dport, seq, GET_A),
+    ]
+}
+
 fn truncated_suffix_then_inner(cut: &[u8]) -> Vec<Vec<u8>> {
     let mut mid = GET_A.to_vec();
     mid.extend_from_slice(cut);
@@ -3125,6 +3132,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(http2_cl24_cases())
     .chain(junk_header_cases())
     .chain(syn_nxtseq_cases())
+    .chain(empty_syn_nxtseq_cases())
     .chain(prefix_extend_desegment_cases())
     .chain(on_disk())
     .filter(|(_, bytes)| !bytes.is_empty())
@@ -3183,22 +3191,101 @@ fn syn_nxtseq_cases() -> Vec<(&'static str, Vec<u8>)> {
         ),
     ));
     out.push((
-        "empty-syn-then-get-seq-1",
-        pcap(
-            LINK_ETHERNET,
-            &[
-                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
-                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
-            ],
-        ),
-    ));
-    out.push((
         "get-fin-then-in-order-inner",
         pcap(
             LINK_ETHERNET,
             &[
                 eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1, 0x19, GET_A),
                 eth_ipv4_tcp_seq(OUTER, 50000, 80, 36, INNER_GET),
+            ],
+        ),
+    ));
+    out
+}
+
+fn empty_syn_nxtseq_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let flags = [
+        ("empty-syn", 0x02u8),
+        ("empty-syn-psh", 0x0a),
+        ("empty-syn-ack", 0x12),
+        ("empty-syn-fin", 0x03),
+    ];
+    let mut out = Vec::new();
+    for (tag, flags) in flags {
+        for seq in [0u32, 1, 2] {
+            out.push((
+                leak(format!("{tag}-then-get-seq-{seq}")),
+                pcap(LINK_ETHERNET, &empty_syn_then_get(flags, seq, 80)),
+            ));
+        }
+    }
+    out.push((
+        "empty-syn-then-psh-get-seq-0",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
+                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x08, GET_A),
+            ],
+        ),
+    ));
+    for seq in [0u32, 2] {
+        out.push((
+            leak(format!("empty-syn-then-get-seq-{seq}-ipv6")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to_flags(OUTER_V6, PEER_V6, 50000, 80, 0, 0x02, b""),
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, seq, GET_A),
+                ],
+            ),
+        ));
+        for dport in [8080u16, 3128] {
+            out.push((
+                leak(format!("empty-syn-then-get-seq-{seq}-{dport}")),
+                pcap(LINK_ETHERNET, &empty_syn_then_get(0x02, seq, dport)),
+            ));
+        }
+        out.push((
+            leak(format!("empty-syn-src80-then-get-seq-{seq}")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 80, 50000, 0, 0x02, b""),
+                    eth_ipv4_tcp_to(OUTER, PEER, 80, 50000, seq, GET_A),
+                ],
+            ),
+        ));
+        out.push((
+            leak(format!("empty-syn-isn-1000-then-get-{}", 1000 + seq)),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1000, 0x02, b""),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1000 + seq, GET_A),
+                ],
+            ),
+        ));
+        out.push((
+            leak(format!("empty-syn-3way-then-get-seq-{seq}")),
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
+                    eth_ipv4_tcp_to_flags(PEER, OUTER, 80, 50000, 0, 0x12, b""),
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1, 0x10, b""),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, seq, GET_A),
+                ],
+            ),
+        ));
+    }
+    out.push((
+        "empty-syn-isn-1000-then-get-1001",
+        pcap(
+            LINK_ETHERNET,
+            &[
+                eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1000, 0x02, b""),
+                eth_ipv4_tcp_seq(OUTER, 50000, 80, 1001, GET_A),
             ],
         ),
     ));

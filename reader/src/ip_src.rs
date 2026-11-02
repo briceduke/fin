@@ -695,10 +695,7 @@ impl Walk<'_> {
         let src = u16::from_be_bytes([bytes[0], bytes[1]]);
         let dst = u16::from_be_bytes([bytes[2], bytes[3]]);
         let data_off = (bytes[12] >> 4) as usize * 4;
-        if data_off < TCP_MIN {
-            return;
-        }
-        if bytes.len() <= data_off {
+        if data_off < TCP_MIN || bytes.len() < data_off {
             return;
         }
         let seq = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -706,6 +703,13 @@ impl Walk<'_> {
         let fin = flags & 0x01 != 0;
         let rst = flags & 0x04 != 0;
         self.tcp_syn = flags & 0x02 != 0;
+        if bytes.len() == data_off {
+            // Empty payload: SYN still consumes a sequence number.
+            if self.want_http && !rst && self.tcp_syn {
+                self.note_http_next(self.tcp_flow(src, dst), seq, 0);
+            }
+            return;
+        }
         let pick = self.tables.tcp(src, dst);
         let payload = &bytes[data_off..];
         if self.want_tls {
@@ -719,6 +723,15 @@ impl Walk<'_> {
         }
     }
 
+    fn tcp_flow(&self, sport: u16, dport: u16) -> Option<TcpFlow> {
+        Some(TcpFlow {
+            src: self.flow_src?,
+            dst: self.flow_dst?,
+            sport,
+            dport,
+        })
+    }
+
     fn http_from_tcp(
         &mut self,
         sport: u16,
@@ -728,15 +741,7 @@ impl Walk<'_> {
         pick: PortPick,
         payload: &[u8],
     ) {
-        let flow = match (self.flow_src, self.flow_dst) {
-            (Some(src), Some(dst)) => Some(TcpFlow {
-                src,
-                dst,
-                sport,
-                dport,
-            }),
-            _ => None,
-        };
+        let flow = self.tcp_flow(sport, dport);
         let key = flow.map(|flow| TcpSeq {
             src: flow.src,
             dst: flow.dst,
@@ -2736,14 +2741,67 @@ mod tests {
 
     #[test]
     fn http_empty_syn_then_get_at_seq_1_prints_host() {
-        let cells = walk_http_frames(&[
+        for (label, flags) in EMPTY_SYN_FLAGS {
+            let cells = empty_syn_then_get(flags, 1, 80, 0x18);
+            assert_eq!(cells[0].http_host, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, None, "{label}");
+            assert_eq!(cells[1].http_host, ["a.example"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+        let isn = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1001, GET_A),
+        ]);
+        assert_eq!(isn[0].http_host, [] as [&str; 0]);
+        assert_eq!(isn[0].counted, None);
+        assert_eq!(isn[1].http_host, ["a.example"]);
+        assert_eq!(isn[1].counted, None);
+        let handshake = walk_http_frames(&[
             eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
             eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
         ]);
-        assert_eq!(cells[0].http_host, [] as [&str; 0]);
-        assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["a.example"]);
-        assert_eq!(cells[1].counted, None);
+        assert_eq!(handshake[3].http_host, ["a.example"]);
+        assert_eq!(handshake[3].counted, None);
+    }
+
+    #[test]
+    fn http_empty_syn_then_get_not_at_nxtseq_is_not_http() {
+        for (label, flags) in EMPTY_SYN_FLAGS {
+            for seq in [0u32, 2] {
+                let cells = empty_syn_then_get(flags, seq, 80, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
+            }
+        }
+        for seq in [0u32, 2] {
+            let psh = empty_syn_then_get(0x02, seq, 80, 0x08);
+            assert_empty_syn_then_blank(&psh, &format!("psh-no-ack seq {seq}"));
+            let v6 = walk_http_frames(&[
+                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x02, b""),
+                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
+            for dport in [8080u16, 3128] {
+                let cells = empty_syn_then_get(0x02, seq, dport, 0x18);
+                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
+            }
+            let src80 = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x02, b""),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
+            let isn = walk_http_frames(&[
+                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, GET_A),
+            ]);
+            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+            let handshake = empty_syn_handshake_then_get(seq);
+            assert_eq!(handshake[0].http_host, [] as [&str; 0], "hs syn {seq}");
+            assert_eq!(handshake[0].counted, None, "hs syn {seq}");
+            assert_eq!(handshake[3].http_host, [] as [&str; 0], "hs get {seq}");
+            assert_eq!(handshake[3].counted, None, "hs get {seq}");
+        }
     }
 
     #[test]
@@ -3101,11 +3159,42 @@ mod tests {
         ("syn-psh-ack-fin", 0x1b),
     ];
 
+    const EMPTY_SYN_FLAGS: [(&str, u8); 5] = [
+        ("syn", 0x02),
+        ("syn-psh", 0x0a),
+        ("syn-ack", 0x12),
+        ("syn-fin", 0x03),
+        ("syn-psh-ack", 0x1a),
+    ];
+
     fn syn_http_then(flags: u8, seq: u32, dport: u16) -> Vec<Cell> {
         walk_http_frames(&[
             eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, GET_A),
             eth_ipv4_tcp_seq(CLIENT, 50000, dport, seq, INNER_GET),
         ])
+    }
+
+    fn empty_syn_then_get(flags: u8, seq: u32, dport: u16, get_flags: u8) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, 0, flags, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, dport, seq, get_flags, GET_A),
+        ])
+    }
+
+    fn empty_syn_handshake_then_get(seq: u32) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, GET_A),
+        ])
+    }
+
+    fn assert_empty_syn_then_blank(cells: &[Cell], label: &str) {
+        assert_eq!(cells[0].http_host, [] as [&str; 0], "{label} syn");
+        assert_eq!(cells[0].counted, None, "{label} syn");
+        assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} get");
+        assert_eq!(cells[1].counted, None, "{label} get");
     }
 
     fn truncated_suffix_then_in_order(cut: &[u8]) -> Vec<Cell> {
