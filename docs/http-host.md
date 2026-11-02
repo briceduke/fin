@@ -14,6 +14,7 @@ HTTP/1.x requests and responses over TCP on the snapshotted tshark 4.6.9 `tcp.po
 - An in-order retransmission of a TCP sequence already consumed prints an empty line.
 - A request without a Host header prints an empty line.
 - A 1xx, 204, or 304 response, or a response with Content-Length that fits, prints Host if present.
+- Content-Length is tshark 4.6.9 `g_ascii_strtoll` on the ENC_ASCII C string: leading `g_ascii_isspace` (including VT and FF) is skipped, and trailing NUL or `g_ascii_isspace` is accepted. A request that then still needs body bytes is counted.
 - A response with no Content-Length prints Host only when this segment has TCP FIN, matching `IS_TH_FIN`.
 - Two complete requests in one segment print both Hosts.
 - A CR ends a line the way tshark 4.6.9 `tvb_find_line_end` does. A complete line that is not `name:` stops adding headers; Host is proved only when a later blank line completes them, matching `http.desegment_headers`. A folded Host prints the first line's value.
@@ -33,7 +34,7 @@ These frames are counted when they look like HTTP that v1 does not prove, and le
 | HTTP/2 (`PRI * HTTP/2.0`, h2c upgrade) | Not HTTP/1.x. |
 | HTTP over TLS | tshark may decrypt (pcapng secrets) or follow HTTP inside TLS; v1 counts `http-over-tls` on snapshotted TLS ports. |
 | HTTP-like UDP (SSDP) | Not TCP. Counted `http-udp`. |
-| Inner HTTP in a tunnel this walker does not follow (sFlow, …) | Counted `http-tunnel`. |
+| Inner HTTP in a tunnel this walker does not follow (sFlow, SSTP after `SSTP_DUPLEX_POST`+200, 101 with `Upgrade`, …) | Counted `http-tunnel`. A 101 with no Upgrade, and CONNECT+200, stay HTTP. |
 | CONNECT tunnel after the request | The CONNECT request itself is proved; later bytes are counted. |
 | Out-of-order TCP | Counted. |
 

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
-use crate::http_host::{looks_like_http_heuristic, parse_http, HttpParse};
+use crate::http_host::{looks_like_http_heuristic, parse_http, HttpParse, HttpProved};
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake,
@@ -127,6 +127,10 @@ pub struct IpSrc {
     http_seen: HashSet<TcpSeq>,
     /// Heuristic `http_tcp` sticks the TCP conversation, matching tshark 4.6.9.
     http_claimed: HashSet<TcpFlow>,
+    /// `SSTP_DUPLEX_POST` waiting for a complete 200, matching packet-http.c.
+    http_sstp: HashSet<TcpFlow>,
+    /// Conversation switched off HTTP; later Hosts are counted `http-tunnel`.
+    http_tunnel: HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
     want_http: bool,
@@ -169,6 +173,8 @@ impl IpSrc {
             tls_ccs: HashMap::new(),
             http_seen: HashSet::new(),
             http_claimed: HashSet::new(),
+            http_sstp: HashSet::new(),
+            http_tunnel: HashSet::new(),
             want_ip: ip_src || (!tls_sni && !http_host),
             want_tls: tls_sni,
             want_http: http_host,
@@ -196,6 +202,8 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tls_ccs: &mut session.tls_ccs,
         http_seen: &mut session.http_seen,
         http_claimed: &mut session.http_claimed,
+        http_sstp: &mut session.http_sstp,
+        http_tunnel: &mut session.http_tunnel,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
         want_http: session.want_http,
@@ -226,6 +234,8 @@ struct Walk<'a> {
     tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
     http_seen: &'a mut HashSet<TcpSeq>,
     http_claimed: &'a mut HashSet<TcpFlow>,
+    http_sstp: &'a mut HashSet<TcpFlow>,
+    http_tunnel: &'a mut HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
     want_http: bool,
@@ -686,13 +696,25 @@ impl Walk<'_> {
                 return;
             }
         }
+        if let Some(flow) = flow {
+            if self.http_tunnel.contains(&flow.conversation()) {
+                if let Some(key) = key {
+                    self.http_seen.insert(key);
+                }
+                self.count("http-tunnel");
+                return;
+            }
+        }
         if pick.is_http() {
             match parse_http(payload, fin) {
-                HttpParse::Message(hosts) => {
+                HttpParse::Message(proved) => {
                     if let Some(key) = key {
                         self.http_seen.insert(key);
                     }
-                    self.http_host.extend(hosts);
+                    if let Some(flow) = flow {
+                        self.note_http_switch(flow, &proved);
+                    }
+                    self.http_host.extend(proved.hosts);
                 }
                 HttpParse::Partial(hosts) => {
                     if let Some(key) = key {
@@ -728,6 +750,25 @@ impl Walk<'_> {
                 self.http_seen.insert(key);
             }
             self.count("http-over-tls");
+        }
+    }
+
+    /// tshark 4.6.9 `packet-http.c` sets `next_handle` after a complete
+    /// `SSTP_DUPLEX_POST` + 200 or a 101 with `Upgrade`. Unwalked tunnels
+    /// are counted; CONNECT + 200 and a 101 with no Upgrade stay HTTP.
+    fn note_http_switch(&mut self, flow: TcpFlow, proved: &HttpProved) {
+        let conv = flow.conversation();
+        if proved.switching_upgrade {
+            self.http_tunnel.insert(conv);
+        }
+        if proved.status_200 && self.http_sstp.contains(&conv) {
+            self.http_tunnel.insert(conv);
+        }
+        if proved.has_response {
+            self.http_sstp.remove(&conv);
+        }
+        if proved.sstp_duplex_post {
+            self.http_sstp.insert(conv);
         }
     }
 
@@ -2242,6 +2283,135 @@ mod tests {
         let cell = walk_http(&eth);
         assert_eq!(cell.http_host, [] as [&str; 0]);
         assert_eq!(cell.counted, Some("http-udp"));
+    }
+
+    fn walk_http_frames(frames: &[Vec<u8>]) -> Vec<Cell> {
+        let mut session = IpSrc::fields(false, false, true);
+        frames
+            .iter()
+            .map(|captured| {
+                walk_ip_src(
+                    &Frame {
+                        link_type: ETHERNET,
+                        captured,
+                    },
+                    &mut session,
+                )
+            })
+            .collect()
+    }
+
+    fn http_req_resp_get(req: &[u8], resp: &[u8], later: &[u8]) -> Vec<Cell> {
+        walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, req),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, resp),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + req.len() as u32, later),
+        ])
+    }
+
+    #[test]
+    fn http_sstp_200_counts_a_later_get() {
+        let cells = http_req_resp_get(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["sstp.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_101_upgrade_counts_a_later_get() {
+        let later = b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n";
+        for proto in [b"websocket".as_slice(), b"h2c"] {
+            let mut req = b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: ".to_vec();
+            req.extend_from_slice(proto);
+            req.extend_from_slice(b"\r\nConnection: Upgrade\r\n\r\n");
+            let mut resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ".to_vec();
+            resp.extend_from_slice(proto);
+            resp.extend_from_slice(b"\r\nConnection: Upgrade\r\nHost: sw.example\r\n\r\n");
+            let cells = http_req_resp_get(&req, &resp, later);
+            assert_eq!(
+                cells[0].http_host,
+                ["ws.example"],
+                "{}",
+                proto.escape_ascii()
+            );
+            assert_eq!(cells[0].counted, None, "{}", proto.escape_ascii());
+            assert_eq!(
+                cells[1].http_host,
+                ["sw.example"],
+                "{}",
+                proto.escape_ascii()
+            );
+            assert_eq!(cells[1].counted, None, "{}", proto.escape_ascii());
+            assert_eq!(
+                cells[2].http_host,
+                [] as [&str; 0],
+                "{}",
+                proto.escape_ascii()
+            );
+            assert_eq!(
+                cells[2].counted,
+                Some("http-tunnel"),
+                "{}",
+                proto.escape_ascii()
+            );
+        }
+    }
+
+    #[test]
+    fn http_101_without_upgrade_still_prints_a_later_host() {
+        let cells = http_req_resp_get(
+            b"GET /chat HTTP/1.1\r\nHost: ws.example\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nHost: sw.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["ws.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["sw.example"]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, ["after-upgrade.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_connect_200_still_prints_a_later_host() {
+        let cells = http_req_resp_get(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n",
+        );
+        assert_eq!(cells[0].http_host, ["example.com:443"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, ["after-connect.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_content_length_vt_ff_and_nul_are_counted_without_a_body() {
+        let headers = [
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0c4\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x0c\r\n\r\n",
+        ];
+        for payload in headers {
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, payload));
+            assert_eq!(cell.http_host, [] as [&str; 0], "{payload:?}");
+            assert_eq!(cell.counted, Some("http"), "{payload:?}");
+            let mut with_body = payload.to_vec();
+            with_body.extend_from_slice(b"body");
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
+            assert_eq!(cell.http_host, ["cllead.example"], "{payload:?}");
+            assert_eq!(cell.counted, None, "{payload:?}");
+        }
     }
 
     #[test]

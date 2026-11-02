@@ -251,6 +251,14 @@ fn fuzz_mutated_http_matches_tshark_469() {
     );
 }
 
+fn req_resp_get(req: &[u8], resp: &[u8], later: &[u8]) -> [Vec<u8>; 3] {
+    [
+        eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, req),
+        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, resp),
+        eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1 + req.len() as u32, later),
+    ]
+}
+
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
     let req = get("www.example.com");
     let vlan_frame = vlan(0x0800, &ipv4(OUTER, 6, &tcp(50000, 80, &req)));
@@ -654,6 +662,169 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                     eth_ipv4_tcp(OUTER, 50000, 80, b"GET / HTTP/1.1\r\n"),
                     eth_ipv4_tcp(OUTER, 50000, 80, b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n"),
                 ],
+            ),
+        ),
+        (
+            "sstp-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+                    b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+                    b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "upgrade-websocket-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nHost: sw.example\r\n\r\n",
+                    b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "upgrade-h2c-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"GET /chat HTTP/1.1\r\nHost: ws.example\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nHost: sw.example\r\n\r\n",
+                    b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "101-no-upgrade-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"GET /chat HTTP/1.1\r\nHost: ws.example\r\n\r\n",
+                    b"HTTP/1.1 101 Switching Protocols\r\nHost: sw.example\r\n\r\n",
+                    b"GET / HTTP/1.1\r\nHost: after-upgrade.example\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "connect-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(
+                    b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+                    b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+                    b"GET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n",
+                ),
+            ),
+        ),
+        (
+            "content-length-lead-vt",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "content-length-lead-ff",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0c4\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-nul",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-ff",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x0c\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "content-length-four-byte-body",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\r\n\r\nbody",
+                )],
+            ),
+        ),
+        (
+            "content-length-lead-vt-body",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\nbody",
+                )],
+            ),
+        ),
+        (
+            "content-length-lead-ff-body",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0c4\r\n\r\nbody",
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-nul-body",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\nbody",
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-ff-body",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x0c\r\n\r\nbody",
+                )],
             ),
         ),
     ]

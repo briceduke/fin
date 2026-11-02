@@ -5,7 +5,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpParse {
     /// Complete HTTP/1.x message(s) whose Host values follow tshark field order.
-    Message(Vec<String>),
+    Message(HttpProved),
     /// Hosts from complete messages before a Transfer-Encoding message
     /// this reader does not parse. Counted; values are a subset.
     Partial(Vec<String>),
@@ -13,6 +13,20 @@ pub enum HttpParse {
     Unproved,
     /// Not HTTP/1.x on this payload start.
     Other,
+}
+
+/// Hosts from complete one-segment messages, plus tshark 4.6.9 tunnel switches.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpProved {
+    pub hosts: Vec<String>,
+    /// Complete `SSTP_DUPLEX_POST` request in this payload.
+    pub sstp_duplex_post: bool,
+    /// Complete 200 response in this payload.
+    pub status_200: bool,
+    /// Complete response of any status in this payload.
+    pub has_response: bool,
+    /// Complete 101 response that listed `Upgrade`.
+    pub switching_upgrade: bool,
 }
 
 const TOKEN: &[u8] = b"!#$%&\\:*+-.^_`|~";
@@ -39,22 +53,40 @@ pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
     if classify_line(first).is_none() {
         return HttpParse::Other;
     }
-    let mut hosts = Vec::new();
+    let mut proved = HttpProved::default();
     while offset < payload.len() {
         match take_message(&payload[offset..], end_of_stream) {
             Take::Done => break,
-            Take::Complete { hosts: found, next } => {
-                hosts.extend(found);
+            Take::Complete {
+                hosts: found,
+                next,
+                sstp_duplex_post,
+                status,
+                upgrade,
+            } => {
+                proved.hosts.extend(found);
+                if sstp_duplex_post {
+                    proved.sstp_duplex_post = true;
+                }
+                if let Some(status) = status {
+                    proved.has_response = true;
+                    if status == 200 {
+                        proved.status_200 = true;
+                    }
+                    if status == 101 && upgrade {
+                        proved.switching_upgrade = true;
+                    }
+                }
                 offset += next;
             }
-            Take::Incomplete if hosts.is_empty() => return HttpParse::Unproved,
-            Take::Incomplete => return HttpParse::Message(hosts),
-            Take::TransferEncoding if hosts.is_empty() => return HttpParse::Unproved,
-            Take::TransferEncoding => return HttpParse::Partial(hosts),
+            Take::Incomplete if proved.hosts.is_empty() => return HttpParse::Unproved,
+            Take::Incomplete => return HttpParse::Message(proved),
+            Take::TransferEncoding if proved.hosts.is_empty() => return HttpParse::Unproved,
+            Take::TransferEncoding => return HttpParse::Partial(proved.hosts),
             Take::Other => break,
         }
     }
-    HttpParse::Message(hosts)
+    HttpParse::Message(proved)
 }
 
 /// tshark 4.6.9 `dissect_http_heur_tcp`: a CRLF line that starts or ends
@@ -72,7 +104,13 @@ pub fn looks_like_http_heuristic(payload: &[u8]) -> bool {
 }
 
 enum Take {
-    Complete { hosts: Vec<String>, next: usize },
+    Complete {
+        hosts: Vec<String>,
+        next: usize,
+        sstp_duplex_post: bool,
+        status: Option<u16>,
+        upgrade: bool,
+    },
     Incomplete,
     TransferEncoding,
     Other,
@@ -80,7 +118,7 @@ enum Take {
 }
 
 enum LineKind {
-    Request,
+    Request { sstp_duplex_post: bool },
     Response { status: u16 },
 }
 
@@ -98,6 +136,7 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
     let mut hosts = Vec::new();
     let mut content_length = None;
     let mut transfer_encoding = false;
+    let mut upgrade = false;
     let mut ignore_headers = false;
     loop {
         let Some((line, next)) = take_line(&payload[offset..]) else {
@@ -132,6 +171,8 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
             hosts.push(ascii_field(value));
         } else if eq_ignore_ascii_case(name, b"Transfer-Encoding") {
             transfer_encoding = true;
+        } else if eq_ignore_ascii_case(name, b"Upgrade") {
+            upgrade = true;
         } else if eq_ignore_ascii_case(name, b"Content-Length") {
             content_length = parse_content_length(value);
         }
@@ -141,7 +182,7 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
     }
     let header_end = offset;
     let body_need = match kind {
-        LineKind::Request => content_length.unwrap_or(0),
+        LineKind::Request { .. } => content_length.unwrap_or(0),
         LineKind::Response { status }
             if (100..200).contains(&status) || status == 204 || status == 304 =>
         {
@@ -160,6 +201,17 @@ fn take_message(payload: &[u8], end_of_stream: bool) -> Take {
     Take::Complete {
         hosts,
         next: header_end + body_need as usize,
+        sstp_duplex_post: matches!(
+            kind,
+            LineKind::Request {
+                sstp_duplex_post: true
+            }
+        ),
+        status: match kind {
+            LineKind::Response { status } => Some(status),
+            LineKind::Request { .. } => None,
+        },
+        upgrade,
     }
 }
 
@@ -199,7 +251,9 @@ fn classify_line(line: &[u8]) -> Option<LineKind> {
     }
     let method_len = data.iter().position(|b| *b == b' ').unwrap_or(data.len());
     if is_request_method(&data[..method_len]) {
-        Some(LineKind::Request)
+        Some(LineKind::Request {
+            sstp_duplex_post: data[..method_len] == b"SSTP_DUPLEX_POST"[..],
+        })
     } else {
         None
     }
@@ -282,9 +336,14 @@ fn valid_header_name(name: &[u8]) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || TOKEN.contains(b))
 }
 
+/// tshark 4.6.9 `HDR_CONTENT_LENGTH`: `g_ascii_strtoll` on the ENC_ASCII
+/// C string. Leading `g_ascii_isspace` is skipped; after the digits, NUL
+/// or `g_ascii_isspace` is accepted.
 fn parse_content_length(value: &[u8]) -> Option<u64> {
+    let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+    let value = &value[..end];
     let mut i = 0;
-    while i < value.len() && (value[i] == b' ' || value[i] == b'\t') {
+    while i < value.len() && ascii_isspace(value[i]) {
         i += 1;
     }
     if i < value.len() && value[i] == b'+' {
@@ -298,17 +357,19 @@ fn parse_content_length(value: &[u8]) -> Option<u64> {
         n = n.checked_mul(10)?.checked_add(i64::from(value[i] - b'0'))?;
         i += 1;
     }
-    while i < value.len() {
-        if value[i] != b' ' && value[i] != b'\t' {
-            return None;
-        }
-        i += 1;
+    if i < value.len() && !ascii_isspace(value[i]) {
+        return None;
     }
     if n < 0 {
         None
     } else {
         Some(n as u64)
     }
+}
+
+/// GLib `g_ascii_isspace`: SP, HT, LF, VT, FF, CR.
+fn ascii_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
 /// tshark 4.6.9 `tvb_get_string_enc(..., ENC_ASCII)` then a C string:
@@ -339,7 +400,20 @@ mod tests {
     use super::*;
 
     fn msg(hosts: &[&str]) -> HttpParse {
-        HttpParse::Message(hosts.iter().map(|h| (*h).to_string()).collect())
+        HttpParse::Message(HttpProved {
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            ..HttpProved::default()
+        })
+    }
+
+    fn resp(hosts: &[&str], status_200: bool, switching_upgrade: bool) -> HttpParse {
+        HttpParse::Message(HttpProved {
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            status_200,
+            has_response: true,
+            switching_upgrade,
+            ..HttpProved::default()
+        })
     }
 
     #[test]
@@ -453,7 +527,7 @@ mod tests {
     fn response_204_prints_host() {
         assert_eq!(
             parse_http(b"HTTP/1.1 204 No Content\r\nHost: x\r\n\r\n", false),
-            msg(&["x"])
+            resp(&["x"], false, false)
         );
     }
 
@@ -465,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             parse_http(b"HTTP/1.1 200 OK\r\nHost: x\r\n\r\nhello", true),
-            msg(&["x"])
+            resp(&["x"], true, false)
         );
     }
 
@@ -565,7 +639,7 @@ mod tests {
     fn icy_is_a_response() {
         assert_eq!(
             parse_http(b"ICY 200 OK\r\nHost: icy.example\r\n\r\n", true),
-            msg(&["icy.example"])
+            resp(&["icy.example"], true, false)
         );
     }
 
@@ -592,6 +666,68 @@ mod tests {
                 false
             ),
             msg(&["z", "y"])
+        );
+    }
+
+    #[test]
+    fn content_length_vt_ff_and_trailing_nul_need_the_body() {
+        let headers = [
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0c4\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x0c\r\n\r\n",
+        ];
+        for payload in headers {
+            assert_eq!(
+                parse_http(payload, false),
+                HttpParse::Unproved,
+                "{payload:?}"
+            );
+            let mut with_body = payload.to_vec();
+            with_body.extend_from_slice(b"body");
+            assert_eq!(
+                parse_http(&with_body, false),
+                msg(&["cllead.example"]),
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sstp_duplex_post_sets_the_switch_flag() {
+        let HttpParse::Message(proved) = parse_http(
+            b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n",
+            false,
+        ) else {
+            panic!("expected a proved SSTP request");
+        };
+        assert_eq!(proved.hosts, ["sstp.example"]);
+        assert!(proved.sstp_duplex_post);
+        assert!(!proved.has_response);
+    }
+
+    #[test]
+    fn switching_101_with_upgrade_sets_the_flag() {
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nHost: sw.example\r\n\r\n",
+                false
+            ),
+            resp(&["sw.example"], false, true)
+        );
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nHost: sw.example\r\n\r\n",
+                false
+            ),
+            resp(&["sw.example"], false, true)
+        );
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 101 Switching Protocols\r\nHost: sw.example\r\n\r\n",
+                false
+            ),
+            resp(&["sw.example"], false, false)
         );
     }
 }
