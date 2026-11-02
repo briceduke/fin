@@ -73,20 +73,9 @@ Each step is checked against the one before it.
 
 After HTTP, QUIC Initials are decrypted and read with the same ClientHello parser. The index, the Parquet export, and the desktop app follow.
 
-## ip.src, 13 Oct 2026
-
-Same machine and method as the table above. Release `fin`, stdout and stderr discarded, one warmup, median of three.
-
-| Query | Capture | tshark 4.6.9 | fin |
-| --- | --- | ---: | ---: |
-| `ip.src` | 1,000,000 Ethernet + IPv4 + UDP, 74 MB | 7.55 s | 1.01 s |
-| `ip.src` | 1,000,000 QinQ + IPv4 + UDP, 82 MB | 8.59 s | 1.02 s |
-
-Counted-frame rate on real files: 0% on the 10-packet public VXLAN sample, 63% on challenge01 (1,670 packets), 59% on bigFlows (791,615 packets). Most of those counts are TCP payloads whose port dissector may reject (HTTP, TLS) or can reach IP. The walker does not model those accept paths yet.
-
 ## Frame walk, 10 Oct 2026
 
-Same machine and method as the table above. The file is the million-packet Ethernet capture. tshark printed `frame.number`. fin walked frames and did not extract a field.
+Intel Core i9-14900HX, 32 GB RAM, Windows 11. One warmup, then the median of three runs, so files were read from a warm cache. Stdout discarded. tshark was passed `-n`. The file is the million-packet Ethernet capture. tshark printed `frame.number`. fin walked frames and did not extract a field.
 
 | Walk | Time |
 | --- | ---: |
