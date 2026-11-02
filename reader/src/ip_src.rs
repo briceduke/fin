@@ -3641,6 +3641,75 @@ mod tests {
         assert_eq!(cell.counted, None);
     }
 
+    fn http_after_junk(start: &[u8], rest: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nnot-a-header\r\n");
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    #[test]
+    fn http_no_colon_later_content_length_and_chunked_are_counted() {
+        let extras = [
+            http_after_junk(
+                b"POST / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            http_after_junk(b"GET / HTTP/1.1", b"Content-Length: 4\r\n\r\n"),
+            http_after_junk(b"POST / HTTP/1.1", b"junk2\r\nContent-Length: 50\r\n\r\n"),
+            b"POST / HTTP/1.1\r\nHost: a.example\r\n extra\r\nContent-Length: 50\r\n\r\n".to_vec(),
+            http_after_junk(
+                b"NOTIFY / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            http_after_junk(
+                b"OPTIONS / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            http_after_junk(b"POST / HTTP/1.1", b"Transfer-Encoding: chunked\r\n\r\n"),
+            http_after_junk(b"POST / HTTP/1.1", b"Transfer-Encoding: chunked\r\n\r\n1"),
+        ];
+        for payload in extras {
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &payload));
+            assert_eq!(
+                cell.http_host,
+                [] as [&str; 0],
+                "{}",
+                payload.escape_ascii()
+            );
+            assert_eq!(cell.counted, Some("http"), "{}", payload.escape_ascii());
+        }
+        let mut complete = http_after_junk(
+            b"POST / HTTP/1.1",
+            b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        );
+        complete.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &complete));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let mut with_body = http_after_junk(b"POST / HTTP/1.1", b"Content-Length: 4\r\n\r\nxxxx");
+        with_body.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &http_after_junk(
+                b"HTTP/1.1 204 No Content",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let mut fin = http_after_junk(b"POST / HTTP/1.1", b"Content-Length: 100\r\n\r\n");
+        fin.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp_fin(CLIENT, 50000, 80, &fin));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
     #[test]
     fn http_content_length_trailing_vt_leftover_is_continuation() {
         let mut payload =

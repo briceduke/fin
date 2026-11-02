@@ -251,13 +251,15 @@ fn take_message(
             // tshark 4.6.9 `dissect_http_message` breaks when `memchr`
             // finds no colon; offset stays on this line. Leftover
             // starting here is Continuation. `req_resp_hdrs_do_reassembly`
-            // still uses a later blank as the header terminator, and
-            // when `try_desegment_body` is true waits for Content-Length
-            // bytes *after* that blank before Host is emitted.
-            let Some(after) = after_blank_line(&payload[offset + next..]) else {
+            // still walks until the later blank and honors a
+            // Content-Length or `Transfer-Encoding: chunked` after this
+            // junk line. Until those body bytes exist, Host is not
+            // emitted.
+            let Some(reasm) = header_reassembly_after(&payload[offset + next..], content_length)
+            else {
                 return Take::Incomplete;
             };
-            after_no_colon_blank = Some(after);
+            after_no_colon_blank = Some(reasm);
             break;
         };
         offset += next;
@@ -296,11 +298,15 @@ fn take_message(
     if transfer_encoding && !skip_body {
         return Take::TransferEncoding;
     }
-    if let Some(after_blank) = after_no_colon_blank {
+    if let Some(reasm) = after_no_colon_blank {
         let try_desegment_body = !end_of_stream && !skip_body;
         if try_desegment_body {
-            if let Some(n) = content_length {
-                if (after_blank.len() as u64) < n {
+            if reasm.chunked {
+                if !chunked_body_complete(reasm.after_blank) {
+                    return Take::Incomplete;
+                }
+            } else if let Some(n) = reasm.content_length {
+                if (reasm.after_blank.len() as u64) < n {
                     return Take::Incomplete;
                 }
             }
@@ -371,17 +377,111 @@ fn take_message(
     }
 }
 
-/// Bytes after the first blank line (`linelen == 0`), matching tshark
-/// 4.6.9 `req_resp_hdrs_do_reassembly`. `None` when no blank is present.
-fn after_blank_line(bytes: &[u8]) -> Option<&[u8]> {
+/// Headers after a no-colon line, through the later blank, matching
+/// tshark 4.6.9 `req_resp_hdrs_do_reassembly`. `None` when no blank is
+/// present.
+struct HeaderReassembly<'a> {
+    after_blank: &'a [u8],
+    content_length: Option<u64>,
+    chunked: bool,
+}
+
+fn header_reassembly_after(
+    bytes: &[u8],
+    mut content_length: Option<u64>,
+) -> Option<HeaderReassembly<'_>> {
     let mut offset = 0;
+    let mut chunked = false;
     while let Some((line, next)) = take_line(&bytes[offset..]) {
         if line.is_empty() {
-            return Some(&bytes[offset + next..]);
+            return Some(HeaderReassembly {
+                after_blank: &bytes[offset + next..],
+                content_length,
+                chunked,
+            });
         }
+        note_reassembly_header(line, &mut content_length, &mut chunked);
         offset += next;
     }
     None
+}
+
+/// tshark 4.6.9 first-byte C/T lines: `Content-Length:` and
+/// `Transfer-Encoding: chunked`.
+fn note_reassembly_header(line: &[u8], content_length: &mut Option<u64>, chunked: &mut bool) {
+    if let Some(value) = line_prefix(line, b"Content-Length:") {
+        if let Some(n) = parse_content_length(value) {
+            *content_length = Some(n);
+        }
+    } else if let Some(value) = line_prefix(line, b"Transfer-Encoding:") {
+        let mut rest = value;
+        while matches!(rest.first().copied(), Some(b' ' | b'\t')) {
+            rest = &rest[1..];
+        }
+        if starts_with_ignore_ascii_case(rest, b"chunked") {
+            *chunked = true;
+        }
+    }
+}
+
+fn line_prefix<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if starts_with_ignore_ascii_case(line, prefix) {
+        Some(&line[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// tshark 4.6.9 `req_resp_hdrs_do_reassembly` chunked loop. `false`
+/// waits for more bytes. `true` is a last chunk, or a size parse that
+/// gave up.
+fn chunked_body_complete(bytes: &[u8]) -> bool {
+    let mut offset = 0;
+    loop {
+        let Some((line, next)) = take_line(&bytes[offset..]) else {
+            return false;
+        };
+        let Some(size) = parse_chunk_size(line) else {
+            return true;
+        };
+        if size > 1u32 << 31 {
+            return true;
+        }
+        let data = offset + next;
+        if size == 0 {
+            return take_line(&bytes[data..]).is_some();
+        }
+        let remaining = bytes.len().saturating_sub(data);
+        if remaining <= size as usize {
+            return false;
+        }
+        offset = data + size as usize + 2;
+        if offset > bytes.len() {
+            return false;
+        }
+    }
+}
+
+fn parse_chunk_size(line: &[u8]) -> Option<u32> {
+    let end = line
+        .iter()
+        .position(|b| matches!(*b, b';' | b' ' | b'\t'))
+        .unwrap_or(line.len());
+    let hex = &line[..end];
+    if hex.is_empty() {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &b in hex {
+        let digit = match b {
+            b'0'..=b'9' => u32::from(b - b'0'),
+            b'a'..=b'f' => u32::from(b - b'a' + 10),
+            b'A'..=b'F' => u32::from(b - b'A' + 10),
+            _ => return None,
+        };
+        n = n.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(n)
 }
 
 fn take_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
@@ -1195,6 +1295,121 @@ mod tests {
         let HttpParse::Message(proved) = parse_http(&junk_cl4(b"HTTP/1.1 200 OK", b"xxxx"), true)
         else {
             panic!("expected a proved 200 on TCP FIN");
+        };
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(!proved.desegment);
+    }
+
+    fn after_junk(start: &[u8], rest: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nnot-a-header\r\n");
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    #[test]
+    fn no_colon_later_content_length_waits_for_the_body() {
+        let extras: [(&[u8], &[u8]); 6] = [
+            (
+                b"POST / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            (b"GET / HTTP/1.1", b"Content-Length: 4\r\n\r\n"),
+            (b"POST / HTTP/1.1", b"junk2\r\nContent-Length: 50\r\n\r\n"),
+            (
+                b"NOTIFY / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            (
+                b"OPTIONS / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            (
+                b"HTTP/1.1 200 OK",
+                b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ];
+        for (start, rest) in extras {
+            assert_eq!(
+                parse_http(&after_junk(start, rest), false),
+                HttpParse::Unproved,
+                "{}",
+                start.escape_ascii()
+            );
+        }
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: a.example\r\n extra\r\nContent-Length: 50\r\n\r\n",
+                false
+            ),
+            HttpParse::Unproved
+        );
+    }
+
+    #[test]
+    fn no_colon_later_content_length_body_prints_the_first_host() {
+        first_host_without_inner(
+            &after_junk(b"POST / HTTP/1.1", b"Content-Length: 4\r\n\r\nxxxx"),
+            "a.example",
+        );
+        first_host_without_inner(
+            &leftover_after(&after_junk(
+                b"POST / HTTP/1.1",
+                b"Content-Length: 4\r\n\r\nxxxx",
+            )),
+            "a.example",
+        );
+    }
+
+    #[test]
+    fn no_colon_later_chunked_waits_until_the_last_chunk() {
+        assert_eq!(
+            parse_http(
+                &after_junk(b"POST / HTTP/1.1", b"Transfer-Encoding: chunked\r\n\r\n"),
+                false
+            ),
+            HttpParse::Unproved
+        );
+        assert_eq!(
+            parse_http(
+                &after_junk(b"POST / HTTP/1.1", b"Transfer-Encoding: chunked\r\n\r\n1"),
+                false
+            ),
+            HttpParse::Unproved
+        );
+        first_host_without_inner(
+            &leftover_after(&after_junk(
+                b"POST / HTTP/1.1",
+                b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            )),
+            "a.example",
+        );
+    }
+
+    #[test]
+    fn no_colon_204_and_fin_skip_later_cl_and_chunked() {
+        first_host_without_inner(
+            &leftover_after(&after_junk(
+                b"HTTP/1.1 204 No Content",
+                b"Content-Length: 100\r\n\r\n",
+            )),
+            "a.example",
+        );
+        first_host_without_inner(
+            &after_junk(
+                b"HTTP/1.1 204 No Content",
+                b"Transfer-Encoding: chunked\r\n\r\n",
+            ),
+            "a.example",
+        );
+        let HttpParse::Message(proved) = parse_http(
+            &leftover_after(&after_junk(
+                b"POST / HTTP/1.1",
+                b"Content-Length: 100\r\n\r\n",
+            )),
+            true,
+        ) else {
+            panic!("expected a proved POST on TCP FIN");
         };
         assert_eq!(proved.hosts, ["a.example"]);
         assert!(!proved.desegment);

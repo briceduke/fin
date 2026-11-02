@@ -3117,6 +3117,128 @@ fn junk_header_cases() -> Vec<(&'static str, Vec<u8>)> {
                 )],
             ),
         ),
+        (
+            "junk-later-cl100-post-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 100\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-later-cl4-get-nobody",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 4\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "junk-two-lines-later-cl50",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\njunk2\r\nContent-Length: 50\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "junk-obs-fold-later-cl50",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: a.example\r\n extra\r\nContent-Length: 50\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "junk-later-cl100-notify-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 100\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-later-cl100-options-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"OPTIONS / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 100\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-later-chunked",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "junk-later-chunked-leftover-1",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nTransfer-Encoding: chunked\r\n\r\n1",
+                )],
+            ),
+        ),
+        (
+            "junk-later-chunked-0-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-later-cl4-body-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 4\r\n\r\nxxxx",
+            ),
+        ),
+        (
+            "junk-later-cl100-204-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 100\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-later-cl100-post-fin",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_fin(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_then_inner(
+                        b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 100\r\n\r\n",
+                    ),
+                )],
+            ),
+        ),
     ]
 }
 
