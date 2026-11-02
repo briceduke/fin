@@ -93,6 +93,7 @@ pub struct TlsOutcome {
 
 /// Parse SNI from one TCP payload on an unnamed port. The first record must
 /// pass tshark 4.6.9 `is_sslv3_or_tls`.
+#[cfg(test)]
 pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
     parse_tls(payload, TlsSession::Unknown, true).kind
 }
@@ -101,17 +102,19 @@ pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
 /// session uses `ssl_looks_like_sslv3`; after an authoritative SSLv3/TLS 1.0–1.2
 /// or TLCP record, later records follow `dissect_ssl3_record`. TLS 1.3 stays
 /// on the default arm.
+#[cfg(test)]
 pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
     parse_tls(payload, TlsSession::Unknown, false).kind
 }
 
 /// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate. `session` is
 /// `SslSession.version`: unknown, sticky pre-1.3, or TLS 1.3.
+#[cfg(test)]
 pub fn parse_tls(payload: &[u8], session: TlsSession, heuristic: bool) -> TlsOutcome {
     parse_tls_after_ccs(payload, session, heuristic, false)
 }
 
-/// Like [`parse_tls`], with this packet's `ssl_packet_from_server` CCS
+/// Like `parse_tls`, with this packet's `ssl_packet_from_server` CCS
 /// frame already set from an earlier packet (`pinfo->num > ccs_frame`).
 pub fn parse_tls_after_ccs(
     payload: &[u8],
@@ -685,25 +688,6 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
     length != 0 && length < TLS_MAX_RECORD
 }
 
-/// Bytes still needed to finish a TLS record that starts in `payload`.
-///
-/// tshark 4.6.9 `dissect_ssl3_record` desegments any incomplete record
-/// (CCS/alert/handshake/app-data/heartbeat). A complete record whose handshake
-/// is shorter than 4 bytes, or whose u24 length overruns, is also buffered.
-/// The next in-order payload on that flow is continuation, not a new
-/// ClientHello.
-pub fn truncated_handshake_need(payload: &[u8]) -> Option<usize> {
-    truncated_handshake_need_known(payload, TlsSession::Unknown)
-}
-
-/// Like [`truncated_handshake_need`], but a sticky session accepts any record
-/// version the way `dissect_ssl3_record` does. Complete records, including
-/// length-0 CCS/alert/app-data/heartbeat, are skipped so a following truncated
-/// record is buffered, matching tshark 4.6.9 `dissect_ssl`.
-pub fn truncated_handshake_need_known(payload: &[u8], session: TlsSession) -> Option<usize> {
-    record_tail(payload, session).map(|tail| tail.more)
-}
-
 /// Bytes of `payload` from the incomplete record onward.
 ///
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
@@ -715,7 +699,6 @@ pub fn truncated_handshake_prefix(payload: &[u8], session: TlsSession) -> Option
 
 struct RecordTail {
     start: usize,
-    more: usize,
 }
 
 fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
@@ -727,10 +710,7 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
             // sticky arm and the SSL_VER_UNKNOWN default arm, before any
             // content-type or ssl_looks_like_sslv3 check. The next in-order
             // segment is Continuation Data.
-            return Some(RecordTail {
-                start: offset,
-                more: RECORD_HEADER - rest.len(),
-            });
+            return Some(RecordTail { start: offset });
         }
         let (content, version, length) = tls_record_header(rest)?;
         if !session.skips_looks_like() && !is_record_version(version) {
@@ -742,10 +722,7 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
             // record after a valid content type, including u16 length
             // 18432–65535. ssl_check_record_length runs only after the
             // full record is assembled, and is expert-info only.
-            return Some(RecordTail {
-                start: offset,
-                more: need - rest.len(),
-            });
+            return Some(RecordTail { start: offset });
         }
         if length == 0 {
             apply_session_version(&mut session, content, version, None);
@@ -760,13 +737,8 @@ fn record_tail(payload: &[u8], mut session: TlsSession) -> Option<RecordTail> {
         let body = &rest[RECORD_HEADER..need];
         let encrypted =
             content == CONTENT_HANDSHAKE && is_encrypted_handshake_message(body, false).hides();
-        if content == CONTENT_HANDSHAKE && !encrypted {
-            if let Some(more) = handshake_need(body) {
-                return Some(RecordTail {
-                    start: offset,
-                    more,
-                });
-            }
+        if content == CONTENT_HANDSHAKE && !encrypted && handshake_need(body).is_some() {
+            return Some(RecordTail { start: offset });
         }
         apply_session_version(
             &mut session,
