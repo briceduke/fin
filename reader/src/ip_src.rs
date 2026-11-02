@@ -121,11 +121,11 @@ struct HttpSeen {
 
 /// A later TCP segment versus bytes already walked on that direction.
 enum HttpOverlap {
-    /// In-order or a gap; dissect this payload as a new HTTP start.
+    /// In-order at nxtseq; dissect this payload as a new HTTP start.
     Fresh,
-    /// Retransmission, replacement, or overlap of consumed seq; no Host.
+    /// Retransmission, fully-contained overlap, or a gap after nxtseq.
     Skip,
-    /// Prefix-extends a completed seq; dissect only the new suffix.
+    /// Extends past nxtseq; dissect only the new suffix.
     Suffix(usize),
     /// Prefix-extends a still-open seq; re-parse the full payload.
     OpenComplete { already: usize },
@@ -742,7 +742,6 @@ impl Walk<'_> {
         });
         let overlap = self.http_overlap(flow, key, seq, payload);
         if matches!(overlap, HttpOverlap::Skip) {
-            self.note_http_next(flow, seq, payload.len() as u32);
             return;
         }
         let (body, skip_hosts, other_is_continuation) = match overlap {
@@ -820,7 +819,10 @@ impl Walk<'_> {
                     self.count("http");
                 }
                 HttpParse::Unproved if other_is_continuation => {
-                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                    let already = key
+                        .and_then(|key| self.http_seen.get(&key).map(|prev| prev.hosts))
+                        .unwrap_or(skip_hosts);
+                    self.note_http_seen(flow, key, seq, payload, true, already.max(skip_hosts));
                 }
                 HttpParse::Unproved => {
                     self.note_http_seen(flow, key, seq, payload, true, skip_hosts);
@@ -869,7 +871,11 @@ impl Walk<'_> {
         let Some(&next) = self.http_next_seq.get(&flow) else {
             return HttpOverlap::Fresh;
         };
-        if (seq.wrapping_sub(next) as i32) >= 0 {
+        let ahead = seq.wrapping_sub(next) as i32;
+        if ahead > 0 {
+            return HttpOverlap::Skip;
+        }
+        if ahead == 0 {
             return HttpOverlap::Fresh;
         }
         let len = payload.len() as u32;
@@ -879,21 +885,18 @@ impl Walk<'_> {
         }
         if let Some(key) = key {
             if let Some(prev) = self.http_seen.get(&key) {
-                if len <= prev.len {
-                    return HttpOverlap::Skip;
+                if prev.open && payload.starts_with(&prev.payload) {
+                    return HttpOverlap::OpenComplete {
+                        already: prev.hosts,
+                    };
                 }
-                if payload.starts_with(&prev.payload) {
-                    if prev.open {
-                        return HttpOverlap::OpenComplete {
-                            already: prev.hosts,
-                        };
-                    }
-                    return HttpOverlap::Suffix(prev.payload.len());
-                }
-                return HttpOverlap::Skip;
             }
         }
-        HttpOverlap::Skip
+        let skip = next.wrapping_sub(seq) as usize;
+        if skip >= payload.len() {
+            return HttpOverlap::Skip;
+        }
+        HttpOverlap::Suffix(skip)
     }
 
     fn note_http_seen(
@@ -2201,6 +2204,8 @@ mod tests {
 
     const CLIENT: [u8; 4] = [10, 0, 0, 1];
     const SERVER: [u8; 4] = [10, 255, 255, 1];
+    const V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const V6_SERVER: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
     fn eth_ipv4_tcp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
         eth_ipv4_tcp_seq(src, sport, dport, 1, payload)
@@ -2619,6 +2624,91 @@ mod tests {
     }
 
     #[test]
+    fn http_gap_after_nxtseq_is_not_http() {
+        for seq in [37u32, 100] {
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, INNER_GET),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "seq {seq}");
+            assert_eq!(cells[0].counted, None, "seq {seq}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "seq {seq}");
+            assert_eq!(cells[1].counted, None, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn http_overlap_past_nxtseq_with_complete_get_prints_host() {
+        for seq in [1u32, 2, 10, 20, 35] {
+            let second = overlap_past_nxtseq(seq, INNER_GET);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, &second),
+            ]);
+            assert_first_a_then_inner(&cells, &format!("seq {seq}"));
+        }
+    }
+
+    #[test]
+    fn http_overlap_past_nxtseq_ipv6_8080_and_handshake() {
+        let second = overlap_past_nxtseq(35, INNER_GET);
+        let ipv4 = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
+        ]);
+        assert_first_a_then_inner(&ipv4, "ipv4-80");
+        let port = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 8080, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 8080, 35, &second),
+        ]);
+        assert_first_a_then_inner(&port, "ipv4-8080");
+        let ipv6 = walk_http_frames(&[
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 1, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 35, &second),
+        ]);
+        assert_first_a_then_inner(&ipv6, "ipv6-80");
+        let handshake = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
+        ]);
+        for cell in &handshake[..3] {
+            assert_eq!(cell.http_host, [] as [&str; 0]);
+            assert_eq!(cell.counted, None);
+        }
+        assert_eq!(handshake[3].http_host, ["a.example"]);
+        assert_eq!(handshake[3].counted, None);
+        assert_eq!(handshake[4].http_host, ["inner.example"]);
+        assert_eq!(handshake[4].counted, None);
+    }
+
+    #[test]
+    fn http_truncated_prefix_extend_then_complete_prints_host() {
+        for cut in [
+            b"GET / HTTP/1.1\r\nHost: ".as_slice(),
+            b"GET / HTTP/1.1\r\nHos",
+        ] {
+            let mut mid = GET_A.to_vec();
+            mid.extend_from_slice(cut);
+            let mut last = GET_A.to_vec();
+            last.extend_from_slice(INNER_GET);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &last),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "{cut:?}");
+            assert_eq!(cells[0].counted, None, "{cut:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{cut:?}");
+            assert_eq!(cells[1].counted, None, "{cut:?}");
+            assert_eq!(cells[2].http_host, ["inner.example"], "{cut:?}");
+            assert_eq!(cells[2].counted, None, "{cut:?}");
+        }
+    }
+
+    #[test]
     fn http_split_headers_then_overlap_at_seq_1_is_continuation() {
         let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
         let cells = walk_http_frames(&[
@@ -2865,6 +2955,21 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn overlap_past_nxtseq(seq: u32, suffix: &[u8]) -> Vec<u8> {
+        let nxtseq = 1 + GET_A.len() as u32;
+        let pad = nxtseq.saturating_sub(seq) as usize;
+        let mut payload = vec![b'X'; pad];
+        payload.extend_from_slice(suffix);
+        payload
+    }
+
+    fn assert_first_a_then_inner(cells: &[Cell], label: &str) {
+        assert_eq!(cells[0].http_host, ["a.example"], "{label}");
+        assert_eq!(cells[0].counted, None, "{label}");
+        assert_eq!(cells[1].http_host, ["inner.example"], "{label}");
+        assert_eq!(cells[1].counted, None, "{label}");
     }
 
     fn http_req_resp_get(req: &[u8], resp: &[u8], later: &[u8]) -> Vec<Cell> {

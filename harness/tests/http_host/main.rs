@@ -276,6 +276,26 @@ const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
 const HTTP2_FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
 const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+
+fn overlap_past_nxtseq(seq: u32, suffix: &[u8]) -> Vec<u8> {
+    let nxtseq = 1 + GET_A.len() as u32;
+    let pad = nxtseq.saturating_sub(seq) as usize;
+    let mut payload = vec![b'X'; pad];
+    payload.extend_from_slice(suffix);
+    payload
+}
+
+fn truncated_prefix_extend(cut: &[u8]) -> Vec<Vec<u8>> {
+    let mut mid = GET_A.to_vec();
+    mid.extend_from_slice(cut);
+    let mut last = GET_A.to_vec();
+    last.extend_from_slice(INNER_GET);
+    vec![
+        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &mid),
+        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &last),
+    ]
+}
 const POST_CL0_A: &[u8] = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
 const RESP_204_A: &[u8] = b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n";
 const NOTIFY_A: &[u8] = b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n";
@@ -2134,6 +2154,136 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                     eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
                     eth_ipv4_tcp_seq(OUTER, 50000, 80, 36, INNER_GET),
                 ],
+            ),
+        ),
+        (
+            "gap-seq-37",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 37, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "gap-seq-100",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 100, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-35-x-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 35, &overlap_past_nxtseq(35, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-2-padded-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 2, &overlap_past_nxtseq(2, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-10-padded-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 10, &overlap_past_nxtseq(10, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-20-padded-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 20, &overlap_past_nxtseq(20, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "same-seq-replacement-x-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &overlap_past_nxtseq(1, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-35-x-then-get-ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv6_tcp_to(OUTER_V6, PEER_V6, 50000, 80, 1, GET_A),
+                    eth_ipv6_tcp_to(
+                        OUTER_V6,
+                        PEER_V6,
+                        50000,
+                        80,
+                        35,
+                        &overlap_past_nxtseq(35, INNER_GET),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-35-x-then-get-8080",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 8080, 1, GET_A),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        8080,
+                        35,
+                        &overlap_past_nxtseq(35, INNER_GET),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-35-x-then-get-after-handshake",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
+                    eth_ipv4_tcp_to_flags(PEER, OUTER, 80, 50000, 0, 0x12, b""),
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1, 0x10, b""),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 35, &overlap_past_nxtseq(35, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "same-seq-truncated-prefix-extend-then-complete",
+            pcap(
+                LINK_ETHERNET,
+                &truncated_prefix_extend(b"GET / HTTP/1.1\r\nHost: "),
+            ),
+        ),
+        (
+            "same-seq-truncated-prefix-extend-mid-host-then-complete",
+            pcap(
+                LINK_ETHERNET,
+                &truncated_prefix_extend(b"GET / HTTP/1.1\r\nHos"),
             ),
         ),
         (
