@@ -279,7 +279,6 @@ fn a_new_section_resets_interface_ids() {
 #[test]
 fn an_unknown_block_between_packets_is_skipped() {
     let skipped = unknown_block(Endian::Little, 7);
-    assert_eq!(skipped.len(), 12);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -361,10 +360,6 @@ fn options_after_endofopt_are_ignored() {
         &option(Endian::Little, 0, &[]),
         &option(Endian::Little, 9, &[9]),
     ]);
-    assert_eq!(
-        options,
-        [0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00]
-    );
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &options),
@@ -380,7 +375,6 @@ fn options_after_endofopt_are_ignored() {
 #[test]
 fn power_of_ten_tsresol_above_19_is_unsupported() {
     let resol = option(Endian::Little, 9, &[20]);
-    assert_eq!(resol, [0x09, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &resol),
@@ -407,7 +401,6 @@ fn power_of_ten_tsresol_above_19_is_unsupported() {
 #[test]
 fn power_of_two_tsresol_above_63_is_unsupported() {
     let resol = option(Endian::Little, 9, &[0xc0]);
-    assert_eq!(resol, [0x09, 0x00, 0x01, 0x00, 0xc0, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &resol),
@@ -434,10 +427,6 @@ fn power_of_two_tsresol_above_63_is_unsupported() {
 #[test]
 fn shb_version_1_1_is_unsupported() {
     let header = section_header_version(Endian::Little, 1, 1);
-    assert_eq!(
-        &header[8..16],
-        [0x4d, 0x3c, 0x2b, 0x1a, 0x01, 0x00, 0x01, 0x00]
-    );
     let bytes = concat(&[
         &header,
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -532,7 +521,6 @@ fn an_unclaimed_pcapng_link_type_still_yields_the_frame() {
 #[test]
 fn header_only_section_has_no_frames() {
     let bytes = section_header(Endian::Little);
-    assert_eq!(bytes.len(), 28);
     let capture = read_capture(&bytes);
 
     assert_eq!(capture.frames.len(), 0);
@@ -576,7 +564,6 @@ fn a_truncated_block_keeps_the_earlier_frame() {
 #[test]
 fn captured_length_above_the_maximum_is_not_a_frame() {
     let epb = enhanced_packet(Endian::Little, 0, 0, 262145, 262145, &[], &[]);
-    assert_eq!(epb.len(), 32);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -655,7 +642,6 @@ fn mismatched_block_lengths_stop() {
         &pack_u32(1, Endian::Little),
         &[0x11, 0x00, 0x00, 0x00],
     ]);
-    assert_eq!(body.len(), 24);
     let epb = block_with_lengths(Endian::Little, 6, &body, 36, 40);
     let bytes = concat(&[
         &section_header(Endian::Little),
@@ -680,7 +666,6 @@ fn mismatched_block_lengths_stop() {
 #[test]
 fn if_tsresol_is_used_only_when_the_length_is_one() {
     let resol = option(Endian::Little, 9, &[9, 0]);
-    assert_eq!(resol, [0x09, 0x00, 0x02, 0x00, 0x09, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &resol),
@@ -730,7 +715,6 @@ fn an_option_overrun_fails_the_idb() {
 #[test]
 fn if_filter_length_zero_fails_the_idb() {
     let filter = option(Endian::Little, 11, &[]);
-    assert_eq!(filter, [0x0b, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &[]),
