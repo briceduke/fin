@@ -116,6 +116,10 @@ impl PortPick {
     pub fn is_tls(self) -> bool {
         self.name == Some("tls")
     }
+
+    pub fn is_http(self) -> bool {
+        self.name == Some("http")
+    }
 }
 
 /// Snapshotted `udp.port` / `tcp.port` / `tls.port` tables from tshark 4.6.9.
@@ -293,7 +297,20 @@ mod tests {
         let pick = tables.tcp(50000, 443);
         assert_eq!(pick.name, Some("tls"));
         assert!(pick.is_tls());
+        assert!(!pick.is_http());
         assert!(!pick.is_vxlan());
+    }
+
+    #[test]
+    fn tcp_80_is_http() {
+        let tables = snapshot();
+        for port in [
+            80u16, 1900, 2710, 2869, 3128, 3132, 3689, 5985, 8080, 8088, 11371,
+        ] {
+            let pick = tables.tcp(50000, port);
+            assert_eq!(pick.name, Some("http"), "{port}");
+            assert!(pick.is_http(), "{port}");
+        }
     }
 
     #[test]

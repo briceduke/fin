@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
+use crate::http_host::{looks_like_http_heuristic, parse_http, HttpParse};
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake,
@@ -47,6 +48,7 @@ const DEPTH: usize = 8;
 pub struct Cell {
     pub values: Vec<String>,
     pub tls_sni: Vec<String>,
+    pub http_host: Vec<String>,
     pub counted: Option<&'static str>,
 }
 
@@ -122,8 +124,12 @@ pub struct IpSrc {
     tls_session: HashMap<TcpFlow, TlsSession>,
     /// Conversation CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
     tls_ccs: HashMap<TcpFlow, TlsCcs>,
+    http_seen: HashSet<TcpSeq>,
+    /// Heuristic `http_tcp` sticks the TCP conversation, matching tshark 4.6.9.
+    http_claimed: HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
+    want_http: bool,
 }
 
 /// tshark 4.6.9 `SslSession` CCS and server role on one TCP conversation.
@@ -148,6 +154,11 @@ impl IpSrc {
 
     /// Walk only the fields the CLI asked for.
     pub fn query(ip_src: bool, tls_sni: bool) -> Self {
+        Self::fields(ip_src, tls_sni, false)
+    }
+
+    /// Walk `ip.src`, TLS SNI, and/or `http.host`.
+    pub fn fields(ip_src: bool, tls_sni: bool, http_host: bool) -> Self {
         Self {
             tables: snapshot(),
             frags: FragTable::default(),
@@ -156,8 +167,11 @@ impl IpSrc {
             tls_claimed: HashSet::new(),
             tls_session: HashMap::new(),
             tls_ccs: HashMap::new(),
-            want_ip: ip_src || !tls_sni,
+            http_seen: HashSet::new(),
+            http_claimed: HashSet::new(),
+            want_ip: ip_src || (!tls_sni && !http_host),
             want_tls: tls_sni,
+            want_http: http_host,
         }
     }
 
@@ -171,6 +185,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
     let mut walk = Walk {
         values: Vec::new(),
         tls_sni: Vec::new(),
+        http_host: Vec::new(),
         counted: None,
         tables: session.tables,
         frags: &mut session.frags,
@@ -179,8 +194,11 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tls_claimed: &mut session.tls_claimed,
         tls_session: &mut session.tls_session,
         tls_ccs: &mut session.tls_ccs,
+        http_seen: &mut session.http_seen,
+        http_claimed: &mut session.http_claimed,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
+        want_http: session.want_http,
         flow_src: None,
         flow_dst: None,
         depth: 0,
@@ -189,6 +207,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
     Cell {
         values: walk.values,
         tls_sni: walk.tls_sni,
+        http_host: walk.http_host,
         counted: walk.counted,
     }
 }
@@ -196,6 +215,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
 struct Walk<'a> {
     values: Vec<String>,
     tls_sni: Vec<String>,
+    http_host: Vec<String>,
     counted: Option<&'static str>,
     tables: &'static PortTables,
     frags: &'a mut FragTable,
@@ -204,8 +224,11 @@ struct Walk<'a> {
     tls_claimed: &'a mut HashSet<TcpFlow>,
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
     tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
+    http_seen: &'a mut HashSet<TcpSeq>,
+    http_claimed: &'a mut HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
+    want_http: bool,
     flow_src: Option<FlowHost>,
     flow_dst: Option<FlowHost>,
     depth: usize,
@@ -329,7 +352,7 @@ impl Walk<'_> {
             return;
         }
         let dst = Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]);
-        if self.want_tls {
+        if self.want_tls || self.want_http {
             self.flow_src = Some(FlowHost::V4(src));
             self.flow_dst = Some(FlowHost::V4(dst));
         }
@@ -404,7 +427,7 @@ impl Walk<'_> {
         if bytes[0] >> 4 != 6 {
             return;
         }
-        if self.want_tls {
+        if self.want_tls || self.want_http {
             let mut src = [0u8; 16];
             let mut dst = [0u8; 16];
             src.copy_from_slice(&bytes[8..24]);
@@ -582,12 +605,21 @@ impl Walk<'_> {
             return;
         }
         let pick = self.tables.udp(src, dst);
-        if self.want_tls {
+        if self.want_tls || self.want_http {
             if pick.is_vxlan() {
                 self.vxlan(payload);
                 return;
             }
-            self.tls_from_udp(payload);
+            if self.want_tls {
+                self.tls_from_udp(payload);
+            }
+            if self.want_http {
+                if looks_like_http_heuristic(payload) {
+                    self.count("http-udp");
+                } else if pick.reaches_ip && !pick.is_vxlan() {
+                    self.count("http-tunnel");
+                }
+            }
             if self.want_ip {
                 self.after_ports(pick, payload);
             }
@@ -610,13 +642,92 @@ impl Walk<'_> {
             return;
         }
         let seq = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let fin = bytes[13] & 0x01 != 0;
         let pick = self.tables.tcp(src, dst);
         let payload = &bytes[data_off..];
         if self.want_tls {
             self.tls_from_tcp(src, dst, seq, pick, payload);
         }
+        if self.want_http {
+            self.http_from_tcp(src, dst, seq, fin, pick, payload);
+        }
         if self.want_ip {
             self.after_ports(pick, payload);
+        }
+    }
+
+    fn http_from_tcp(
+        &mut self,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        fin: bool,
+        pick: PortPick,
+        payload: &[u8],
+    ) {
+        let flow = match (self.flow_src, self.flow_dst) {
+            (Some(src), Some(dst)) => Some(TcpFlow {
+                src,
+                dst,
+                sport,
+                dport,
+            }),
+            _ => None,
+        };
+        let key = flow.map(|flow| TcpSeq {
+            src: flow.src,
+            dst: flow.dst,
+            sport,
+            dport,
+            seq,
+        });
+        if let Some(key) = key {
+            if self.http_seen.contains(&key) {
+                return;
+            }
+        }
+        if pick.is_http() {
+            match parse_http(payload, fin) {
+                HttpParse::Message(hosts) => {
+                    if let Some(key) = key {
+                        self.http_seen.insert(key);
+                    }
+                    self.http_host.extend(hosts);
+                }
+                HttpParse::Partial(hosts) => {
+                    if let Some(key) = key {
+                        self.http_seen.insert(key);
+                    }
+                    self.http_host.extend(hosts);
+                    self.count("http");
+                }
+                HttpParse::Unproved | HttpParse::Other => {
+                    if let Some(key) = key {
+                        self.http_seen.insert(key);
+                    }
+                    self.count("http");
+                }
+            }
+            return;
+        }
+        let claimed = flow
+            .map(|flow| self.http_claimed.contains(&flow.conversation()))
+            .unwrap_or(false);
+        if claimed || looks_like_http_heuristic(payload) {
+            if let Some(flow) = flow {
+                self.http_claimed.insert(flow.conversation());
+            }
+            if let Some(key) = key {
+                self.http_seen.insert(key);
+            }
+            self.count("http-heuristic");
+            return;
+        }
+        if pick.is_tls() {
+            if let Some(key) = key {
+                self.http_seen.insert(key);
+            }
+            self.count("http-over-tls");
         }
     }
 
@@ -1323,6 +1434,7 @@ mod tests {
         Cell {
             values: values.iter().map(|value| (*value).to_string()).collect(),
             tls_sni: Vec::new(),
+            http_host: Vec::new(),
             counted: None,
         }
     }
@@ -1331,6 +1443,7 @@ mod tests {
         Cell {
             values: Vec::new(),
             tls_sni: Vec::new(),
+            http_host: Vec::new(),
             counted: None,
         }
     }
@@ -1902,6 +2015,16 @@ mod tests {
         )
     }
 
+    fn walk_http(captured: &[u8]) -> Cell {
+        walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured,
+            },
+            &mut IpSrc::fields(false, false, true),
+        )
+    }
+
     #[test]
     fn tls_sni_on_443() {
         let frame = eth_ipv4_tcp([10, 0, 0, 1], 50000, 443, &sni_hello("www.example.com"));
@@ -1947,6 +2070,178 @@ mod tests {
         let cell = walk_tls(&frame);
         assert_eq!(cell.tls_sni, [] as [&str; 0]);
         assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_host_on_80() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: www.example.com\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, ["www.example.com"]);
+        assert_eq!(cell.counted, None);
+        assert_eq!(cell.values, [] as [&str; 0]);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn http_host_on_8080_and_3689() {
+        for port in [8080u16, 3689] {
+            let frame = eth_ipv4_tcp(
+                [10, 0, 0, 1],
+                50000,
+                port,
+                b"GET / HTTP/1.1\r\nHost: alt.example\r\n\r\n",
+            );
+            let cell = walk_http(&frame);
+            assert_eq!(cell.http_host, ["alt.example"], "{port}");
+            assert_eq!(cell.counted, None, "{port}");
+        }
+    }
+
+    #[test]
+    fn http_on_443_is_counted_heuristic() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http-heuristic"));
+    }
+
+    #[test]
+    fn http_incomplete_headers_are_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: cut.example",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+    }
+
+    #[test]
+    fn http_retransmit_prints_once() {
+        let payload = b"GET / HTTP/1.1\r\nHost: www.example.com\r\n\r\n";
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 80, 1, payload);
+        let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 80, 1, payload);
+        let mut session = IpSrc::fields(false, false, true);
+        let a = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let b = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(a.http_host, ["www.example.com"]);
+        assert_eq!(a.counted, None);
+        assert_eq!(b.http_host, [] as [&str; 0]);
+        assert_eq!(b.counted, None);
+    }
+
+    #[test]
+    fn http_no_host_is_blank_not_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_chunked_is_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            80,
+            b"POST / HTTP/1.1\r\nHost: chunk.example\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+    }
+
+    #[test]
+    fn http_heuristic_split_counts_the_completing_segment() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let cut = full.len() / 2;
+        let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 12345, 1, &full[..cut]);
+        let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 12345, 1 + cut as u32, &full[cut..]);
+        let mut session = IpSrc::fields(false, false, true);
+        let a = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &first,
+            },
+            &mut session,
+        );
+        let b = walk_ip_src(
+            &Frame {
+                link_type: ETHERNET,
+                captured: &second,
+            },
+            &mut session,
+        );
+        assert_eq!(a.http_host, [] as [&str; 0]);
+        assert_eq!(a.counted, Some("http-heuristic"));
+        assert_eq!(b.http_host, [] as [&str; 0]);
+        assert_eq!(b.counted, Some("http-heuristic"));
+    }
+
+    #[test]
+    fn http_over_tls_on_443_is_counted() {
+        let frame = eth_ipv4_tcp(
+            [10, 0, 0, 1],
+            50000,
+            443,
+            &[
+                0x17, 0x03, 0x03, 0x00, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            ],
+        );
+        let cell = walk_http(&frame);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http-over-tls"));
+    }
+
+    #[test]
+    fn http_udp_ssdp_is_counted() {
+        let payload = b"NOTIFY * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\n\r\n";
+        let mut udp = Vec::from(1900u16.to_be_bytes());
+        udp.extend_from_slice(&1900u16.to_be_bytes());
+        udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(payload);
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0];
+        let total = (20 + udp.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip.extend_from_slice(&[10, 0, 0, 1, 239, 255, 255, 250]);
+        ip.extend_from_slice(&udp);
+        let mut eth = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
+        ];
+        eth.extend_from_slice(&ip);
+        let cell = walk_http(&eth);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http-udp"));
     }
 
     #[test]

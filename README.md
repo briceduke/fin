@@ -2,7 +2,7 @@
 
 > TLS server names on a 368 MB capture: 0.206 seconds, against 6.39 seconds for tshark 4.6.9. 791,615 frames, 1,251 proved names.
 
-**Status:** `fin -r <file> [-n] -T fields -e ip.src` and `-e tls.handshake.extensions_server_name` map the file, split a classic pcap across cores, and print the field. pcapng and stdin use the sequential reader. Next is HTTP.
+**Status:** `fin -r <file> [-n] -T fields -e ip.src`, `-e tls.handshake.extensions_server_name`, and `-e http.host` map the file, split a classic pcap across cores, and print the field. pcapng and stdin use the sequential reader. Next is QUIC Initials.
 
 fin is an open-source packet analyzer.
 
@@ -50,10 +50,10 @@ The output is pinned to tshark 4.6.9. When the target version moves, its port ta
 ## What v1 supports
 
 ```
-fin -r capture.pcapng -T fields -e ip.src -e tls.handshake.extensions_server_name
+fin -r capture.pcapng -T fields -e ip.src -e tls.handshake.extensions_server_name -e http.host
 ```
 
-- **Fields:** `ip.src` (the IPv4 source address) and `tls.handshake.extensions_server_name` (the TLS server name).
+- **Fields:** `ip.src` (the IPv4 source address), `tls.handshake.extensions_server_name` (the TLS server name), and `http.host` (the HTTP/1.x Host header).
 - **Flags:** `-r`, `-n`, `-T fields`, `-e`, and `-o tcp.reassemble_out_of_order:TRUE`.
 - **Files:** classic pcap and pcapng.
 - **Link types:** Ethernet, Linux cooked capture (SLL and SLL2).
@@ -69,9 +69,9 @@ Each step is checked against the one before it.
 3. `ip.src`. Done. The walker covers Ethernet, classic SLL, SLL2, VLAN, QinQ, IPv4, IPv6 extension headers, ICMP errors, IP-in-IP, and VXLAN. UDP/TCP use the snapshotted tshark 4.6.9 port table. Any path it cannot prove is counted on stderr. HTTP is not in this step.
 4. The chunk split. Done. A mapped classic pcap is split across cores. Each core proves its start is the byte where the previous chunk stopped. A seam that does not prove is reread by `read_capture`. pcapng stays sequential: hopping blocks in parallel still peels frames in file order, and the measured win is on pcap. Tests diff chunked frames against the sequential reader, including adversarial pcap payloads and the file faults tshark 4.6.9 raises.
 5. TLS server names. Done. ClientHello `server_name` / `host_name`. An in-order split of one TLS record prints the name on the completing segment. Out-of-order stitches, a second TLS record, QUIC, or DTLS are counted. Notes: `docs/tls-sni.md`.
-6. HTTP.
+6. HTTP. Done. `http.host` from HTTP/1.x requests and responses whose headers and body fit in one TCP segment on the snapshotted HTTP ports. Split headers, body desegment, Transfer-Encoding, HTTP/2, HTTP over TLS, and heuristic ports are counted. Notes: `docs/http-host.md`.
 
-After TLS server names, QUIC Initials are decrypted and read with the same ClientHello parser. The index, the Parquet export, and the desktop app follow.
+After HTTP, QUIC Initials are decrypted and read with the same ClientHello parser. The index, the Parquet export, and the desktop app follow.
 
 ## Preliminary experiments
 

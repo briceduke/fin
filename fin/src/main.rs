@@ -1,4 +1,4 @@
-//! `fin -r <file> [-n] -T fields -e ip.src` / `-e tls.handshake.extensions_server_name`
+//! `fin -r <file> [-n] -T fields -e ip.src` / `-e tls.handshake.extensions_server_name` / `-e http.host`
 
 use std::env;
 use std::ffi::OsString;
@@ -74,7 +74,8 @@ fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io:
     let mut err = BufWriter::with_capacity(OUTPUT_BUF, stderr.lock());
     let want_ip = fields.contains(&Field::IpSrc);
     let want_tls = fields.contains(&Field::TlsSni);
-    let mut session = IpSrc::query(want_ip, want_tls);
+    let want_http = fields.contains(&Field::HttpHost);
+    let mut session = IpSrc::fields(want_ip, want_tls, want_http);
     let mut counted = Vec::new();
     let mut stdout_open = true;
     for (index, frame) in capture.frames.iter().enumerate() {
@@ -84,6 +85,7 @@ fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io:
             match field {
                 Field::IpSrc => columns.push(escape_field(&cell.values.join(","))),
                 Field::TlsSni => columns.push(escape_field(&cell.tls_sni.join(","))),
+                Field::HttpHost => columns.push(escape_field(&cell.http_host.join(","))),
             }
         }
         if stdout_open {
@@ -138,6 +140,7 @@ struct Args {
 enum Field {
     IpSrc,
     TlsSni,
+    HttpHost,
 }
 
 fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
@@ -167,6 +170,7 @@ fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
                 match value.as_str() {
                     "ip.src" => fields.push(Field::IpSrc),
                     "tls.handshake.extensions_server_name" => fields.push(Field::TlsSni),
+                    "http.host" => fields.push(Field::HttpHost),
                     other => return Err(format!("unsupported field {other}")),
                 }
             }
