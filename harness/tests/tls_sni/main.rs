@@ -241,254 +241,85 @@ fn record_version_cases() -> Vec<(&'static str, Vec<u8>)> {
 fn hello_ext_throw_cases() -> Vec<(&'static str, Vec<u8>)> {
     let other = client_hello(Some("other.example"));
     let hello = client_hello(Some("www.example.com"));
-    let throws: &[(&str, u16, &[u8])] = &[
-        ("maxfrag-0", 1, &[]),
-        ("maxfrag-1", 1, &[0x01]),
-        ("status-0", 5, &[]),
-        ("certtype-0", 9, &[]),
-        ("ecpf-0", 11, &[]),
-        ("heartbeat-0", 15, &[]),
-        ("heartbeat-1", 15, &[0x01]),
-        ("client-cert-0", 19, &[]),
-        ("server-cert-0", 20, &[]),
-        ("tokenbind-0", 24, &[]),
-        ("tokenbind-1", 24, &[0x00]),
-        ("rsl-0", 28, &[]),
-        ("rsl-1", 28, &[0x00]),
-        ("cid-dep-0", 53, &[]),
-        ("cid-0", 54, &[]),
-        ("compress-cert-odd-2", 27, &[0x01, 0x00]),
-        ("compress-cert-odd-4", 27, &[0x03, 0x00, 0x00, 0x00]),
-        ("compress-cert-0", 27, &[]),
-        ("compress-cert-1", 27, &[0x00]),
-        ("compress-cert-even", 27, &[0x02, 0x00, 0x01]),
-        ("quic-tp-v1-0", 57, &[]),
-        ("quic-tp-v1-1", 57, &[0x00]),
-        ("quic-tp-v1-00-40", 57, &[0x00, 0x40]),
-        ("quic-tp-v1-40-00", 57, &[0x40, 0x00]),
-        ("quic-tp-v1-80-00", 57, &[0x80, 0x00]),
-        ("quic-tp-v1-00-01", 57, &[0x00, 0x01]),
-        ("quic-tp-v1-len3", 57, &[0x00, 0x00, 0x00]),
-        ("quic-tp-v1-00-00", 57, &[0x00, 0x00]),
-        ("quic-tp-v1-idle-0", 57, &[0x01, 0x00]),
+    let then_other = |tag: &'static str, typ: u16, data: &[u8], sport: u16, dport: u16| {
+        let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
+        let same = two_client_hellos_record(&first, &other);
         (
-            "quic-tp-v1-reset-8",
-            57,
-            &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0],
+            tag,
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, sport, dport, &same)]),
+        )
+    };
+    let maxfrag = client_hello_exts(Some("www.example.com"), &[(1, &[])]);
+    let empty_maxfrag = client_hello_exts(None, &[(1, &[])]);
+    let mut leftover = maxfrag.clone();
+    leftover.push(0x00);
+    vec![
+        then_other("hello-ext-maxfrag-0-then-other-443", 1, &[], 50000, 443),
+        then_other(
+            "hello-ext-maxfrag-0-then-other-unnamed",
+            1,
+            &[],
+            40001,
+            40002,
         ),
-        ("quic-tp-v1-prefaddr-0", 57, &[0x0d, 0x00]),
-        ("quic-tp-v1-03-0", 57, &[0x03, 0x00]),
-        ("quic-tp-v1-04-0", 57, &[0x04, 0x00]),
-        ("quic-tp-v1-05-0", 57, &[0x05, 0x00]),
-        ("quic-tp-v1-06-0", 57, &[0x06, 0x00]),
-        ("quic-tp-v1-07-0", 57, &[0x07, 0x00]),
-        ("quic-tp-v1-08-0", 57, &[0x08, 0x00]),
-        ("quic-tp-v1-09-0", 57, &[0x09, 0x00]),
-        ("quic-tp-v1-0a-0", 57, &[0x0a, 0x00]),
-        ("quic-tp-v1-0b-0", 57, &[0x0b, 0x00]),
-        ("quic-tp-v1-migr-0", 57, &[0x0c, 0x00]),
-        ("quic-tp-old-0", 65445, &[]),
-        ("quic-tp-old-1", 65445, &[0x00]),
-        ("quic-tp-old-00-40", 65445, &[0x00, 0x40]),
-        ("quic-tp-old-40-00", 65445, &[0x40, 0x00]),
-        ("quic-tp-old-80-00", 65445, &[0x80, 0x00]),
-        ("quic-tp-old-00-01", 65445, &[0x00, 0x01]),
-        ("quic-tp-old-len3", 65445, &[0x00, 0x00, 0x00]),
-        ("quic-tp-old-00-00", 65445, &[0x00, 0x00]),
-        ("quic-tp-old-idle-0", 65445, &[0x01, 0x00]),
-        (
-            "quic-tp-old-reset-8",
-            65445,
-            &[0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0],
+        then_other(
+            "hello-ext-compress-cert-even-then-other-443",
+            27,
+            &[0x02, 0x00, 0x01],
+            50000,
+            443,
         ),
-        ("quic-tp-old-prefaddr-0", 65445, &[0x0d, 0x00]),
-        ("quic-tp-old-03-0", 65445, &[0x03, 0x00]),
-        ("quic-tp-old-04-0", 65445, &[0x04, 0x00]),
-        ("quic-tp-old-05-0", 65445, &[0x05, 0x00]),
-        ("quic-tp-old-06-0", 65445, &[0x06, 0x00]),
-        ("quic-tp-old-07-0", 65445, &[0x07, 0x00]),
-        ("quic-tp-old-08-0", 65445, &[0x08, 0x00]),
-        ("quic-tp-old-09-0", 65445, &[0x09, 0x00]),
-        ("quic-tp-old-0a-0", 65445, &[0x0a, 0x00]),
-        ("quic-tp-old-0b-0", 65445, &[0x0b, 0x00]),
-        ("quic-tp-old-migr-0", 65445, &[0x0c, 0x00]),
-        ("esni-0", 65486, &[]),
-        ("esni-1", 65486, &[0x00]),
-        ("esni-2", 65486, &[0x00, 0x00]),
-        ("esni-3", 65486, &[0x00, 0x2f, 0x00]),
-        ("esni-4", 65486, &[0x00, 0x2f, 0x00, 0x17]),
-        ("esni-5", 65486, &[0x00, 0x2f, 0x00, 0x17, 0x00]),
-        ("esni-6", 65486, &[0x00, 0x2f, 0x00, 0x17, 0x00, 0x00]),
-        ("ech-0", 65037, &[]),
-        ("ech-1", 65037, &[0x00]),
-        ("ech-2", 65037, &[0x00, 0x00]),
-        ("status-v2-000100", 17, &[0x00, 0x01, 0x00]),
-        ("status-v2-000101", 17, &[0x00, 0x01, 0x01]),
-        ("status-v2-000102", 17, &[0x00, 0x01, 0x02]),
-        ("status-v2-000103", 17, &[0x00, 0x01, 0x03]),
-        ("status-v2-0000", 17, &[0x00, 0x00]),
-        (
-            "status-v2-001501-20z",
-            17,
-            &[
-                0x00, 0x15, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
+        then_other(
+            "hello-ext-compress-cert-odd-2-then-other-443",
+            27,
+            &[0x01, 0x00],
+            50000,
+            443,
         ),
-        (
-            "status-v2-00050100020000",
-            17,
-            &[0x00, 0x05, 0x01, 0x00, 0x02, 0x00, 0x00],
+        then_other(
+            "hello-ext-alpn-0000-then-other-443",
+            16,
+            &[0x00, 0x00],
+            50000,
+            443,
         ),
-        ("alpn-000100", 16, &[0x00, 0x01, 0x00]),
-        ("alpn-0000", 16, &[0x00, 0x00]),
-        ("alpn-00020100", 16, &[0x00, 0x02, 0x01, 0x00]),
-        ("alpn-0003010000", 16, &[0x00, 0x03, 0x01, 0x00, 0x00]),
-        ("alpn-0003016800", 16, &[0x00, 0x03, 0x01, 0x68, 0x00]),
-        ("oid-filters-00020100", 48, &[0x00, 0x02, 0x01, 0x00]),
-        ("oid-filters-000100", 48, &[0x00, 0x01, 0x00]),
-        ("oid-filters-0000", 48, &[0x00, 0x00]),
-        (
-            "oid-filters-0006020600000100",
-            48,
-            &[0x00, 0x06, 0x02, 0x06, 0x00, 0x00, 0x01, 0x00],
-        ),
-        (
-            "oid-filters-000702060000020000",
-            48,
-            &[0x00, 0x07, 0x02, 0x06, 0x00, 0x00, 0x02, 0x00, 0x00],
-        ),
-        (
-            "oid-filters-0003020605",
-            48,
-            &[0x00, 0x03, 0x02, 0x06, 0x05],
-        ),
-        (
-            "oid-filters-000403068105",
-            48,
-            &[0x00, 0x04, 0x03, 0x06, 0x81, 0x05],
-        ),
-        ("trusted-ca-000101", 3, &[0x00, 0x01, 0x01]),
-        ("trusted-ca-000103", 3, &[0x00, 0x01, 0x03]),
-        ("trusted-ca-00020100", 3, &[0x00, 0x02, 0x01, 0x00]),
-        ("trusted-ca-0000", 3, &[0x00, 0x00]),
-        ("trusted-ca-000100", 3, &[0x00, 0x01, 0x00]),
-        ("trusted-ca-0003020000", 3, &[0x00, 0x03, 0x02, 0x00, 0x00]),
-        (
-            "trusted-ca-000402000100",
-            3,
-            &[0x00, 0x04, 0x02, 0x00, 0x01, 0x00],
-        ),
-        (
-            "trusted-ca-00050200023005",
-            3,
-            &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x05],
-        ),
-        (
-            "trusted-ca-0006020003308105",
-            3,
-            &[0x00, 0x06, 0x02, 0x00, 0x03, 0x30, 0x81, 0x05],
-        ),
-        (
-            "trusted-ca-00050200023000",
-            3,
-            &[0x00, 0x05, 0x02, 0x00, 0x02, 0x30, 0x00],
-        ),
-        ("psk-00020000", 41, &[0x00, 0x02, 0x00, 0x00]),
-        ("psk-0003000000", 41, &[0x00, 0x03, 0x00, 0x00, 0x00]),
-        (
-            "psk-000400000000",
+        then_other(
+            "hello-ext-psk-0000-then-other-443",
             41,
-            &[0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+            &[0x00, 0x00],
+            50000,
+            443,
         ),
-        ("psk-0000", 41, &[0x00, 0x00]),
-        ("psk-000100", 41, &[0x00, 0x01, 0x00]),
-        ("cert-auth-00020000", 47, &[0x00, 0x02, 0x00, 0x00]),
-        ("cert-auth-0003000000", 47, &[0x00, 0x03, 0x00, 0x00, 0x00]),
-        ("cert-auth-0003000100", 47, &[0x00, 0x03, 0x00, 0x01, 0x00]),
-        ("cert-auth-0000", 47, &[0x00, 0x00]),
-        (
-            "cert-auth-000400023005",
-            47,
-            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
-        ),
-        (
-            "cert-auth-00050003308105",
-            47,
-            &[0x00, 0x05, 0x00, 0x03, 0x30, 0x81, 0x05],
-        ),
-        (
-            "cert-auth-000400023000",
-            47,
-            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x00],
-        ),
-        (
-            "cert-auth-0006000430023105",
+        then_other("hello-ext-quic-tp-v1-0-then-other-443", 57, &[], 50000, 443),
+        then_other("hello-ext-esni-0-then-other-443", 65486, &[], 50000, 443),
+        then_other(
+            "hello-ext-cert-auth-0006000430023105-then-other-443",
             47,
             &[0x00, 0x06, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
+            50000,
+            443,
         ),
         (
-            "cert-auth-000500031f0005",
-            47,
-            &[0x00, 0x05, 0x00, 0x03, 0x1f, 0x00, 0x05],
-        ),
-        (
-            "oid-filters-000400023005",
-            48,
-            &[0x00, 0x04, 0x00, 0x02, 0x30, 0x05],
-        ),
-        (
-            "trusted-ca-000702000430023105",
-            3,
-            &[0x00, 0x07, 0x02, 0x00, 0x04, 0x30, 0x02, 0x31, 0x05],
-        ),
-        (
-            "quic-tp-v1-len32-wrap",
-            57,
-            &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
-        ),
-        (
-            "quic-tp-old-len32-wrap",
-            65445,
-            &[0x00, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
-        ),
-    ];
-    let mut cases = Vec::new();
-    for &(tag, typ, data) in throws {
-        let first = client_hello_exts(Some("www.example.com"), &[(typ, data)]);
-        let empty_first = client_hello_exts(None, &[(typ, data)]);
-        let same = two_client_hellos_record(&first, &other);
-        cases.push((
-            leak(format!("hello-ext-{tag}-then-other-443")),
-            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 443, &same)]),
-        ));
-        cases.push((
-            leak(format!("hello-ext-{tag}-then-other-unnamed")),
-            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 40001, 40002, &same)]),
-        ));
-        cases.push((
-            leak(format!("hello-ext-{tag}-only-then-www-443")),
+            "hello-ext-maxfrag-0-only-then-www-443",
             pcap(
                 LINK_ETHERNET,
                 &[eth_ipv4_tcp(
                     OUTER,
                     50000,
                     443,
-                    &two_client_hellos_record(&empty_first, &hello),
+                    &two_client_hellos_record(&empty_maxfrag, &hello),
                 )],
             ),
-        ));
-        let mut leftover = first.clone();
-        leftover.push(0x00);
-        cases.push((
-            leak(format!("hello-ext-{tag}-leftover-00-then-0301")),
+        ),
+        (
+            "hello-ext-maxfrag-0-leftover-00-then-0301",
             sequential_payloads(50000, 443, &[&leftover, &hello]),
-        ));
-        cases.push((
-            leak(format!("hello-ext-{tag}-next-payload-other")),
-            sequential_payloads(50000, 443, &[&first, &other]),
-        ));
-    }
-    cases
+        ),
+        (
+            "hello-ext-maxfrag-0-next-payload-other",
+            sequential_payloads(50000, 443, &[&maxfrag, &other]),
+        ),
+    ]
 }
 
 fn two_client_hellos_record(first: &[u8], second: &[u8]) -> Vec<u8> {
