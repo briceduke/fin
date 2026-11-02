@@ -136,6 +136,10 @@ pub struct IpSrc {
     /// `SSTP_DUPLEX_POST` waiting for a complete 200, matching packet-http.c.
     /// A 1xx does not clear this; tshark 4.6.9 `push_res` keeps `request_method`.
     http_sstp: HashSet<TcpFlow>,
+    /// CONNECT waiting for a 2xx. The value is the URI port after `:`,
+    /// or `None` when the URI has no colon. tshark 4.6.9
+    /// `http_conversation_is_connect` then `http_payload_subdissector`.
+    http_connect: HashMap<TcpFlow, Option<u32>>,
     /// Conversation switched off HTTP; later Hosts are counted `http-tunnel`.
     http_tunnel: HashSet<TcpFlow>,
     want_ip: bool,
@@ -182,6 +186,7 @@ impl IpSrc {
             http_desegment: HashSet::new(),
             http_claimed: HashSet::new(),
             http_sstp: HashSet::new(),
+            http_connect: HashMap::new(),
             http_tunnel: HashSet::new(),
             want_ip: ip_src || (!tls_sni && !http_host),
             want_tls: tls_sni,
@@ -212,6 +217,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         http_desegment: &mut session.http_desegment,
         http_claimed: &mut session.http_claimed,
         http_sstp: &mut session.http_sstp,
+        http_connect: &mut session.http_connect,
         http_tunnel: &mut session.http_tunnel,
         want_ip: session.want_ip,
         want_tls: session.want_tls,
@@ -245,6 +251,7 @@ struct Walk<'a> {
     http_desegment: &'a mut HashSet<TcpFlow>,
     http_claimed: &'a mut HashSet<TcpFlow>,
     http_sstp: &'a mut HashSet<TcpFlow>,
+    http_connect: &'a mut HashMap<TcpFlow, Option<u32>>,
     http_tunnel: &'a mut HashSet<TcpFlow>,
     want_ip: bool,
     want_tls: bool,
@@ -729,6 +736,9 @@ impl Walk<'_> {
         let sstp_pending = flow
             .map(|flow| self.http_sstp.contains(&flow.conversation()))
             .unwrap_or(false);
+        let connect_pending = flow
+            .map(|flow| self.http_connect.contains_key(&flow.conversation()))
+            .unwrap_or(false);
         if pick.is_http() {
             if let Some(flow) = flow {
                 if self.http_claimed.contains(&flow.conversation()) {
@@ -745,7 +755,7 @@ impl Walk<'_> {
                 self.count("http");
                 return;
             }
-            match parse_http_pending(payload, fin, sstp_pending) {
+            match parse_http_pending(payload, fin, sstp_pending, connect_pending) {
                 HttpParse::Message(proved) => {
                     self.note_http_seen(key, len);
                     if let Some(flow) = flow {
@@ -813,12 +823,20 @@ impl Walk<'_> {
     /// Complete headers on that 200 or 101 are enough: `try_desegment_body`
     /// is false, so no Content-Length, a short Content-Length, or
     /// Transfer-Encoding still switches. Those later Hosts are an unwalked
-    /// tunnel, including leftover in this same segment. CONNECT + 200 and a
-    /// 101 with no Upgrade stay HTTP.
+    /// tunnel, including leftover in this same segment.
+    ///
+    /// CONNECT plus 2xx is different: `dissect_http_tcp` calls
+    /// `http_conversation_is_connect` on *later* segments and hands them
+    /// to `http_payload_subdissector` using the URI port. Same-segment
+    /// leftover on the 2xx frame stays HTTP. A 101 with no Upgrade stays
+    /// HTTP.
     fn extend_http_hosts(&mut self, flow: TcpFlow, proved: HttpProved) {
         self.note_http_switch(flow, &proved);
+        let status_2xx = proved.status_2xx;
+        let has_final_response = proved.has_final_response;
         if !self.http_tunnel.contains(&flow.conversation()) {
             self.http_host.extend(proved.hosts);
+            self.arm_connect_tunnel(flow, status_2xx, has_final_response);
             return;
         }
         let leftover = if proved.switching_upgrade {
@@ -838,6 +856,7 @@ impl Walk<'_> {
         if leftover {
             self.count("http-tunnel");
         }
+        self.arm_connect_tunnel(flow, status_2xx, has_final_response);
     }
 
     fn note_http_switch(&mut self, flow: TcpFlow, proved: &HttpProved) {
@@ -848,12 +867,41 @@ impl Walk<'_> {
         if proved.sstp_duplex_post {
             self.http_sstp.insert(conv);
         }
+        if proved.connect {
+            self.http_connect.insert(conv, proved.connect_port);
+        }
         if proved.status_200 && self.http_sstp.contains(&conv) {
             self.http_tunnel.insert(conv);
         }
         if proved.has_final_response {
             self.http_sstp.remove(&conv);
         }
+    }
+
+    /// tshark 4.6.9 `http_conversation_is_connect` is true after CONNECT
+    /// plus 2xx. `http_payload_subdissector` then `decode_tcp_ports` on
+    /// the URI port. `http` and `tls` still print a later GET (`tls`
+    /// rejects HTTP, then the HTTP heuristic claims). Any other port,
+    /// or a URI with no colon, is not HTTP.
+    fn arm_connect_tunnel(&mut self, flow: TcpFlow, status_2xx: bool, has_final_response: bool) {
+        let conv = flow.conversation();
+        if status_2xx {
+            if let Some(port) = self.http_connect.remove(&conv) {
+                if !self.connect_uri_stays_http(port) {
+                    self.http_tunnel.insert(conv);
+                }
+            }
+        } else if has_final_response {
+            self.http_connect.remove(&conv);
+        }
+    }
+
+    fn connect_uri_stays_http(&self, port: Option<u32>) -> bool {
+        let Some(port) = port.and_then(|port| u16::try_from(port).ok()) else {
+            return false;
+        };
+        let pick = self.tables.tcp(port, port);
+        pick.is_http() || pick.is_tls()
     }
 
     fn tls_from_tcp(&mut self, sport: u16, dport: u16, seq: u32, pick: PortPick, payload: &[u8]) {
@@ -2831,6 +2879,73 @@ mod tests {
         assert_eq!(cells[2].counted, None);
     }
 
+    fn connect_req(uri: &str) -> Vec<u8> {
+        let mut req = b"CONNECT ".to_vec();
+        req.extend_from_slice(uri.as_bytes());
+        req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+        req.extend_from_slice(uri.as_bytes());
+        req.extend_from_slice(b"\r\n\r\n");
+        req
+    }
+
+    const CONNECT_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+    const CONNECT_201: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+
+    #[test]
+    fn http_connect_2xx_non_http_uri_port_counts_a_later_get() {
+        let ports = [
+            21u16, 22, 23, 25, 53, 110, 143, 587, 1194, 1883, 3306, 5060, 5432, 5900, 6379,
+        ];
+        for port in ports {
+            let uri = format!("example.com:{port}");
+            let cells = http_req_resp_get(&connect_req(&uri), CONNECT_200, INNER_GET);
+            assert_eq!(cells[0].http_host, [uri.as_str()], "{port}");
+            assert_eq!(cells[0].counted, None, "{port}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{port}");
+            assert_eq!(cells[1].counted, None, "{port}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{port}");
+            assert_eq!(cells[2].counted, Some("http-tunnel"), "{port}");
+        }
+    }
+
+    #[test]
+    fn http_connect_no_port_or_201_counts_a_later_get() {
+        let req = connect_req("example.com");
+        for resp in [CONNECT_200, CONNECT_201] {
+            let cells = http_req_resp_get(&req, resp, INNER_GET);
+            assert_eq!(cells[0].http_host, ["example.com"], "{resp:?}");
+            assert_eq!(cells[0].counted, None, "{resp:?}");
+            assert_eq!(cells[2].http_host, [] as [&str; 0], "{resp:?}");
+            assert_eq!(cells[2].counted, Some("http-tunnel"), "{resp:?}");
+        }
+        let cells = http_req_resp_get(&connect_req("example.com:22"), CONNECT_201, INNER_GET);
+        assert_eq!(cells[0].http_host, ["example.com:22"]);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+        let cells = http_req_resp_get(
+            &connect_req("example.com:22"),
+            b"HTTP/1.1 201 Created\r\n\r\n",
+            INNER_GET,
+        );
+        assert_eq!(cells[0].http_host, ["example.com:22"]);
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("http-tunnel"));
+    }
+
+    #[test]
+    fn http_connect_http_or_tls_uri_port_still_prints_a_later_get() {
+        for port in [443u16, 80, 8080, 465, 993, 995] {
+            let uri = format!("example.com:{port}");
+            let cells = http_req_resp_get(&connect_req(&uri), CONNECT_200, INNER_GET);
+            assert_eq!(cells[0].http_host, [uri.as_str()], "{port}");
+            assert_eq!(cells[0].counted, None, "{port}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{port}");
+            assert_eq!(cells[1].counted, None, "{port}");
+            assert_eq!(cells[2].http_host, ["inner.example"], "{port}");
+            assert_eq!(cells[2].counted, None, "{port}");
+        }
+    }
+
     #[test]
     fn http_desegment_body_counts_a_later_same_direction_get() {
         let get = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
@@ -2878,6 +2993,14 @@ mod tests {
     }
 
     const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    fn cl24_magic_then_get(start: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n");
+        payload.extend_from_slice(HTTP2_MAGIC);
+        payload.extend_from_slice(INNER_GET);
+        payload
+    }
     const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
     const HTTP2_FIRST_LINE: &[u8] = b"PRI * HTTP/2.0\r\n";
     const HTTP2_V6_CLIENT: [u8; 16] = [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -3098,6 +3221,63 @@ mod tests {
     }
 
     #[test]
+    fn http_content_length_magic_body_still_prints_leftover_get() {
+        assert_eq!(HTTP2_MAGIC.len(), 24);
+        let starts = [
+            b"GET / HTTP/1.1".as_slice(),
+            b"PUT / HTTP/1.1",
+            b"OPTIONS / HTTP/1.1",
+            b"POST / HTTP/1.1",
+            b"HTTP/1.1 200 OK",
+            b"HTTP/1.1 204 No Content",
+        ];
+        for start in starts {
+            let cell = walk_http(&eth_ipv4_tcp_flow(
+                CLIENT,
+                SERVER,
+                50000,
+                80,
+                1,
+                &cl24_magic_then_get(start),
+            ));
+            assert_eq!(
+                cell.http_host,
+                ["a.example", "inner.example"],
+                "{}",
+                start.escape_ascii()
+            );
+            assert_eq!(cell.counted, None, "{}", start.escape_ascii());
+        }
+        let cl0 = walk_http(&eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &{
+            let mut payload =
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n".to_vec();
+            payload.extend_from_slice(HTTP2_MAGIC);
+            payload.extend_from_slice(INNER_GET);
+            payload
+        }));
+        assert_eq!(cl0.http_host, ["a.example"]);
+        assert_eq!(cl0.counted, None);
+    }
+
+    #[test]
+    fn http_content_length_magic_body_later_frame_is_counted() {
+        let mut first =
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n".to_vec();
+        first.extend_from_slice(HTTP2_MAGIC);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &first),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1 + first.len() as u32, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        // A later frame after a CL-24 Magic body is a counted miss
+        // (allowed): the unbounded-body HTTP/2 stick also covers a
+        // Content-Length body that consumed the rest of the payload.
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+    }
+
+    #[test]
     fn http_desegment_body_opposite_direction_still_prints() {
         let cells = http_req_resp_get(
             b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
@@ -3191,14 +3371,15 @@ mod tests {
 
     #[test]
     fn http_connect_200_same_segment_leftover_still_prints() {
-        let cells = http_req_resp(
-            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n",
-        );
-        assert_eq!(cells[0].http_host, ["example.com:443"]);
-        assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["after-connect.example"]);
-        assert_eq!(cells[1].counted, None);
+        for uri in ["example.com:443", "example.com:22", "example.com:80"] {
+            let mut leftover = CONNECT_200.to_vec();
+            leftover.extend_from_slice(b"GET / HTTP/1.1\r\nHost: after-connect.example\r\n\r\n");
+            let cells = http_req_resp(&connect_req(uri), &leftover);
+            assert_eq!(cells[0].http_host, [uri], "{uri}");
+            assert_eq!(cells[0].counted, None, "{uri}");
+            assert_eq!(cells[1].http_host, ["after-connect.example"], "{uri}");
+            assert_eq!(cells[1].counted, None, "{uri}");
+        }
     }
 
     fn http_cl_then(status: &[u8], pad: &[u8]) -> Vec<u8> {

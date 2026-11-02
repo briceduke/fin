@@ -2628,9 +2628,167 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         ),
     ]
     .into_iter()
+    .chain(connect_cases())
+    .chain(http2_cl24_cases())
     .chain(on_disk())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
+}
+
+fn connect_req(uri: &str) -> Vec<u8> {
+    let mut req = b"CONNECT ".to_vec();
+    req.extend_from_slice(uri.as_bytes());
+    req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    req.extend_from_slice(uri.as_bytes());
+    req.extend_from_slice(b"\r\n\r\n");
+    req
+}
+
+fn connect_cases() -> Vec<(&'static str, Vec<u8>)> {
+    const CONNECT_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+    const CONNECT_201: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    const TUNNEL: &[(&str, &str)] = &[
+        ("connect-21-200-then-get", "example.com:21"),
+        ("connect-22-200-then-get", "example.com:22"),
+        ("connect-23-200-then-get", "example.com:23"),
+        ("connect-25-200-then-get", "example.com:25"),
+        ("connect-53-200-then-get", "example.com:53"),
+        ("connect-110-200-then-get", "example.com:110"),
+        ("connect-143-200-then-get", "example.com:143"),
+        ("connect-587-200-then-get", "example.com:587"),
+        ("connect-1194-200-then-get", "example.com:1194"),
+        ("connect-1883-200-then-get", "example.com:1883"),
+        ("connect-3306-200-then-get", "example.com:3306"),
+        ("connect-5060-200-then-get", "example.com:5060"),
+        ("connect-5432-200-then-get", "example.com:5432"),
+        ("connect-5900-200-then-get", "example.com:5900"),
+        ("connect-6379-200-then-get", "example.com:6379"),
+    ];
+    const STAY: &[(&str, &str)] = &[
+        ("connect-443-200-then-get", "example.com:443"),
+        ("connect-80-200-then-get", "example.com:80"),
+        ("connect-8080-200-then-get", "example.com:8080"),
+        ("connect-465-200-then-get", "example.com:465"),
+        ("connect-993-200-then-get", "example.com:993"),
+        ("connect-995-200-then-get", "example.com:995"),
+    ];
+    const LEFTOVER: &[(&str, &str)] = &[
+        ("connect-443-200-leftover-get", "example.com:443"),
+        ("connect-22-200-leftover-get", "example.com:22"),
+        ("connect-80-200-leftover-get", "example.com:80"),
+    ];
+    let mut out = Vec::new();
+    for (name, uri) in TUNNEL {
+        out.push((
+            *name,
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(&connect_req(uri), CONNECT_200, INNER_GET),
+            ),
+        ));
+    }
+    out.push((
+        "connect-noport-200-then-get",
+        pcap(
+            LINK_ETHERNET,
+            &req_resp_get(&connect_req("example.com"), CONNECT_200, INNER_GET),
+        ),
+    ));
+    out.push((
+        "connect-noport-201-then-get",
+        pcap(
+            LINK_ETHERNET,
+            &req_resp_get(&connect_req("example.com"), CONNECT_201, INNER_GET),
+        ),
+    ));
+    out.push((
+        "connect-22-201-then-get",
+        pcap(
+            LINK_ETHERNET,
+            &req_resp_get(&connect_req("example.com:22"), CONNECT_201, INNER_GET),
+        ),
+    ));
+    out.push((
+        "connect-22-201-no-cl-then-get",
+        pcap(
+            LINK_ETHERNET,
+            &req_resp_get(
+                &connect_req("example.com:22"),
+                b"HTTP/1.1 201 Created\r\n\r\n",
+                INNER_GET,
+            ),
+        ),
+    ));
+    for (name, uri) in STAY {
+        out.push((
+            *name,
+            pcap(
+                LINK_ETHERNET,
+                &req_resp_get(&connect_req(uri), CONNECT_200, INNER_GET),
+            ),
+        ));
+    }
+    for (name, uri) in LEFTOVER {
+        let mut leftover = CONNECT_200.to_vec();
+        leftover.extend_from_slice(INNER_GET);
+        out.push((
+            *name,
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to(OUTER, PEER, 50000, 80, 1, &connect_req(uri)),
+                    eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, &leftover),
+                ],
+            ),
+        ));
+    }
+    out
+}
+
+fn cl24_magic_then_get(start: &[u8]) -> Vec<u8> {
+    let mut payload = start.to_vec();
+    payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n");
+    payload.extend_from_slice(HTTP2_MAGIC);
+    payload.extend_from_slice(INNER_GET);
+    payload
+}
+
+fn http2_cl24_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let starts: [(&'static str, &[u8]); 6] = [
+        ("http2-cl24-get-leftover-get", b"GET / HTTP/1.1"),
+        ("http2-cl24-put-leftover-get", b"PUT / HTTP/1.1"),
+        ("http2-cl24-options-leftover-get", b"OPTIONS / HTTP/1.1"),
+        ("http2-cl24-post-leftover-get", b"POST / HTTP/1.1"),
+        ("http2-cl24-200-leftover-get", b"HTTP/1.1 200 OK"),
+        ("http2-cl24-204-leftover-get", b"HTTP/1.1 204 No Content"),
+    ];
+    let mut out = Vec::new();
+    for (name, start) in starts {
+        out.push((
+            name,
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 80, &cl24_magic_then_get(start))],
+            ),
+        ));
+    }
+    out.push((
+        "http2-get-cl0-leftover-magic-then-get",
+        pcap(
+            LINK_ETHERNET,
+            &[eth_ipv4_tcp(OUTER, 50000, 80, &{
+                let mut payload =
+                    b"GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n".to_vec();
+                payload.extend_from_slice(HTTP2_MAGIC);
+                payload.extend_from_slice(INNER_GET);
+                payload
+            })],
+        ),
+    ));
+    let mut first = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n".to_vec();
+    first.extend_from_slice(HTTP2_MAGIC);
+    out.push(("http2-cl24-post-then-later-get", http2_then_inner(&first)));
+    out
 }
 
 fn on_disk() -> Vec<(&'static str, Vec<u8>)> {

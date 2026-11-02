@@ -21,8 +21,17 @@ pub struct HttpProved {
     pub hosts: Vec<String>,
     /// Complete `SSTP_DUPLEX_POST` request in this payload.
     pub sstp_duplex_post: bool,
+    /// Complete CONNECT request in this payload.
+    pub connect: bool,
+    /// CONNECT URI port after the first `:`, matching tshark 4.6.9
+    /// `wmem_strsplit(..., ":", 2)` then `strtol`. `None` when the URI
+    /// has no colon.
+    pub connect_port: Option<u32>,
     /// Complete 200 response in this payload.
     pub status_200: bool,
+    /// Complete 2xx response in this payload. tshark 4.6.9
+    /// `http_conversation_is_connect` uses `200 <= code < 300`.
+    pub status_2xx: bool,
     /// Complete response of any status in this payload.
     pub has_response: bool,
     /// Complete response with status >= 200. tshark 4.6.9 `push_res`
@@ -51,13 +60,19 @@ const TOKEN: &[u8] = b"!#$%&\\:*+-.^_`|~";
 /// tshark 4.6.9 `IS_TH_FIN` for a response with no Content-Length.
 #[cfg(test)]
 pub fn parse_http(payload: &[u8], end_of_stream: bool) -> HttpParse {
-    parse_http_pending(payload, end_of_stream, false)
+    parse_http_pending(payload, end_of_stream, false, false)
 }
 
 /// `sstp_pending` is a prior complete `SSTP_DUPLEX_POST` on this TCP
-/// conversation. tshark 4.6.9 then sets `try_desegment_body = false`
-/// for a 2xx, so complete headers are a complete response.
-pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> HttpParse {
+/// conversation. `connect_pending` is a prior complete CONNECT.
+/// tshark 4.6.9 then sets `try_desegment_body = false` for a 2xx, so
+/// complete headers are a complete response.
+pub fn parse_http_pending(
+    payload: &[u8],
+    end_of_stream: bool,
+    sstp_pending: bool,
+    connect_pending: bool,
+) -> HttpParse {
     if payload.is_empty() {
         return HttpParse::Other;
     }
@@ -77,12 +92,15 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
     let mut proved = HttpProved::default();
     while offset < payload.len() {
         let sstp = sstp_pending || proved.sstp_duplex_post;
-        match take_message(&payload[offset..], end_of_stream, sstp) {
+        let connect = connect_pending || proved.connect;
+        match take_message(&payload[offset..], end_of_stream, sstp, connect) {
             Take::Done => break,
             Take::Complete {
                 hosts: found,
                 next,
                 sstp_duplex_post,
+                connect,
+                connect_port,
                 status,
                 upgrade,
                 http2,
@@ -94,6 +112,10 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
                 if sstp_duplex_post {
                     proved.sstp_duplex_post = true;
                 }
+                if connect {
+                    proved.connect = true;
+                    proved.connect_port = connect_port;
+                }
                 if http2 {
                     proved.http2 = true;
                 }
@@ -101,6 +123,9 @@ pub fn parse_http_pending(payload: &[u8], end_of_stream: bool, sstp_pending: boo
                     proved.has_response = true;
                     if status >= 200 {
                         proved.has_final_response = true;
+                    }
+                    if (200..300).contains(&status) {
+                        proved.status_2xx = true;
                     }
                     if status == 200 {
                         proved.status_200 = true;
@@ -161,6 +186,8 @@ enum Take {
         hosts: Vec<String>,
         next: usize,
         sstp_duplex_post: bool,
+        connect: bool,
+        connect_port: Option<u32>,
         status: Option<u16>,
         upgrade: bool,
         http2: bool,
@@ -174,6 +201,7 @@ enum Take {
 enum LineKind {
     Request {
         sstp_duplex_post: bool,
+        connect: bool,
     },
     /// tshark 4.6.9 `MEDIA_CONTAINER_HTTP_NOTIFICATION`.
     Notification,
@@ -182,7 +210,12 @@ enum LineKind {
     },
 }
 
-fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take {
+fn take_message(
+    payload: &[u8],
+    end_of_stream: bool,
+    sstp_pending: bool,
+    connect_pending: bool,
+) -> Take {
     if payload.is_empty() {
         return Take::Done;
     }
@@ -246,11 +279,16 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
         kind,
         LineKind::Response { status } if sstp_pending && (200..300).contains(&status)
     );
+    let connect_2xx = matches!(
+        kind,
+        LineKind::Response { status } if connect_pending && (200..300).contains(&status)
+    );
     // tshark 4.6.9 `try_desegment_body = false` for 1xx / 204 / 304
-    // and for a 2xx to `SSTP_DUPLEX_POST`. Headers complete means the
-    // message is complete, including Transfer-Encoding.
-    let skip_body =
-        sstp_2xx || matches!(kind, LineKind::Response { status } if rfc_no_body(status));
+    // and for a 2xx to CONNECT or `SSTP_DUPLEX_POST`. Headers complete
+    // means the message is complete, including Transfer-Encoding.
+    let skip_body = sstp_2xx
+        || connect_2xx
+        || matches!(kind, LineKind::Response { status } if rfc_no_body(status));
     if transfer_encoding && !skip_body {
         return Take::TransferEncoding;
     }
@@ -271,10 +309,12 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
         LineKind::Response { status } if rfc_no_body(status) => {
             content_length.map(|n| n.min(available)).unwrap_or(0)
         }
-        LineKind::Response { .. } if sstp_2xx => match (transfer_encoding, content_length) {
-            (false, Some(n)) => n.min(available),
-            _ => available,
-        },
+        LineKind::Response { .. } if sstp_2xx || connect_2xx => {
+            match (transfer_encoding, content_length) {
+                (false, Some(n)) => n.min(available),
+                _ => available,
+            }
+        }
         LineKind::Response { .. } => match content_length {
             Some(n) => n,
             None if end_of_stream => available,
@@ -284,24 +324,36 @@ fn take_message(payload: &[u8], end_of_stream: bool, sstp_pending: bool) -> Take
     if available < body_need {
         return Take::Incomplete;
     }
-    let after_headers = &payload[header_end..];
     let body_end = header_end + body_need as usize;
+    let connect = matches!(kind, LineKind::Request { connect: true, .. });
     Take::Complete {
         hosts,
         next: skip + body_end,
         sstp_duplex_post: matches!(
             kind,
             LineKind::Request {
-                sstp_duplex_post: true
+                sstp_duplex_post: true,
+                ..
             }
         ),
+        connect,
+        connect_port: if connect {
+            connect_uri_port(first)
+        } else {
+            None
+        },
         status: match kind {
             LineKind::Response { status } => Some(status),
             LineKind::Request { .. } | LineKind::Notification => None,
         },
         upgrade,
-        http2: looks_like_http2_preface(after_headers)
-            || looks_like_http2_preface(&payload[body_end..]),
+        // tshark 4.6.9 `dissect_http_message` clips `datalen` to
+        // Content-Length, then walks leftover as the next message.
+        // A Content-Length *body* with leftover after it is not an
+        // HTTP/2 preface. An unbounded body (NOTIFY, or a message
+        // that consumes the rest of the payload) still is.
+        http2: looks_like_http2_preface(&payload[body_end..])
+            || (body_end == payload.len() && looks_like_http2_preface(&payload[header_end..])),
     }
 }
 
@@ -347,9 +399,49 @@ fn classify_line(line: &[u8]) -> Option<LineKind> {
     } else if is_request_method(method) {
         Some(LineKind::Request {
             sstp_duplex_post: method == b"SSTP_DUPLEX_POST",
+            connect: method == b"CONNECT",
         })
     } else {
         None
+    }
+}
+
+/// tshark 4.6.9 `http_payload_subdissector`: `wmem_strsplit(uri, ":", 2)`
+/// then `strtol` on the second token. `None` when the URI has no colon.
+fn connect_uri_port(line: &[u8]) -> Option<u32> {
+    let sp = line.iter().position(|b| *b == b' ')?;
+    let rest = &line[sp + 1..];
+    let uri_end = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
+    let uri = &rest[..uri_end];
+    let colon = uri.iter().position(|b| *b == b':')?;
+    Some(parse_strtol_u32(&uri[colon + 1..]))
+}
+
+/// C `strtol(..., 10)` for a CONNECT URI port: leading `isspace`,
+/// optional sign, then digits.
+fn parse_strtol_u32(bytes: &[u8]) -> u32 {
+    let mut i = 0;
+    while i < bytes.len() && ascii_isspace(bytes[i]) {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let mut n: i64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        n = n
+            .saturating_mul(10)
+            .saturating_add(i64::from(bytes[i] - b'0'));
+        i += 1;
+    }
+    if neg || n < 0 {
+        0
+    } else if n > i64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        n as u32
     }
 }
 
@@ -528,6 +620,7 @@ mod tests {
         HttpParse::Message(HttpProved {
             hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             status_200: status == 200,
+            status_2xx: (200..300).contains(&status),
             has_response: true,
             has_final_response: status >= 200,
             switching_upgrade,
@@ -963,6 +1056,52 @@ mod tests {
                 assert!(proved.http2, "{}", first.escape_ascii());
             }
         }
+        let cl0_then = concat_bytes(
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n",
+            &concat_bytes(MAGIC, b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"),
+        );
+        let proved = message(&cl0_then);
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(proved.http2);
+    }
+
+    const HTTP2_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    fn concat_bytes(first: &[u8], leftover: &[u8]) -> Vec<u8> {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(leftover);
+        payload
+    }
+
+    fn cl24_magic_then_get(start: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 24\r\n\r\n");
+        payload.extend_from_slice(HTTP2_MAGIC);
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n");
+        payload
+    }
+
+    #[test]
+    fn content_length_magic_body_still_pipelines_leftover_get() {
+        assert_eq!(HTTP2_MAGIC.len(), 24);
+        let starts = [
+            b"GET / HTTP/1.1".as_slice(),
+            b"PUT / HTTP/1.1",
+            b"OPTIONS / HTTP/1.1",
+            b"POST / HTTP/1.1",
+            b"HTTP/1.1 200 OK",
+            b"HTTP/1.1 204 No Content",
+        ];
+        for start in starts {
+            let proved = message(&cl24_magic_then_get(start));
+            assert_eq!(
+                proved.hosts,
+                ["a.example", "inner.example"],
+                "{}",
+                start.escape_ascii()
+            );
+            assert!(!proved.http2, "{}", start.escape_ascii());
+        }
     }
 
     #[test]
@@ -975,13 +1114,18 @@ mod tests {
 
     #[test]
     fn connect_and_options() {
-        assert_eq!(
-            parse_http(
-                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-                false
-            ),
-            msg(&["example.com:443"])
-        );
+        let proved = message(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+        assert_eq!(proved.hosts, ["example.com:443"]);
+        assert!(proved.connect);
+        assert_eq!(proved.connect_port, Some(443));
+        let proved = message(b"CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n");
+        assert_eq!(proved.hosts, ["example.com:22"]);
+        assert!(proved.connect);
+        assert_eq!(proved.connect_port, Some(22));
+        let proved = message(b"CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(proved.hosts, ["example.com"]);
+        assert!(proved.connect);
+        assert_eq!(proved.connect_port, None);
         assert_eq!(
             parse_http(b"OPTIONS * HTTP/1.1\r\nHost: opt.example\r\n\r\n", false),
             msg(&["opt.example"])
@@ -1166,7 +1310,14 @@ mod tests {
     }
 
     fn pending(payload: &[u8]) -> HttpProved {
-        match parse_http_pending(payload, false, true) {
+        match parse_http_pending(payload, false, true, false) {
+            HttpParse::Message(proved) => proved,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn connect_pending(payload: &[u8]) -> HttpProved {
+        match parse_http_pending(payload, false, false, true) {
             HttpParse::Message(proved) => proved,
             other => panic!("{other:?}"),
         }
@@ -1213,6 +1364,31 @@ mod tests {
         assert!(proved.hosts.is_empty());
         assert!(!proved.leftover_after_response);
         assert_eq!(proved.hosts_after_response, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn connect_pending_2xx_headers_are_a_complete_response() {
+        let cl0 =
+            connect_pending(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n");
+        assert!(cl0.status_200);
+        assert!(cl0.status_2xx);
+        let created = connect_pending(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+        assert!(created.status_2xx);
+        assert!(!created.status_200);
+        let no_cl = connect_pending(b"HTTP/1.1 201 Created\r\n\r\n");
+        assert!(no_cl.status_2xx);
+        assert!(no_cl.hosts.is_empty());
+        let leftover = connect_pending(
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        );
+        assert_eq!(leftover.hosts, ["inner.example"]);
+        assert!(leftover.status_2xx);
+        let body = connect_pending(
+            b"HTTP/1.1 200 Connection Established\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        );
+        assert!(body.status_2xx);
+        assert!(body.hosts.is_empty());
+        assert!(!body.leftover_after_response);
     }
 
     #[test]
