@@ -107,30 +107,6 @@ struct TcpSeq {
     seq: u32,
 }
 
-/// Payload already walked at one TCP seq.
-#[derive(Debug, Clone)]
-struct HttpSeen {
-    len: u32,
-    /// Incomplete at this seq; a later longer overlap may complete it.
-    open: bool,
-    /// Hosts already emitted from this seq, so a later prefix extension
-    /// does not print them again.
-    hosts: usize,
-    payload: Vec<u8>,
-}
-
-/// A later TCP segment versus bytes already walked on that direction.
-enum HttpOverlap {
-    /// In-order at nxtseq; dissect this payload as a new HTTP start.
-    Fresh,
-    /// Retransmission, fully-contained overlap, or a gap after nxtseq.
-    Skip,
-    /// Extends past nxtseq; dissect only the new suffix.
-    Suffix(usize),
-    /// Prefix-extends a still-open seq; re-parse the full payload.
-    OpenComplete { already: usize },
-}
-
 #[derive(Debug, Clone)]
 struct TlsNeed {
     next_seq: u32,
@@ -150,10 +126,8 @@ pub struct IpSrc {
     tls_session: HashMap<TcpFlow, TlsSession>,
     /// Conversation CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
     tls_ccs: HashMap<TcpFlow, TlsCcs>,
-    /// Payload already walked at this TCP seq.
-    http_seen: HashMap<TcpSeq, HttpSeen>,
-    /// Next unused TCP seq on that direction, matching tshark 4.6.9
-    /// `tcp.reassemble_out_of_order:TRUE` nxtseq. SYN consumes one.
+    /// Next unused TCP seq on that direction. SYN consumes one.
+    /// A gap, retransmission, or overlap is not a one-segment Host.
     http_next_seq: HashMap<TcpFlow, u32>,
     /// Direction waiting for `http.desegment_body` continuation.
     http_desegment: HashSet<TcpFlow>,
@@ -209,7 +183,6 @@ impl IpSrc {
             tls_claimed: HashSet::new(),
             tls_session: HashMap::new(),
             tls_ccs: HashMap::new(),
-            http_seen: HashMap::new(),
             http_next_seq: HashMap::new(),
             http_desegment: HashSet::new(),
             http_claimed: HashSet::new(),
@@ -241,7 +214,6 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tls_claimed: &mut session.tls_claimed,
         tls_session: &mut session.tls_session,
         tls_ccs: &mut session.tls_ccs,
-        http_seen: &mut session.http_seen,
         http_next_seq: &mut session.http_next_seq,
         http_desegment: &mut session.http_desegment,
         http_claimed: &mut session.http_claimed,
@@ -277,7 +249,6 @@ struct Walk<'a> {
     tls_claimed: &'a mut HashSet<TcpFlow>,
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
     tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
-    http_seen: &'a mut HashMap<TcpSeq, HttpSeen>,
     http_next_seq: &'a mut HashMap<TcpFlow, u32>,
     http_desegment: &'a mut HashSet<TcpFlow>,
     http_claimed: &'a mut HashSet<TcpFlow>,
@@ -749,34 +720,29 @@ impl Walk<'_> {
         payload: &[u8],
     ) {
         let flow = self.tcp_flow(sport, dport);
-        let key = flow.map(|flow| TcpSeq {
-            src: flow.src,
-            dst: flow.dst,
-            sport,
-            dport,
-            seq,
-        });
-        let overlap = self.http_overlap(flow, key, seq, payload);
-        if matches!(overlap, HttpOverlap::Skip) {
-            return;
-        }
-        let (body, skip_hosts, other_is_continuation) = match overlap {
-            HttpOverlap::Fresh => (payload, 0, false),
-            HttpOverlap::Suffix(skip) => (&payload[skip..], 0, true),
-            HttpOverlap::OpenComplete { already } => (payload, already, false),
-            HttpOverlap::Skip => unreachable!(),
-        };
         if let Some(direction) = flow {
-            let same_seq_again = key
-                .map(|key| self.http_seen.contains_key(&key))
-                .unwrap_or(false);
-            if !same_seq_again && self.http_desegment.contains(&direction) {
-                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+            if let Some(&next) = self.http_next_seq.get(&direction) {
+                let ahead = seq.wrapping_sub(next) as i32;
+                if ahead != 0 {
+                    let end = seq.wrapping_add(payload.len() as u32);
+                    if ahead > 0 || (end.wrapping_sub(next) as i32) <= 0 {
+                        return;
+                    }
+                    self.http_desegment.insert(direction);
+                    self.note_http_next(flow, seq, payload.len() as u32);
+                    self.count("http");
+                    return;
+                }
+            }
+        }
+        if let Some(direction) = flow {
+            if self.http_desegment.contains(&direction) {
+                self.note_http_next(flow, seq, payload.len() as u32);
                 self.count("http");
                 return;
             }
             if self.http_tunnel.contains(&direction.conversation()) {
-                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                self.note_http_next(flow, seq, payload.len() as u32);
                 self.count("http-tunnel");
                 return;
             }
@@ -790,23 +756,22 @@ impl Walk<'_> {
         if pick.is_http() {
             if let Some(direction) = flow {
                 if self.http_claimed.contains(&direction.conversation()) {
-                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                    self.note_http_next(flow, seq, payload.len() as u32);
                     self.count("http");
                     return;
                 }
             }
-            if looks_like_http2_preface(body) {
+            if looks_like_http2_preface(payload) {
                 if let Some(flow) = flow {
                     self.http_claimed.insert(flow.conversation());
                 }
-                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                self.note_http_next(flow, seq, payload.len() as u32);
                 self.count("http");
                 return;
             }
-            match parse_http_pending(body, fin, sstp_pending, connect_pending) {
+            match parse_http_pending(payload, fin, sstp_pending, connect_pending) {
                 HttpParse::Message(proved) => {
-                    let n = proved.hosts.len().max(skip_hosts);
-                    self.note_http_seen(flow, key, seq, payload, proved.desegment, n);
+                    self.note_http_next(flow, seq, payload.len() as u32);
                     if let Some(flow) = flow {
                         if proved.http2 {
                             self.http_claimed.insert(flow.conversation());
@@ -814,47 +779,28 @@ impl Walk<'_> {
                         if proved.desegment {
                             self.http_desegment.insert(flow);
                         }
-                        if skip_hosts == 0 {
-                            self.extend_http_hosts(flow, proved);
-                        } else {
-                            self.http_host
-                                .extend(proved.hosts.into_iter().skip(skip_hosts));
-                        }
+                        self.extend_http_hosts(flow, proved);
                     } else {
-                        self.http_host
-                            .extend(proved.hosts.into_iter().skip(skip_hosts));
+                        self.http_host.extend(proved.hosts);
                     }
                 }
                 HttpParse::Partial(hosts) => {
-                    let n = hosts.len().max(skip_hosts);
-                    self.note_http_seen(flow, key, seq, payload, true, n);
+                    self.note_http_next(flow, seq, payload.len() as u32);
                     if let Some(flow) = flow {
                         self.http_desegment.insert(flow);
                     }
-                    self.http_host.extend(hosts.into_iter().skip(skip_hosts));
+                    self.http_host.extend(hosts);
                     self.count("http");
-                }
-                HttpParse::Unproved if other_is_continuation => {
-                    let already = key
-                        .and_then(|key| self.http_seen.get(&key).map(|prev| prev.hosts))
-                        .unwrap_or(skip_hosts);
-                    self.note_http_seen(flow, key, seq, payload, true, already.max(skip_hosts));
-                    if let Some(flow) = flow {
-                        self.http_desegment.insert(flow);
-                    }
                 }
                 HttpParse::Unproved => {
-                    self.note_http_seen(flow, key, seq, payload, true, skip_hosts);
+                    self.note_http_next(flow, seq, payload.len() as u32);
                     if let Some(flow) = flow {
                         self.http_desegment.insert(flow);
                     }
                     self.count("http");
                 }
-                HttpParse::Other if other_is_continuation => {
-                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
-                }
                 HttpParse::Other => {
-                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                    self.note_http_next(flow, seq, payload.len() as u32);
                     self.count("http");
                 }
             }
@@ -863,90 +809,18 @@ impl Walk<'_> {
         let claimed = flow
             .map(|flow| self.http_claimed.contains(&flow.conversation()))
             .unwrap_or(false);
-        if claimed || looks_like_http_heuristic(body) {
+        if claimed || looks_like_http_heuristic(payload) {
             if let Some(flow) = flow {
                 self.http_claimed.insert(flow.conversation());
             }
-            self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+            self.note_http_next(flow, seq, payload.len() as u32);
             self.count("http-heuristic");
             return;
         }
         if pick.is_tls() {
-            self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+            self.note_http_next(flow, seq, payload.len() as u32);
             self.count("http-over-tls");
         }
-    }
-
-    fn http_overlap(
-        &self,
-        flow: Option<TcpFlow>,
-        key: Option<TcpSeq>,
-        seq: u32,
-        payload: &[u8],
-    ) -> HttpOverlap {
-        let Some(flow) = flow else {
-            return HttpOverlap::Fresh;
-        };
-        let Some(&next) = self.http_next_seq.get(&flow) else {
-            return HttpOverlap::Fresh;
-        };
-        let ahead = seq.wrapping_sub(next) as i32;
-        if ahead > 0 {
-            return HttpOverlap::Skip;
-        }
-        if ahead == 0 {
-            return HttpOverlap::Fresh;
-        }
-        let len = payload.len() as u32;
-        let end = seq.wrapping_add(len);
-        if (end.wrapping_sub(next) as i32) <= 0 {
-            return HttpOverlap::Skip;
-        }
-        if let Some(key) = key {
-            if let Some(prev) = self.http_seen.get(&key) {
-                if prev.open && payload.starts_with(&prev.payload) {
-                    return HttpOverlap::OpenComplete {
-                        already: prev.hosts,
-                    };
-                }
-            }
-        }
-        let skip = next.wrapping_sub(seq) as usize;
-        if skip >= payload.len() {
-            return HttpOverlap::Skip;
-        }
-        HttpOverlap::Suffix(skip)
-    }
-
-    fn note_http_seen(
-        &mut self,
-        flow: Option<TcpFlow>,
-        key: Option<TcpSeq>,
-        seq: u32,
-        payload: &[u8],
-        open: bool,
-        hosts: usize,
-    ) {
-        let len = payload.len() as u32;
-        if let Some(key) = key {
-            self.http_seen
-                .entry(key)
-                .and_modify(|prev| {
-                    if len >= prev.len {
-                        prev.len = len;
-                        prev.open = open;
-                        prev.hosts = hosts;
-                        prev.payload = payload.to_vec();
-                    }
-                })
-                .or_insert(HttpSeen {
-                    len,
-                    open,
-                    hosts,
-                    payload: payload.to_vec(),
-                });
-        }
-        self.note_http_next(flow, seq, len);
     }
 
     fn note_http_next(&mut self, flow: Option<TcpFlow>, seq: u32, len: u32) {
@@ -2503,7 +2377,7 @@ mod tests {
         assert_eq!(cells[0].http_host, ["a.example"]);
         assert_eq!(cells[0].counted, None);
         assert_eq!(cells[1].http_host, [] as [&str; 0]);
-        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[1].counted, Some("http"));
     }
 
     #[test]
@@ -2524,20 +2398,7 @@ mod tests {
         assert_eq!(cells[3].http_host, ["a.example"]);
         assert_eq!(cells[3].counted, None);
         assert_eq!(cells[4].http_host, [] as [&str; 0]);
-        assert_eq!(cells[4].counted, None);
-    }
-
-    #[test]
-    fn http_same_seq_full_after_partial_prints_host() {
-        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, full),
-        ]);
-        assert_eq!(cells[0].http_host, [] as [&str; 0]);
-        assert_eq!(cells[0].counted, Some("http"));
-        assert_eq!(cells[1].http_host, ["split.example"]);
-        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[4].counted, Some("http"));
     }
 
     #[test]
@@ -2573,38 +2434,6 @@ mod tests {
     }
 
     #[test]
-    fn http_same_seq_open_complete_plus_truncated_prints_suffix_host() {
-        let mut first = GET_A.to_vec();
-        first.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
-        let mut second = first.clone();
-        second.extend_from_slice(b"inner.example\r\n\r\n");
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
-        ]);
-        assert_eq!(cells[0].http_host, ["a.example"]);
-        assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["inner.example"]);
-        assert_eq!(cells[1].counted, None);
-    }
-
-    #[test]
-    fn http_same_seq_open_mid_header_then_two_requests_prints_suffix_host() {
-        let mut first = GET_A.to_vec();
-        first.extend_from_slice(b"GET / HTTP/1.1\r\nHos");
-        let mut second = GET_A.to_vec();
-        second.extend_from_slice(INNER_GET);
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
-        ]);
-        assert_eq!(cells[0].http_host, ["a.example"]);
-        assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["inner.example"]);
-        assert_eq!(cells[1].counted, None);
-    }
-
-    #[test]
     fn http_same_seq_open_response_prefix_then_get_stays_blank() {
         let resp = b"HTTP/1.1 200 OK\r\nHost: st.example\r\n\r\n";
         let cells = walk_http_frames(&[
@@ -2614,7 +2443,7 @@ mod tests {
         assert_eq!(cells[0].http_host, [] as [&str; 0]);
         assert_eq!(cells[0].counted, Some("http"));
         assert_eq!(cells[1].http_host, [] as [&str; 0]);
-        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[1].counted, Some("http"));
     }
 
     #[test]
@@ -2627,7 +2456,7 @@ mod tests {
             assert_eq!(cells[0].http_host, ["a.example"], "seq {seq}");
             assert_eq!(cells[0].counted, None, "seq {seq}");
             assert_eq!(cells[1].http_host, [] as [&str; 0], "seq {seq}");
-            assert_eq!(cells[1].counted, None, "seq {seq}");
+            assert_eq!(cells[1].counted, Some("http"), "seq {seq}");
         }
     }
 
@@ -2658,60 +2487,13 @@ mod tests {
     }
 
     #[test]
-    fn http_overlap_past_nxtseq_with_complete_get_prints_host() {
-        for seq in [1u32, 2, 10, 20, 35] {
-            let second = overlap_past_nxtseq(seq, INNER_GET);
-            let cells = walk_http_frames(&[
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, &second),
-            ]);
-            assert_first_a_then_inner(&cells, &format!("seq {seq}"));
-        }
-    }
-
-    #[test]
-    fn http_overlap_past_nxtseq_ipv6_8080_and_handshake() {
-        let second = overlap_past_nxtseq(35, INNER_GET);
-        let ipv4 = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
-        ]);
-        assert_first_a_then_inner(&ipv4, "ipv4-80");
-        let port = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 8080, 1, GET_A),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 8080, 35, &second),
-        ]);
-        assert_first_a_then_inner(&port, "ipv4-8080");
-        let ipv6 = walk_http_frames(&[
-            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 1, GET_A),
-            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 35, &second),
-        ]);
-        assert_first_a_then_inner(&ipv6, "ipv6-80");
-        let handshake = walk_http_frames(&[
-            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
-            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
-            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 35, &second),
-        ]);
-        for cell in &handshake[..3] {
-            assert_eq!(cell.http_host, [] as [&str; 0]);
-            assert_eq!(cell.counted, None);
-        }
-        assert_eq!(handshake[3].http_host, ["a.example"]);
-        assert_eq!(handshake[3].counted, None);
-        assert_eq!(handshake[4].http_host, ["inner.example"]);
-        assert_eq!(handshake[4].counted, None);
-    }
-
-    #[test]
     fn http_syn_payload_nxtseq_skips_seq_plus_len() {
         for (label, flags) in SYN_HTTP_FLAGS {
             let cells = syn_http_then(flags, 35, 80);
             assert_eq!(cells[0].http_host, ["a.example"], "{label} extra");
             assert_eq!(cells[0].counted, None, "{label} extra");
             assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} extra");
-            assert_eq!(cells[1].counted, None, "{label} extra");
+            assert_eq!(cells[1].counted, Some("http"), "{label} extra");
         }
         let ipv6 = walk_http_frames(&[
             eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x1a, GET_A),
@@ -2720,12 +2502,12 @@ mod tests {
         assert_eq!(ipv6[0].http_host, ["a.example"]);
         assert_eq!(ipv6[0].counted, None);
         assert_eq!(ipv6[1].http_host, [] as [&str; 0]);
-        assert_eq!(ipv6[1].counted, None);
+        assert_eq!(ipv6[1].counted, Some("http"));
         let port = syn_http_then(0x1a, 35, 8080);
         assert_eq!(port[0].http_host, ["a.example"]);
         assert_eq!(port[0].counted, None);
         assert_eq!(port[1].http_host, [] as [&str; 0]);
-        assert_eq!(port[1].counted, None);
+        assert_eq!(port[1].counted, Some("http"));
     }
 
     #[test]
@@ -2776,39 +2558,61 @@ mod tests {
     #[test]
     fn http_empty_syn_then_get_not_at_nxtseq_is_not_http() {
         for (label, flags) in EMPTY_SYN_FLAGS {
-            for seq in [0u32, 2] {
-                let cells = empty_syn_then_get(flags, seq, 80, 0x18);
-                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
-            }
+            let counted = empty_syn_then_get(flags, 0, 80, 0x18);
+            assert_empty_syn_then_counted(&counted, &format!("{label} seq 0"));
+            let blank = empty_syn_then_get(flags, 2, 80, 0x18);
+            assert_empty_syn_then_blank(&blank, &format!("{label} seq 2"));
         }
-        for seq in [0u32, 2] {
-            let psh = empty_syn_then_get(0x02, seq, 80, 0x08);
-            assert_empty_syn_then_blank(&psh, &format!("psh-no-ack seq {seq}"));
-            let v6 = walk_http_frames(&[
-                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x02, b""),
-                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, GET_A),
-            ]);
-            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
-            for dport in [8080u16, 3128] {
-                let cells = empty_syn_then_get(0x02, seq, dport, 0x18);
-                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
-            }
-            let src80 = walk_http_frames(&[
-                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x02, b""),
-                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, GET_A),
-            ]);
-            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
-            let isn = walk_http_frames(&[
-                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, GET_A),
-            ]);
-            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
-            let handshake = empty_syn_handshake_then_get(seq);
-            assert_eq!(handshake[0].http_host, [] as [&str; 0], "hs syn {seq}");
-            assert_eq!(handshake[0].counted, None, "hs syn {seq}");
-            assert_eq!(handshake[3].http_host, [] as [&str; 0], "hs get {seq}");
-            assert_eq!(handshake[3].counted, None, "hs get {seq}");
+        let psh0 = empty_syn_then_get(0x02, 0, 80, 0x08);
+        assert_empty_syn_then_counted(&psh0, "psh-no-ack seq 0");
+        let psh2 = empty_syn_then_get(0x02, 2, 80, 0x08);
+        assert_empty_syn_then_blank(&psh2, "psh-no-ack seq 2");
+        let v6_0 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 0, GET_A),
+        ]);
+        assert_empty_syn_then_counted(&v6_0, "ipv6 seq 0");
+        let v6_2 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 2, GET_A),
+        ]);
+        assert_empty_syn_then_blank(&v6_2, "ipv6 seq 2");
+        for dport in [8080u16, 3128] {
+            let counted = empty_syn_then_get(0x02, 0, dport, 0x18);
+            assert_empty_syn_then_counted(&counted, &format!("{dport} seq 0"));
+            let blank = empty_syn_then_get(0x02, 2, dport, 0x18);
+            assert_empty_syn_then_blank(&blank, &format!("{dport} seq 2"));
         }
+        let src80_0 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x02, b""),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, 0, GET_A),
+        ]);
+        assert_empty_syn_then_counted(&src80_0, "src80 seq 0");
+        let src80_2 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x02, b""),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, 2, GET_A),
+        ]);
+        assert_empty_syn_then_blank(&src80_2, "src80 seq 2");
+        let isn0 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000, GET_A),
+        ]);
+        assert_empty_syn_then_counted(&isn0, "isn seq 0");
+        let isn2 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x02, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1002, GET_A),
+        ]);
+        assert_empty_syn_then_blank(&isn2, "isn seq 2");
+        let hs0 = empty_syn_handshake_then_get(0);
+        assert_eq!(hs0[0].http_host, [] as [&str; 0], "hs syn 0");
+        assert_eq!(hs0[0].counted, None, "hs syn 0");
+        assert_eq!(hs0[3].http_host, [] as [&str; 0], "hs get 0");
+        assert_eq!(hs0[3].counted, Some("http"), "hs get 0");
+        let hs2 = empty_syn_handshake_then_get(2);
+        assert_eq!(hs2[0].http_host, [] as [&str; 0], "hs syn 2");
+        assert_eq!(hs2[0].counted, None, "hs syn 2");
+        assert_eq!(hs2[3].http_host, [] as [&str; 0], "hs get 2");
+        assert_eq!(hs2[3].counted, None, "hs get 2");
     }
 
     #[test]
@@ -2833,43 +2637,65 @@ mod tests {
     #[test]
     fn http_empty_syn_rst_then_get_not_at_nxtseq_is_not_http() {
         for (label, flags) in SYN_RST_FLAGS {
-            for seq in [0u32, 2] {
-                let cells = empty_syn_then_get(flags, seq, 80, 0x18);
-                assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
-            }
+            let counted = empty_syn_then_get(flags, 0, 80, 0x18);
+            assert_empty_syn_then_counted(&counted, &format!("{label} seq 0"));
+            let blank = empty_syn_then_get(flags, 2, 80, 0x18);
+            assert_empty_syn_then_blank(&blank, &format!("{label} seq 2"));
         }
-        for seq in [0u32, 2] {
-            let v6 = walk_http_frames(&[
-                eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, b""),
-                eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, GET_A),
-            ]);
-            assert_empty_syn_then_blank(&v6, &format!("ipv6 seq {seq}"));
-            for dport in [8080u16, 3128] {
-                let cells = empty_syn_then_get(0x06, seq, dport, 0x18);
-                assert_empty_syn_then_blank(&cells, &format!("{dport} seq {seq}"));
-            }
-            let src80 = walk_http_frames(&[
-                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, b""),
-                eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, seq, GET_A),
-            ]);
-            assert_empty_syn_then_blank(&src80, &format!("src80 seq {seq}"));
-            let isn = walk_http_frames(&[
-                eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000 + seq, GET_A),
-            ]);
-            assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
+        let v6_0 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, b""),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 0, GET_A),
+        ]);
+        assert_empty_syn_then_counted(&v6_0, "ipv6 seq 0");
+        let v6_2 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, b""),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 2, GET_A),
+        ]);
+        assert_empty_syn_then_blank(&v6_2, "ipv6 seq 2");
+        for dport in [8080u16, 3128] {
+            let counted = empty_syn_then_get(0x06, 0, dport, 0x18);
+            assert_empty_syn_then_counted(&counted, &format!("{dport} seq 0"));
+            let blank = empty_syn_then_get(0x06, 2, dport, 0x18);
+            assert_empty_syn_then_blank(&blank, &format!("{dport} seq 2"));
         }
+        let src80_0 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, b""),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, 0, GET_A),
+        ]);
+        assert_empty_syn_then_counted(&src80_0, "src80 seq 0");
+        let src80_2 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, b""),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, 2, GET_A),
+        ]);
+        assert_empty_syn_then_blank(&src80_2, "src80 seq 2");
+        let isn0 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000, GET_A),
+        ]);
+        assert_empty_syn_then_counted(&isn0, "isn seq 0");
+        let isn2 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1002, GET_A),
+        ]);
+        assert_empty_syn_then_blank(&isn2, "isn seq 2");
     }
 
     #[test]
     fn http_syn_rst_payload_then_later_get_is_not_http() {
         for (label, flags) in SYN_RST_FLAGS {
-            for seq in [0u32, 35, 36, 37] {
+            let counted = syn_rst_payload_then(flags, 0, 80);
+            assert_empty_syn_then_counted(&counted, &format!("{label} seq 0"));
+            for seq in [35u32, 36, 37] {
                 let cells = syn_rst_payload_then(flags, seq, 80);
                 assert_empty_syn_then_blank(&cells, &format!("{label} seq {seq}"));
             }
         }
-        for seq in [0u32, 35, 36, 37] {
+        let v6_0 = walk_http_frames(&[
+            eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, GET_A),
+            eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 0, INNER_GET),
+        ]);
+        assert_empty_syn_then_counted(&v6_0, "ipv6 seq 0");
+        for seq in [35u32, 36, 37] {
             let v6 = walk_http_frames(&[
                 eth_ipv6_tcp_flow_flags(V6_CLIENT, V6_SERVER, 50000, 80, 0, 0x06, GET_A),
                 eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, seq, INNER_GET),
@@ -2890,6 +2716,20 @@ mod tests {
             ]);
             assert_empty_syn_then_blank(&isn, &format!("isn seq {seq}"));
         }
+        for dport in [8080u16, 3128] {
+            let cells = syn_rst_payload_then(0x06, 0, dport);
+            assert_empty_syn_then_counted(&cells, &format!("{dport} seq 0"));
+        }
+        let src80_0 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 80, 50000, 0, 0x06, GET_A),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 80, 50000, 0, INNER_GET),
+        ]);
+        assert_empty_syn_then_counted(&src80_0, "src80 seq 0");
+        let isn0 = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1000, 0x06, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1000, INNER_GET),
+        ]);
+        assert_empty_syn_then_counted(&isn0, "isn seq 0");
     }
 
     #[test]
@@ -2913,37 +2753,13 @@ mod tests {
     }
 
     #[test]
-    fn http_truncated_prefix_extend_then_complete_prints_host() {
-        for cut in [
-            b"GET / HTTP/1.1\r\nHost: ".as_slice(),
-            b"GET / HTTP/1.1\r\nHos",
-        ] {
-            let mut mid = GET_A.to_vec();
-            mid.extend_from_slice(cut);
-            let mut last = GET_A.to_vec();
-            last.extend_from_slice(INNER_GET);
-            let cells = walk_http_frames(&[
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &mid),
-                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &last),
-            ]);
-            assert_eq!(cells[0].http_host, ["a.example"], "{cut:?}");
-            assert_eq!(cells[0].counted, None, "{cut:?}");
-            assert_eq!(cells[1].http_host, [] as [&str; 0], "{cut:?}");
-            assert_eq!(cells[1].counted, None, "{cut:?}");
-            assert_eq!(cells[2].http_host, ["inner.example"], "{cut:?}");
-            assert_eq!(cells[2].counted, None, "{cut:?}");
-        }
-    }
-
-    #[test]
     fn http_unproved_prefix_extend_suffix_counts_in_order_inner() {
         for n in [1usize, 2, 3, 17, 18, 19, 20] {
             let cells = truncated_suffix_then_in_order(&INNER_GET[..n]);
             assert_eq!(cells[0].http_host, ["a.example"], "cut {n}");
             assert_eq!(cells[0].counted, None, "cut {n}");
             assert_eq!(cells[1].http_host, [] as [&str; 0], "cut {n}");
-            assert_eq!(cells[1].counted, None, "cut {n}");
+            assert_eq!(cells[1].counted, Some("http"), "cut {n}");
             assert_eq!(cells[2].http_host, [] as [&str; 0], "cut {n}");
             assert_eq!(cells[2].counted, Some("http"), "cut {n}");
         }
@@ -2952,10 +2768,11 @@ mod tests {
         assert_eq!(cells[0].http_host, ["a.example"]);
         assert_eq!(cells[0].counted, None);
         assert_eq!(cells[1].http_host, [] as [&str; 0]);
-        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[1].counted, Some("http"));
         assert_eq!(cells[2].http_host, [] as [&str; 0]);
         assert_eq!(cells[2].counted, Some("http"));
-        let second = overlap_past_nxtseq(35, b"GET / HTTP/1.1\r\nHos");
+        let mut second = vec![b'X'];
+        second.extend_from_slice(b"GET / HTTP/1.1\r\nHos");
         let nxtseq = 35 + second.len() as u32;
         let overlap = walk_http_frames(&[
             eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
@@ -2965,7 +2782,7 @@ mod tests {
         assert_eq!(overlap[0].http_host, ["a.example"]);
         assert_eq!(overlap[0].counted, None);
         assert_eq!(overlap[1].http_host, [] as [&str; 0]);
-        assert_eq!(overlap[1].counted, None);
+        assert_eq!(overlap[1].counted, Some("http"));
         assert_eq!(overlap[2].http_host, [] as [&str; 0]);
         assert_eq!(overlap[2].counted, Some("http"));
     }
@@ -2988,7 +2805,7 @@ mod tests {
         assert_eq!(cells[0].http_host, ["a.example"]);
         assert_eq!(cells[0].counted, None);
         assert_eq!(cells[1].http_host, [] as [&str; 0]);
-        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[1].counted, Some("http"));
         assert_eq!(cells[2].http_host, [] as [&str; 0]);
         assert_eq!(cells[2].counted, Some("http"));
     }
@@ -3010,100 +2827,6 @@ mod tests {
     }
 
     #[test]
-    fn http_same_seq_prefix_extension_prints_suffix_host() {
-        let mut second = GET_A.to_vec();
-        second.extend_from_slice(INNER_GET);
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
-        ]);
-        assert_eq!(cells[0].http_host, ["a.example"]);
-        assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["inner.example"]);
-        assert_eq!(cells[1].counted, None);
-    }
-
-    #[test]
-    fn http_same_seq_prefix_extension_after_handshake_prints_suffix_host() {
-        let mut second = GET_A.to_vec();
-        second.extend_from_slice(INNER_GET);
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
-            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
-            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
-        ]);
-        for cell in &cells[..3] {
-            assert_eq!(cell.http_host, [] as [&str; 0]);
-            assert_eq!(cell.counted, None);
-        }
-        assert_eq!(cells[3].http_host, ["a.example"]);
-        assert_eq!(cells[3].counted, None);
-        assert_eq!(cells[4].http_host, ["inner.example"]);
-        assert_eq!(cells[4].counted, None);
-    }
-
-    #[test]
-    fn http_same_seq_prefix_extension_after_post_and_responses() {
-        let post = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\n\r\nxxxx";
-        let resp_200 = b"HTTP/1.1 200 OK\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
-        let resp_204 = b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
-        for (src, dst, sport, dport, first) in [
-            (CLIENT, SERVER, 50000, 80, post.as_slice()),
-            (SERVER, CLIENT, 80, 50000, resp_200.as_slice()),
-            (SERVER, CLIENT, 80, 50000, resp_204.as_slice()),
-        ] {
-            let mut second = first.to_vec();
-            second.extend_from_slice(INNER_GET);
-            let cells = walk_http_frames(&[
-                eth_ipv4_tcp_flow(src, dst, sport, dport, 1, first),
-                eth_ipv4_tcp_flow(src, dst, sport, dport, 1, &second),
-            ]);
-            assert_eq!(cells[0].http_host, ["a.example"], "{first:?}");
-            assert_eq!(cells[0].counted, None, "{first:?}");
-            assert_eq!(cells[1].http_host, ["inner.example"], "{first:?}");
-            assert_eq!(cells[1].counted, None, "{first:?}");
-        }
-    }
-
-    #[test]
-    fn http_same_seq_prefix_extension_after_two_pipelined_prints_third() {
-        let get_b = b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n";
-        let get_c = b"GET / HTTP/1.1\r\nHost: c.example\r\n\r\n";
-        let mut first = GET_A.to_vec();
-        first.extend_from_slice(get_b);
-        let mut second = first.clone();
-        second.extend_from_slice(get_c);
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
-        ]);
-        assert_eq!(cells[0].http_host, ["a.example", "b.example"]);
-        assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["c.example"]);
-        assert_eq!(cells[1].counted, None);
-    }
-
-    #[test]
-    fn http_same_seq_partial_then_full_then_prefix_extension() {
-        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
-        let mut third = full.to_vec();
-        third.extend_from_slice(INNER_GET);
-        let cells = walk_http_frames(&[
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, full),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &third),
-        ]);
-        assert_eq!(cells[0].http_host, [] as [&str; 0]);
-        assert_eq!(cells[0].counted, Some("http"));
-        assert_eq!(cells[1].http_host, ["split.example"]);
-        assert_eq!(cells[1].counted, None);
-        assert_eq!(cells[2].http_host, ["inner.example"]);
-        assert_eq!(cells[2].counted, None);
-    }
-
-    #[test]
     fn http_same_seq_prefix_extension_non_request_stays_blank() {
         for extra in [b"X".as_slice(), b"not a request".as_slice()] {
             let mut second = GET_A.to_vec();
@@ -3115,7 +2838,7 @@ mod tests {
             assert_eq!(cells[0].http_host, ["a.example"], "{extra:?}");
             assert_eq!(cells[0].counted, None, "{extra:?}");
             assert_eq!(cells[1].http_host, [] as [&str; 0], "{extra:?}");
-            assert_eq!(cells[1].counted, None, "{extra:?}");
+            assert_eq!(cells[1].counted, Some("http"), "{extra:?}");
         }
     }
 
@@ -3242,14 +2965,6 @@ mod tests {
             .collect()
     }
 
-    fn overlap_past_nxtseq(seq: u32, suffix: &[u8]) -> Vec<u8> {
-        let nxtseq = 1 + GET_A.len() as u32;
-        let pad = nxtseq.saturating_sub(seq) as usize;
-        let mut payload = vec![b'X'; pad];
-        payload.extend_from_slice(suffix);
-        payload
-    }
-
     const SYN_HTTP_FLAGS: [(&str, u8); 5] = [
         ("syn", 0x02),
         ("syn-psh", 0x0a),
@@ -3308,6 +3023,13 @@ mod tests {
         assert_eq!(cells[0].counted, None, "{label} syn");
         assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} get");
         assert_eq!(cells[1].counted, None, "{label} get");
+    }
+
+    fn assert_empty_syn_then_counted(cells: &[Cell], label: &str) {
+        assert_eq!(cells[0].http_host, [] as [&str; 0], "{label} syn");
+        assert_eq!(cells[0].counted, None, "{label} syn");
+        assert_eq!(cells[1].http_host, [] as [&str; 0], "{label} get");
+        assert_eq!(cells[1].counted, Some("http"), "{label} get");
     }
 
     fn truncated_suffix_then_in_order(cut: &[u8]) -> Vec<Cell> {
