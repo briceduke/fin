@@ -235,6 +235,7 @@ fn take_message(
     let mut content_length = None;
     let mut transfer_encoding = false;
     let mut upgrade = false;
+    let mut after_no_colon_blank = None;
     loop {
         let Some((line, next)) = take_line(&payload[offset..]) else {
             return Take::Incomplete;
@@ -248,13 +249,15 @@ fn take_message(
         }
         let Some(colon) = line.iter().position(|b| *b == b':') else {
             // tshark 4.6.9 `dissect_http_message` breaks when `memchr`
-            // finds no colon; offset stays on this line. For a request,
-            // `datalen` is 0, so leftover starting here is Continuation,
-            // not a new HTTP message. `http.desegment_headers` still
-            // needs a later blank line before Host is emitted.
-            if !has_blank_line(&payload[offset + next..]) {
+            // finds no colon; offset stays on this line. Leftover
+            // starting here is Continuation. `req_resp_hdrs_do_reassembly`
+            // still uses a later blank as the header terminator, and
+            // when `try_desegment_body` is true waits for Content-Length
+            // bytes *after* that blank before Host is emitted.
+            let Some(after) = after_blank_line(&payload[offset + next..]) else {
                 return Take::Incomplete;
-            }
+            };
+            after_no_colon_blank = Some(after);
             break;
         };
         offset += next;
@@ -292,6 +295,16 @@ fn take_message(
         || matches!(kind, LineKind::Response { status } if rfc_no_body(status));
     if transfer_encoding && !skip_body {
         return Take::TransferEncoding;
+    }
+    if let Some(after_blank) = after_no_colon_blank {
+        let try_desegment_body = !end_of_stream && !skip_body;
+        if try_desegment_body {
+            if let Some(n) = content_length {
+                if (after_blank.len() as u64) < n {
+                    return Take::Incomplete;
+                }
+            }
+        }
     }
     let header_end = offset;
     let available = (payload.len() - header_end) as u64;
@@ -358,17 +371,17 @@ fn take_message(
     }
 }
 
-/// tshark 4.6.9 `req_resp_hdrs_do_reassembly` waits for a blank line
-/// (`linelen == 0`) before `dissect_http_message` emits Host.
-fn has_blank_line(bytes: &[u8]) -> bool {
+/// Bytes after the first blank line (`linelen == 0`), matching tshark
+/// 4.6.9 `req_resp_hdrs_do_reassembly`. `None` when no blank is present.
+fn after_blank_line(bytes: &[u8]) -> Option<&[u8]> {
     let mut offset = 0;
     while let Some((line, next)) = take_line(&bytes[offset..]) {
         if line.is_empty() {
-            return true;
+            return Some(&bytes[offset + next..]);
         }
         offset += next;
     }
-    false
+    None
 }
 
 fn take_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
@@ -435,7 +448,7 @@ fn connect_uri_port(line: &[u8]) -> Option<u32> {
 /// optional sign, then digits.
 fn parse_strtol_u32(bytes: &[u8]) -> u32 {
     let mut i = 0;
-    while i < bytes.len() && ascii_isspace(bytes[i]) {
+    while i < bytes.len() && strtoll_leading_space(bytes[i]) {
         i += 1;
     }
     let mut neg = false;
@@ -561,13 +574,14 @@ fn valid_header_name(name: &[u8]) -> bool {
 }
 
 /// tshark 4.6.9 `HDR_CONTENT_LENGTH`: `g_ascii_strtoll` on the ENC_ASCII
-/// C string. Leading `g_ascii_isspace` is skipped; after the digits, NUL
-/// or `g_ascii_isspace` is accepted.
+/// C string. Leading skip follows `g_ascii_strtoll` (VT included). After
+/// the digits, NUL or GLib 2.80 `g_ascii_isspace` is accepted; VT `0x0b`
+/// is not space on this tshark, so `4\x0b` is an invalid length.
 fn parse_content_length(value: &[u8]) -> Option<u64> {
     let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
     let value = &value[..end];
     let mut i = 0;
-    while i < value.len() && ascii_isspace(value[i]) {
+    while i < value.len() && strtoll_leading_space(value[i]) {
         i += 1;
     }
     if i < value.len() && value[i] == b'+' {
@@ -591,9 +605,15 @@ fn parse_content_length(value: &[u8]) -> Option<u64> {
     }
 }
 
-/// GLib `g_ascii_isspace`: SP, HT, LF, VT, FF, CR.
+/// GLib 2.80 `g_ascii_isspace` on tshark 4.6.9 (`v4.6.9-0-g2d548b197c75`):
+/// SP, HT, LF, FF, CR. VT `0x0b` is not space.
 fn ascii_isspace(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
+}
+
+/// `g_ascii_strtoll` / C `strtol` still skip leading VT.
+fn strtoll_leading_space(b: u8) -> bool {
+    ascii_isspace(b) || b == 0x0b
 }
 
 /// tshark 4.6.9 `tvb_get_string_enc(..., ENC_ASCII)` then a C string:
@@ -1121,6 +1141,65 @@ mod tests {
         );
     }
 
+    fn junk_cl4(start: &[u8], after_junk: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 4\r\nnot-a-header\r\n");
+        payload.extend_from_slice(after_junk);
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n");
+        payload
+    }
+
+    #[test]
+    fn no_colon_content_length_waits_after_the_later_blank() {
+        let starts = [
+            b"HTTP/1.1 200 OK".as_slice(),
+            b"HTTP/1.1 201 Created",
+            b"HTTP/1.1 302 Found",
+            b"HTTP/1.1 404 Not Found",
+            b"HTTP/1.1 206 Partial Content",
+            b"POST / HTTP/1.1",
+            b"GET / HTTP/1.1",
+        ];
+        for start in starts {
+            for pad in [b"xxxx".as_slice(), b""] {
+                assert_eq!(
+                    parse_http(&junk_cl4(start, pad), false),
+                    HttpParse::Unproved,
+                    "{} {}",
+                    start.escape_ascii(),
+                    pad.escape_ascii()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_colon_blank_then_content_length_body_prints_the_first_host() {
+        first_host_without_inner(&junk_cl4(b"HTTP/1.1 200 OK", b"\r\nxxxx"), "a.example");
+        first_host_without_inner(&junk_cl4(b"POST / HTTP/1.1", b"\r\nxxxx"), "a.example");
+        first_host_without_inner(&junk_cl4(b"GET / HTTP/1.1", b"\r\nxxxx"), "a.example");
+    }
+
+    #[test]
+    fn no_colon_204_304_and_fin_do_not_wait_for_body() {
+        first_host_without_inner(
+            &leftover_after(b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nnot-a-header\r\n\r\n"),
+            "a.example",
+        );
+        first_host_without_inner(
+            &leftover_after(
+                b"HTTP/1.1 304 Not Modified\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+            ),
+            "a.example",
+        );
+        let HttpParse::Message(proved) = parse_http(&junk_cl4(b"HTTP/1.1 200 OK", b"xxxx"), true)
+        else {
+            panic!("expected a proved 200 on TCP FIN");
+        };
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(!proved.desegment);
+    }
+
     #[test]
     fn heuristic_matches_tshark() {
         assert!(looks_like_http_heuristic(
@@ -1275,6 +1354,55 @@ mod tests {
                 "{payload:?}"
             );
         }
+    }
+
+    fn cl_trail_then_inner(trail: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut payload = b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4".to_vec();
+        payload.extend_from_slice(trail);
+        payload.extend_from_slice(b"\r\n\r\n");
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n");
+        payload
+    }
+
+    #[test]
+    fn content_length_trailing_vt_is_invalid_so_leftover_is_continuation() {
+        first_host_without_inner(&cl_trail_then_inner(b"\x0b", b"xxxx"), "cl.example");
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\n",
+                false
+            ),
+            msg(&["cl.example"])
+        );
+    }
+
+    #[test]
+    fn content_length_lead_vt_and_trail_ff_tab_sp_nul_still_pipeline() {
+        assert_eq!(
+            parse_http(&cl_trail_then_inner(b"\x0c", b"xxxx"), false),
+            msg(&["cl.example", "inner.example"])
+        );
+        assert_eq!(
+            parse_http(&cl_trail_then_inner(b"\t", b"xxxx"), false),
+            msg(&["cl.example", "inner.example"])
+        );
+        assert_eq!(
+            parse_http(&cl_trail_then_inner(b" ", b"xxxx"), false),
+            msg(&["cl.example", "inner.example"])
+        );
+        assert_eq!(
+            parse_http(&cl_trail_then_inner(b"\x00", b"xxxx"), false),
+            msg(&["cl.example", "inner.example"])
+        );
+        let mut lead =
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\nxxxx"
+                .to_vec();
+        lead.extend_from_slice(b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n");
+        assert_eq!(
+            parse_http(&lead, false),
+            msg(&["cllead.example", "inner.example"])
+        );
     }
 
     #[test]

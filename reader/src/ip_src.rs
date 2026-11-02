@@ -3600,6 +3600,72 @@ mod tests {
         }
     }
 
+    fn http_junk_cl4(start: &[u8], after_junk: &[u8]) -> Vec<u8> {
+        let mut payload = start.to_vec();
+        payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 4\r\nnot-a-header\r\n");
+        payload.extend_from_slice(after_junk);
+        payload.extend_from_slice(INNER_GET);
+        payload
+    }
+
+    #[test]
+    fn http_no_colon_content_length_without_body_after_blank_is_counted() {
+        let starts = [
+            b"HTTP/1.1 200 OK".as_slice(),
+            b"HTTP/1.1 201 Created",
+            b"POST / HTTP/1.1",
+            b"GET / HTTP/1.1",
+        ];
+        for start in starts {
+            for pad in [b"xxxx".as_slice(), b""] {
+                let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &http_junk_cl4(start, pad)));
+                assert_eq!(cell.http_host, [] as [&str; 0], "{:?} {:?}", start, pad);
+                assert_eq!(cell.counted, Some("http"), "{:?} {:?}", start, pad);
+            }
+        }
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &http_junk_cl4(b"HTTP/1.1 200 OK", b"\r\nxxxx"),
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp_fin(
+            CLIENT,
+            50000,
+            80,
+            &http_junk_cl4(b"HTTP/1.1 200 OK", b"xxxx"),
+        ));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_content_length_trailing_vt_leftover_is_continuation() {
+        let mut payload =
+            b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nxxxx".to_vec();
+        payload.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &payload));
+        assert_eq!(cell.http_host, ["cl.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["cl.example"]);
+        assert_eq!(cell.counted, None);
+        let mut lead =
+            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\nxxxx"
+                .to_vec();
+        lead.extend_from_slice(INNER_GET);
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &lead));
+        assert_eq!(cell.http_host, ["cllead.example", "inner.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
     #[test]
     fn truncated_tls_record_is_counted() {
         let mut hello = sni_hello("cut.example");

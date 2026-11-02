@@ -1092,6 +1092,90 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         (
+            "content-length-trail-vt-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &cl_trail_then_inner(b"\x0b", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-vt",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\n",
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-ff-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &cl_trail_then_inner(b"\x0c", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-tab-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &cl_trail_then_inner(b"\t", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-sp-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &cl_trail_then_inner(b" ", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "content-length-trail-nul-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &cl_trail_then_inner(b"\x00", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "content-length-lead-vt-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 80, &{
+                    let mut payload = b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\nxxxx"
+                        .to_vec();
+                    payload.extend_from_slice(INNER_GET);
+                    payload
+                })],
+            ),
+        ),
+        (
             "upgrade-websocket-same-segment-leftover",
             pcap(
                 LINK_ETHERNET,
@@ -2752,6 +2836,23 @@ fn junk_then_inner(first: &[u8]) -> Vec<u8> {
     payload
 }
 
+fn cl_trail_then_inner(trail: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut payload = b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4".to_vec();
+    payload.extend_from_slice(trail);
+    payload.extend_from_slice(b"\r\n\r\n");
+    payload.extend_from_slice(body);
+    payload.extend_from_slice(INNER_GET);
+    payload
+}
+
+fn junk_cl4_then_inner(start: &[u8], after_junk: &[u8]) -> Vec<u8> {
+    let mut payload = start.to_vec();
+    payload.extend_from_slice(b"\r\nHost: a.example\r\nContent-Length: 4\r\nnot-a-header\r\n");
+    payload.extend_from_slice(after_junk);
+    payload.extend_from_slice(INNER_GET);
+    payload
+}
+
 fn junk_header_frame(sport: u16, dport: u16, first: &[u8]) -> Vec<u8> {
     pcap(
         LINK_ETHERNET,
@@ -2873,6 +2974,146 @@ fn junk_header_cases() -> Vec<(&'static str, Vec<u8>)> {
                     50000,
                     80,
                     b"GET / HTTP/1.1\r\nHost: fuzz.example\r\nnot-a-header\r\n",
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-200-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 200 OK", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-200-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 200 OK", b""),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-201-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 201 Created", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-302-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 302 Found", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-404-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 404 Not Found", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-206-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 206 Partial Content", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-post-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"POST / HTTP/1.1", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-get-xxxx-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"GET / HTTP/1.1", b"xxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-200-blank-body-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 200 OK", b"\r\nxxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-cl4-post-blank-body-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"POST / HTTP/1.1", b"\r\nxxxx"),
+                )],
+            ),
+        ),
+        (
+            "junk-304-then-get",
+            junk_header_frame(
+                50000,
+                80,
+                b"HTTP/1.1 304 Not Modified\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+            ),
+        ),
+        (
+            "junk-cl4-200-xxxx-fin",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_fin(
+                    OUTER,
+                    50000,
+                    80,
+                    &junk_cl4_then_inner(b"HTTP/1.1 200 OK", b"xxxx"),
                 )],
             ),
         ),
