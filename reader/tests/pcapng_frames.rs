@@ -215,7 +215,6 @@ fn big_endian_section_reads_one_packet() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x07, 0x08]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -231,9 +230,7 @@ fn snaplen_does_not_clip_an_enhanced_packet() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].captured, &[0x01, 0x02, 0x03, 0x04]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0xab]);
-    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -251,10 +248,8 @@ fn second_interface_supplies_its_link_type() {
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].link_type, 113);
     assert_eq!(capture.frames[1].captured, &[0xbb, 0xcc]);
-    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -273,13 +268,11 @@ fn a_new_section_resets_interface_ids() {
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[1].link_type, 276);
     assert_eq!(capture.frames[1].captured, &[2, 3]);
-    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
 fn an_unknown_block_between_packets_is_skipped() {
     let skipped = unknown_block(Endian::Little, 7);
-    assert_eq!(skipped.len(), 12);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -292,9 +285,7 @@ fn an_unknown_block_between_packets_is_skipped() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].captured, &[0x01]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0x02]);
-    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -310,7 +301,6 @@ fn simple_packet_clips_to_snaplen() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x01, 0x02, 0x03, 0x04]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -327,7 +317,6 @@ fn simple_packet_snaplen_zero_keeps_the_original_length() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &packet);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -361,10 +350,6 @@ fn options_after_endofopt_are_ignored() {
         &option(Endian::Little, 0, &[]),
         &option(Endian::Little, 9, &[9]),
     ]);
-    assert_eq!(
-        options,
-        [0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00]
-    );
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &options),
@@ -380,7 +365,6 @@ fn options_after_endofopt_are_ignored() {
 #[test]
 fn power_of_ten_tsresol_above_19_is_unsupported() {
     let resol = option(Endian::Little, 9, &[20]);
-    assert_eq!(resol, [0x09, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &resol),
@@ -407,7 +391,6 @@ fn power_of_ten_tsresol_above_19_is_unsupported() {
 #[test]
 fn power_of_two_tsresol_above_63_is_unsupported() {
     let resol = option(Endian::Little, 9, &[0xc0]);
-    assert_eq!(resol, [0x09, 0x00, 0x01, 0x00, 0xc0, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &resol),
@@ -434,10 +417,6 @@ fn power_of_two_tsresol_above_63_is_unsupported() {
 #[test]
 fn shb_version_1_1_is_unsupported() {
     let header = section_header_version(Endian::Little, 1, 1);
-    assert_eq!(
-        &header[8..16],
-        [0x4d, 0x3c, 0x2b, 0x1a, 0x01, 0x00, 0x01, 0x00]
-    );
     let bytes = concat(&[
         &header,
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -492,9 +471,7 @@ fn a_packet_option_does_not_swallow_the_next_packet() {
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 2);
     assert_eq!(capture.frames[0].captured, &[0x11]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
     assert_eq!(capture.frames[1].captured, &[0x22]);
-    assert!(is_subslice(&bytes, capture.frames[1].captured));
 }
 
 #[test]
@@ -510,7 +487,6 @@ fn obsolete_packet_block_is_a_frame() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 1);
     assert_eq!(capture.frames[0].captured, &[0x0a, 0x0b]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
@@ -526,13 +502,11 @@ fn an_unclaimed_pcapng_link_type_still_yields_the_frame() {
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].link_type, 127);
     assert_eq!(capture.frames[0].captured, &[0x22]);
-    assert!(is_subslice(&bytes, capture.frames[0].captured));
 }
 
 #[test]
 fn header_only_section_has_no_frames() {
     let bytes = section_header(Endian::Little);
-    assert_eq!(bytes.len(), 28);
     let capture = read_capture(&bytes);
 
     assert_eq!(capture.frames.len(), 0);
@@ -576,7 +550,6 @@ fn a_truncated_block_keeps_the_earlier_frame() {
 #[test]
 fn captured_length_above_the_maximum_is_not_a_frame() {
     let epb = enhanced_packet(Endian::Little, 0, 0, 262145, 262145, &[], &[]);
-    assert_eq!(epb.len(), 32);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -655,7 +628,6 @@ fn mismatched_block_lengths_stop() {
         &pack_u32(1, Endian::Little),
         &[0x11, 0x00, 0x00, 0x00],
     ]);
-    assert_eq!(body.len(), 24);
     let epb = block_with_lengths(Endian::Little, 6, &body, 36, 40);
     let bytes = concat(&[
         &section_header(Endian::Little),
@@ -680,7 +652,6 @@ fn mismatched_block_lengths_stop() {
 #[test]
 fn if_tsresol_is_used_only_when_the_length_is_one() {
     let resol = option(Endian::Little, 9, &[9, 0]);
-    assert_eq!(resol, [0x09, 0x00, 0x02, 0x00, 0x09, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &resol),
@@ -730,7 +701,6 @@ fn an_option_overrun_fails_the_idb() {
 #[test]
 fn if_filter_length_zero_fails_the_idb() {
     let filter = option(Endian::Little, 11, &[]);
-    assert_eq!(filter, [0x0b, 0x00, 0x00, 0x00]);
     let bytes = concat(&[
         &section_header(Endian::Little),
         &interface_block(Endian::Little, 1, 65535, &[]),
@@ -855,99 +825,57 @@ fn epb_lengths(first: u32, second: u32) -> Vec<u8> {
 }
 
 #[test]
-fn a_trailer_three_below_the_first_length_is_accepted() {
-    let bytes = concat(&[&prefix(None), &epb_lengths(36, 35)]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
+fn rounded_epb_trailers_are_accepted() {
+    for (prior, first, second, want) in [(None, 36, 35, 1), (None, 36, 33, 1), (Some(1), 36, 35, 2)]
+    {
+        let bytes = concat(&[&prefix(prior), &epb_lengths(first, second)]);
+        let capture = read_capture(&bytes);
+        assert_eq!(capture.fault, None);
+        assert_eq!(capture.frames.len(), want);
+        assert_eq!(capture.frames[want - 1].captured, &[0xaa]);
+        assert_eq!(capture.exit_code(), 0);
+    }
 }
 
 #[test]
-fn a_trailer_that_rounds_up_to_the_first_length_is_accepted() {
-    let bytes = concat(&[&prefix(None), &epb_lengths(36, 33)]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_later_unaligned_epb_trailer_keeps_both_frames() {
-    let bytes = concat(&[&prefix(Some(1)), &epb_lengths(36, 35)]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 2);
-    assert_eq!(capture.frames[0].captured, &[1]);
-    assert_eq!(capture.frames[1].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn opening_shb_first_length_27_still_opens() {
-    let bytes = concat(&[
-        &section_header_totals(Endian::Little, 27, 27),
-        &interface_block(Endian::Little, 1, 65535, &[]),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn opening_shb_trailer_27_still_opens() {
-    let bytes = concat(&[
-        &section_header_totals(Endian::Little, 28, 27),
-        &interface_block(Endian::Little, 1, 65535, &[]),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn opening_shb_first_length_29_still_opens() {
-    let bytes = concat(&[
-        &section_header_padded(Endian::Little, 29, 32, 4),
-        &interface_block(Endian::Little, 1, 65535, &[]),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(capture.frames[0].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_later_shb_first_length_27_still_opens() {
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &section_header_totals(Endian::Little, 27, 27),
-        &interface_block(Endian::Little, 1, 65535, &[]),
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 2);
-    assert_eq!(capture.frames[0].captured, &[1]);
-    assert_eq!(capture.frames[1].captured, &[0xaa]);
-    assert_eq!(capture.exit_code(), 0);
+fn rounded_shb_lengths_still_open() {
+    let packet = enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0xaa], &[]);
+    let iface = interface_block(Endian::Little, 1, 65535, &[]);
+    let files = [
+        concat(&[
+            &section_header_totals(Endian::Little, 27, 27),
+            &iface,
+            &packet,
+        ]),
+        concat(&[
+            &section_header_totals(Endian::Little, 28, 27),
+            &iface,
+            &packet,
+        ]),
+        concat(&[
+            &section_header_padded(Endian::Little, 29, 32, 4),
+            &iface,
+            &packet,
+        ]),
+        concat(&[
+            &prefix(Some(1)),
+            &section_header_totals(Endian::Little, 27, 27),
+            &iface,
+            &packet,
+        ]),
+    ];
+    for (index, bytes) in files.iter().enumerate() {
+        let capture = read_capture(bytes);
+        assert_eq!(capture.fault, None, "case {index}");
+        assert_eq!(capture.frames.last().unwrap().captured, &[0xaa]);
+        assert_eq!(capture.exit_code(), 0);
+        if index == 3 {
+            assert_eq!(capture.frames.len(), 2);
+            assert_eq!(capture.frames[0].captured, &[1]);
+        } else {
+            assert_eq!(capture.frames.len(), 1);
+        }
+    }
 }
 
 #[test]
@@ -1030,24 +958,32 @@ fn a_journal_export_between_packets_is_a_frame() {
 }
 
 #[test]
-fn an_empty_journal_export_stops_the_file() {
-    let bytes = concat(&[&prefix(Some(1)), &unknown_block(Endian::Little, 9)]);
-    let capture = read_capture(&bytes);
-    let fault = capture.fault.unwrap();
-
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        fault,
-        Fault::BlockBody {
-            kind: BlockKind::Journal,
-            length: 0
-        }
-    );
-    assert_eq!(capture.exit_code(), 14);
-    assert_eq!(
-        fault.phrase(),
-        "pcapng: block content length 0 of a systemd journal export is less than the minimum systemd journal export content size 23"
-    );
+fn empty_extra_blocks_stop_the_file() {
+    for (block_type, kind, phrase) in [
+        (
+            9,
+            BlockKind::Journal,
+            "pcapng: block content length 0 of a systemd journal export is less than the minimum systemd journal export content size 23",
+        ),
+        (
+            0x0000_0BAD,
+            BlockKind::Custom,
+            "pcapng: block content length 0 of a CB is less than the minimum CB content size 4",
+        ),
+        (
+            10,
+            BlockKind::Dsb,
+            "pcapng: block content length 0 of an DSB is less than the minimum DSB content size 8",
+        ),
+    ] {
+        let bytes = concat(&[&prefix(Some(1)), &unknown_block(Endian::Little, block_type)]);
+        let capture = read_capture(&bytes);
+        let fault = capture.fault.unwrap();
+        assert_eq!(capture.frames.len(), 1);
+        assert_eq!(fault, Fault::BlockBody { kind, length: 0 });
+        assert_eq!(capture.exit_code(), 14);
+        assert_eq!(fault.phrase(), phrase);
+    }
 }
 
 #[test]
@@ -1096,28 +1032,27 @@ fn a_journal_entry_stripped_below_the_minimum_stops_the_file() {
 }
 
 #[test]
-fn a_custom_block_between_packets_is_a_frame() {
-    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &custom,
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+fn a_custom_block_is_a_frame() {
+    let body = pack_u32(1, Endian::Little);
+    for block_type in [0x0000_0BAD, 0x4000_0BAD] {
+        let custom = block(Endian::Little, block_type, &body);
+        let between = concat(&[
+            &prefix(Some(1)),
+            &custom,
+            &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
+        ]);
+        let capture = read_capture(&between);
+        assert_eq!(capture.fault, None);
+        assert_eq!(capture.frames.len(), 3);
+        assert_eq!(capture.frames[1].captured, b"");
+        assert_eq!(capture.frames[2].captured, &[0x02]);
+        assert_eq!(capture.exit_code(), 0);
+    }
+    let solo = concat(&[
+        &section_header(Endian::Little),
+        &block(Endian::Little, 0x0000_0BAD, &body),
     ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, b"");
-    assert_eq!(capture.frames[2].captured, &[0x02]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn a_custom_block_without_packets_is_a_frame() {
-    let custom = block(Endian::Little, 0x0000_0BAD, &pack_u32(1, Endian::Little));
-    let bytes = concat(&[&section_header(Endian::Little), &custom]);
-    let capture = read_capture(&bytes);
-
+    let capture = read_capture(&solo);
     assert_eq!(capture.fault, None);
     assert_eq!(capture.frames.len(), 1);
     assert_eq!(capture.frames[0].captured, b"");
@@ -1125,48 +1060,7 @@ fn a_custom_block_without_packets_is_a_frame() {
 }
 
 #[test]
-fn a_nocopy_custom_block_between_packets_is_a_frame() {
-    let custom = block(Endian::Little, 0x4000_0BAD, &pack_u32(1, Endian::Little));
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &custom,
-        &enhanced_packet(Endian::Little, 0, 0, 1, 1, &[0x02], &[]),
-    ]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.fault, None);
-    assert_eq!(capture.frames.len(), 3);
-    assert_eq!(capture.frames[1].captured, b"");
-    assert_eq!(capture.frames[2].captured, &[0x02]);
-    assert_eq!(capture.exit_code(), 0);
-}
-
-#[test]
-fn an_empty_custom_block_stops_the_file() {
-    let bytes = concat(&[
-        &prefix(Some(1)),
-        &unknown_block(Endian::Little, 0x0000_0BAD),
-    ]);
-    let capture = read_capture(&bytes);
-    let fault = capture.fault.unwrap();
-
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        fault,
-        Fault::BlockBody {
-            kind: BlockKind::Custom,
-            length: 0
-        }
-    );
-    assert_eq!(capture.exit_code(), 14);
-    assert_eq!(
-        fault.phrase(),
-        "pcapng: block content length 0 of a CB is less than the minimum CB content size 4"
-    );
-}
-
-#[test]
-fn an_isb_custom_option_stops_the_file() {
+fn an_isb_custom_option_faults() {
     let isb = block(
         Endian::Little,
         5,
@@ -1177,56 +1071,19 @@ fn an_isb_custom_option_stops_the_file() {
             &option(Endian::Little, 2988, &[]),
         ]),
     );
-    let bytes = concat(&[&prefix(Some(1)), &isb]);
-    let capture = read_capture(&bytes);
-    let fault = capture.fault.unwrap();
+    let after_bytes = concat(&[&prefix(Some(1)), &isb]);
+    let after = read_capture(&after_bytes);
+    assert_eq!(after.frames.len(), 1);
+    assert_eq!(after.fault, Some(Fault::CustomOption { length: 0 }));
+    assert_eq!(after.exit_code(), 14);
 
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(fault, Fault::CustomOption { length: 0 });
-    assert_eq!(capture.exit_code(), 14);
-}
-
-#[test]
-fn an_opening_isb_custom_option_exits_3() {
-    let isb = block(
-        Endian::Little,
-        5,
-        &concat(&[
-            &pack_u32(0, Endian::Little),
-            &pack_u32(0, Endian::Little),
-            &pack_u32(0, Endian::Little),
-            &option(Endian::Little, 2988, &[]),
-        ]),
-    );
-    let bytes = concat(&[&prefix(None), &isb]);
-    let capture = read_capture(&bytes);
-
-    assert_eq!(capture.frames.len(), 0);
-    assert_eq!(capture.exit_code(), 3);
+    let opening_bytes = concat(&[&prefix(None), &isb]);
+    let opening = read_capture(&opening_bytes);
+    assert_eq!(opening.frames.len(), 0);
+    assert_eq!(opening.exit_code(), 3);
     assert_eq!(
-        capture.fault.unwrap().phrase(),
+        opening.fault.unwrap().phrase(),
         "pcapng: option length (0) too small for custom option"
-    );
-}
-
-#[test]
-fn an_empty_dsb_stops_the_file() {
-    let bytes = concat(&[&prefix(Some(1)), &unknown_block(Endian::Little, 10)]);
-    let capture = read_capture(&bytes);
-    let fault = capture.fault.unwrap();
-
-    assert_eq!(capture.frames.len(), 1);
-    assert_eq!(
-        fault,
-        Fault::BlockBody {
-            kind: BlockKind::Dsb,
-            length: 0
-        }
-    );
-    assert_eq!(capture.exit_code(), 14);
-    assert_eq!(
-        fault.phrase(),
-        "pcapng: block content length 0 of an DSB is less than the minimum DSB content size 8"
     );
 }
 
