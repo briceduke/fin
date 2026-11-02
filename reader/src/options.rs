@@ -55,15 +55,6 @@ struct Collected {
     resol: Option<u8>,
 }
 
-pub(crate) fn walk_shb(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    big_endian: bool,
-) -> Result<(), Fault> {
-    walk_common(bytes, start, end, big_endian)
-}
-
 pub(crate) fn walk_common(
     bytes: &[u8],
     start: usize,
