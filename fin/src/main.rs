@@ -32,7 +32,8 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
         io::stdin()
             .read_to_end(&mut bytes)
             .map_err(|error| format!("stdin: {error}"))?;
-        return emit("stdin", read_capture(&bytes), &args.fields);
+        return write_rows("stdin", read_capture(&bytes), &args.fields)
+            .map_err(|error| error.to_string());
     }
     let file = File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let is_file = file.metadata().map(|m| m.is_file()).unwrap_or(false);
@@ -43,11 +44,12 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        return emit(
+        return write_rows(
             &path.display().to_string(),
             read_capture(&bytes),
             &args.fields,
-        );
+        )
+        .map_err(|error| error.to_string());
     }
     // Regular files are mapped. They are not written while fin reads them; on
     // Linux a concurrent truncation can SIGBUS instead of reporting a fault.
@@ -56,15 +58,12 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
     let threads = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    emit(
+    write_rows(
         &path.display().to_string(),
         read_capture_chunked(&mapped, threads),
         &args.fields,
     )
-}
-
-fn emit(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> Result<i32, String> {
-    write_rows(name, capture, fields).map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
 fn write_rows(name: &str, capture: reader::Capture<'_>, fields: &[Field]) -> io::Result<i32> {
@@ -147,7 +146,7 @@ fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
     let mut file = None;
     let mut fields_flag = false;
     let mut fields = Vec::new();
-    let mut args = raw.peekable();
+    let mut args = raw;
     while let Some(arg) = args.next() {
         let Some(flag) = arg.to_str() else {
             return Err("unrecognized flag".to_string());
@@ -192,10 +191,7 @@ fn parse(raw: impl Iterator<Item = OsString>) -> Result<Args, String> {
     Ok(Args { file, fields })
 }
 
-fn next_str(
-    args: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
-    flag: &str,
-) -> Result<String, String> {
+fn next_str(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, String> {
     let value = args.next().ok_or_else(|| format!("missing {flag} value"))?;
     value
         .into_string()
