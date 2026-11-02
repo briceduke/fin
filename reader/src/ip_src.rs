@@ -108,11 +108,27 @@ struct TcpSeq {
 }
 
 /// Payload already walked at one TCP seq.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HttpSeen {
     len: u32,
     /// Incomplete at this seq; a later longer overlap may complete it.
     open: bool,
+    /// Hosts already emitted from this seq, so a later prefix extension
+    /// does not print them again.
+    hosts: usize,
+    payload: Vec<u8>,
+}
+
+/// A later TCP segment versus bytes already walked on that direction.
+enum HttpOverlap {
+    /// In-order or a gap; dissect this payload as a new HTTP start.
+    Fresh,
+    /// Retransmission, replacement, or overlap of consumed seq; no Host.
+    Skip,
+    /// Prefix-extends a completed seq; dissect only the new suffix.
+    Suffix(usize),
+    /// Prefix-extends a still-open seq; re-parse the full payload.
+    OpenComplete { already: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +152,9 @@ pub struct IpSrc {
     tls_ccs: HashMap<TcpFlow, TlsCcs>,
     /// Payload already walked at this TCP seq.
     http_seen: HashMap<TcpSeq, HttpSeen>,
+    /// Next unused TCP seq on that direction, matching tshark 4.6.9
+    /// `tcp.reassemble_out_of_order:TRUE` nxtseq.
+    http_next_seq: HashMap<TcpFlow, u32>,
     /// Direction waiting for `http.desegment_body` continuation.
     http_desegment: HashSet<TcpFlow>,
     /// Heuristic `http_tcp` or an HTTP/2 preface on a named `http` port
@@ -191,6 +210,7 @@ impl IpSrc {
             tls_session: HashMap::new(),
             tls_ccs: HashMap::new(),
             http_seen: HashMap::new(),
+            http_next_seq: HashMap::new(),
             http_desegment: HashSet::new(),
             http_claimed: HashSet::new(),
             http_sstp: HashSet::new(),
@@ -222,6 +242,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tls_session: &mut session.tls_session,
         tls_ccs: &mut session.tls_ccs,
         http_seen: &mut session.http_seen,
+        http_next_seq: &mut session.http_next_seq,
         http_desegment: &mut session.http_desegment,
         http_claimed: &mut session.http_claimed,
         http_sstp: &mut session.http_sstp,
@@ -256,6 +277,7 @@ struct Walk<'a> {
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
     tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
     http_seen: &'a mut HashMap<TcpSeq, HttpSeen>,
+    http_next_seq: &'a mut HashMap<TcpFlow, u32>,
     http_desegment: &'a mut HashSet<TcpFlow>,
     http_claimed: &'a mut HashSet<TcpFlow>,
     http_sstp: &'a mut HashSet<TcpFlow>,
@@ -718,29 +740,28 @@ impl Walk<'_> {
             dport,
             seq,
         });
-        let len = payload.len() as u32;
-        if let Some(key) = key {
-            if let Some(prev) = self.http_seen.get(&key) {
-                // Shorter or equal is a retransmission. A later longer
-                // segment at a seq that already completed HTTP is tshark
-                // 4.6.9 [TCP Out-Of-Order] Continuation, not a new Host.
-                // A still-open partial at this seq may complete.
-                if len <= prev.len || !prev.open {
-                    return;
-                }
-            }
+        let overlap = self.http_overlap(flow, key, seq, payload);
+        if matches!(overlap, HttpOverlap::Skip) {
+            self.note_http_next(flow, seq, payload.len() as u32);
+            return;
         }
-        if let Some(flow) = flow {
+        let (body, skip_hosts, other_is_continuation) = match overlap {
+            HttpOverlap::Fresh => (payload, 0, false),
+            HttpOverlap::Suffix(skip) => (&payload[skip..], 0, true),
+            HttpOverlap::OpenComplete { already } => (payload, already, false),
+            HttpOverlap::Skip => unreachable!(),
+        };
+        if let Some(direction) = flow {
             let same_seq_again = key
                 .map(|key| self.http_seen.contains_key(&key))
                 .unwrap_or(false);
-            if !same_seq_again && self.http_desegment.contains(&flow) {
-                self.note_http_seen(key, len, false);
+            if !same_seq_again && self.http_desegment.contains(&direction) {
+                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
                 self.count("http");
                 return;
             }
-            if self.http_tunnel.contains(&flow.conversation()) {
-                self.note_http_seen(key, len, false);
+            if self.http_tunnel.contains(&direction.conversation()) {
+                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
                 self.count("http-tunnel");
                 return;
             }
@@ -752,24 +773,25 @@ impl Walk<'_> {
             .map(|flow| self.http_connect.contains_key(&flow.conversation()))
             .unwrap_or(false);
         if pick.is_http() {
-            if let Some(flow) = flow {
-                if self.http_claimed.contains(&flow.conversation()) {
-                    self.note_http_seen(key, len, false);
+            if let Some(direction) = flow {
+                if self.http_claimed.contains(&direction.conversation()) {
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
                     self.count("http");
                     return;
                 }
             }
-            if looks_like_http2_preface(payload) {
+            if looks_like_http2_preface(body) {
                 if let Some(flow) = flow {
                     self.http_claimed.insert(flow.conversation());
                 }
-                self.note_http_seen(key, len, false);
+                self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
                 self.count("http");
                 return;
             }
-            match parse_http_pending(payload, fin, sstp_pending, connect_pending) {
+            match parse_http_pending(body, fin, sstp_pending, connect_pending) {
                 HttpParse::Message(proved) => {
-                    self.note_http_seen(key, len, proved.desegment);
+                    let n = proved.hosts.len().max(skip_hosts);
+                    self.note_http_seen(flow, key, seq, payload, proved.desegment, n);
                     if let Some(flow) = flow {
                         if proved.http2 {
                             self.http_claimed.insert(flow.conversation());
@@ -777,28 +799,41 @@ impl Walk<'_> {
                         if proved.desegment {
                             self.http_desegment.insert(flow);
                         }
-                        self.extend_http_hosts(flow, proved);
+                        if skip_hosts == 0 {
+                            self.extend_http_hosts(flow, proved);
+                        } else {
+                            self.http_host
+                                .extend(proved.hosts.into_iter().skip(skip_hosts));
+                        }
                     } else {
-                        self.http_host.extend(proved.hosts);
+                        self.http_host
+                            .extend(proved.hosts.into_iter().skip(skip_hosts));
                     }
                 }
                 HttpParse::Partial(hosts) => {
-                    self.note_http_seen(key, len, true);
+                    let n = hosts.len().max(skip_hosts);
+                    self.note_http_seen(flow, key, seq, payload, true, n);
                     if let Some(flow) = flow {
                         self.http_desegment.insert(flow);
                     }
-                    self.http_host.extend(hosts);
+                    self.http_host.extend(hosts.into_iter().skip(skip_hosts));
                     self.count("http");
+                }
+                HttpParse::Unproved if other_is_continuation => {
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
                 }
                 HttpParse::Unproved => {
-                    self.note_http_seen(key, len, true);
+                    self.note_http_seen(flow, key, seq, payload, true, skip_hosts);
                     if let Some(flow) = flow {
                         self.http_desegment.insert(flow);
                     }
                     self.count("http");
                 }
+                HttpParse::Other if other_is_continuation => {
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
+                }
                 HttpParse::Other => {
-                    self.note_http_seen(key, len, false);
+                    self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
                     self.count("http");
                 }
             }
@@ -807,29 +842,101 @@ impl Walk<'_> {
         let claimed = flow
             .map(|flow| self.http_claimed.contains(&flow.conversation()))
             .unwrap_or(false);
-        if claimed || looks_like_http_heuristic(payload) {
+        if claimed || looks_like_http_heuristic(body) {
             if let Some(flow) = flow {
                 self.http_claimed.insert(flow.conversation());
             }
-            self.note_http_seen(key, len, false);
+            self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
             self.count("http-heuristic");
             return;
         }
         if pick.is_tls() {
-            self.note_http_seen(key, len, false);
+            self.note_http_seen(flow, key, seq, payload, false, skip_hosts);
             self.count("http-over-tls");
         }
     }
 
-    fn note_http_seen(&mut self, key: Option<TcpSeq>, len: u32, open: bool) {
+    fn http_overlap(
+        &self,
+        flow: Option<TcpFlow>,
+        key: Option<TcpSeq>,
+        seq: u32,
+        payload: &[u8],
+    ) -> HttpOverlap {
+        let Some(flow) = flow else {
+            return HttpOverlap::Fresh;
+        };
+        let Some(&next) = self.http_next_seq.get(&flow) else {
+            return HttpOverlap::Fresh;
+        };
+        if (seq.wrapping_sub(next) as i32) >= 0 {
+            return HttpOverlap::Fresh;
+        }
+        let len = payload.len() as u32;
+        let end = seq.wrapping_add(len);
+        if (end.wrapping_sub(next) as i32) <= 0 {
+            return HttpOverlap::Skip;
+        }
+        if let Some(key) = key {
+            if let Some(prev) = self.http_seen.get(&key) {
+                if len <= prev.len {
+                    return HttpOverlap::Skip;
+                }
+                if payload.starts_with(&prev.payload) {
+                    if prev.open {
+                        return HttpOverlap::OpenComplete {
+                            already: prev.hosts,
+                        };
+                    }
+                    return HttpOverlap::Suffix(prev.payload.len());
+                }
+                return HttpOverlap::Skip;
+            }
+        }
+        HttpOverlap::Skip
+    }
+
+    fn note_http_seen(
+        &mut self,
+        flow: Option<TcpFlow>,
+        key: Option<TcpSeq>,
+        seq: u32,
+        payload: &[u8],
+        open: bool,
+        hosts: usize,
+    ) {
+        let len = payload.len() as u32;
         if let Some(key) = key {
             self.http_seen
                 .entry(key)
                 .and_modify(|prev| {
-                    prev.len = prev.len.max(len);
-                    prev.open = open;
+                    if len >= prev.len {
+                        prev.len = len;
+                        prev.open = open;
+                        prev.hosts = hosts;
+                        prev.payload = payload.to_vec();
+                    }
                 })
-                .or_insert(HttpSeen { len, open });
+                .or_insert(HttpSeen {
+                    len,
+                    open,
+                    hosts,
+                    payload: payload.to_vec(),
+                });
+        }
+        self.note_http_next(flow, seq, len);
+    }
+
+    fn note_http_next(&mut self, flow: Option<TcpFlow>, seq: u32, len: u32) {
+        let Some(flow) = flow else {
+            return;
+        };
+        let end = seq.wrapping_add(len);
+        match self.http_next_seq.get(&flow).copied() {
+            Some(next) if (end.wrapping_sub(next) as i32) <= 0 => {}
+            _ => {
+                self.http_next_seq.insert(flow, end);
+            }
         }
     }
 
@@ -2441,6 +2548,203 @@ mod tests {
     }
 
     #[test]
+    fn http_same_seq_open_complete_plus_truncated_prints_suffix_host() {
+        let mut first = GET_A.to_vec();
+        first.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
+        let mut second = first.clone();
+        second.extend_from_slice(b"inner.example\r\n\r\n");
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_open_mid_header_then_two_requests_prints_suffix_host() {
+        let mut first = GET_A.to_vec();
+        first.extend_from_slice(b"GET / HTTP/1.1\r\nHos");
+        let mut second = GET_A.to_vec();
+        second.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_open_response_prefix_then_get_stays_blank() {
+        let resp = b"HTTP/1.1 200 OK\r\nHost: st.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, &resp[..20]),
+            eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_overlapping_later_seq_is_continuation() {
+        for seq in [2u32, 5, 35] {
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, seq, INNER_GET),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "seq {seq}");
+            assert_eq!(cells[0].counted, None, "seq {seq}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "seq {seq}");
+            assert_eq!(cells[1].counted, None, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn http_in_order_seq_after_first_payload_prints_host() {
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 36, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_split_headers_then_overlap_at_seq_1_is_continuation() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 21, &full[20..]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, INNER_GET),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("http"));
+        assert_eq!(cells[2].http_host, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_prints_suffix_host() {
+        let mut second = GET_A.to_vec();
+        second.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_after_handshake_prints_suffix_host() {
+        let mut second = GET_A.to_vec();
+        second.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        for cell in &cells[..3] {
+            assert_eq!(cell.http_host, [] as [&str; 0]);
+            assert_eq!(cell.counted, None);
+        }
+        assert_eq!(cells[3].http_host, ["a.example"]);
+        assert_eq!(cells[3].counted, None);
+        assert_eq!(cells[4].http_host, ["inner.example"]);
+        assert_eq!(cells[4].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_after_post_and_responses() {
+        let post = b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\n\r\nxxxx";
+        let resp_200 = b"HTTP/1.1 200 OK\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+        let resp_204 = b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+        for (src, dst, sport, dport, first) in [
+            (CLIENT, SERVER, 50000, 80, post.as_slice()),
+            (SERVER, CLIENT, 80, 50000, resp_200.as_slice()),
+            (SERVER, CLIENT, 80, 50000, resp_204.as_slice()),
+        ] {
+            let mut second = first.to_vec();
+            second.extend_from_slice(INNER_GET);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_flow(src, dst, sport, dport, 1, first),
+                eth_ipv4_tcp_flow(src, dst, sport, dport, 1, &second),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "{first:?}");
+            assert_eq!(cells[0].counted, None, "{first:?}");
+            assert_eq!(cells[1].http_host, ["inner.example"], "{first:?}");
+            assert_eq!(cells[1].counted, None, "{first:?}");
+        }
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_after_two_pipelined_prints_third() {
+        let get_b = b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n";
+        let get_c = b"GET / HTTP/1.1\r\nHost: c.example\r\n\r\n";
+        let mut first = GET_A.to_vec();
+        first.extend_from_slice(get_b);
+        let mut second = first.clone();
+        second.extend_from_slice(get_c);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+        ]);
+        assert_eq!(cells[0].http_host, ["a.example", "b.example"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].http_host, ["c.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_partial_then_full_then_prefix_extension() {
+        let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let mut third = full.to_vec();
+        third.extend_from_slice(INNER_GET);
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &full[..20]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, full),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &third),
+        ]);
+        assert_eq!(cells[0].http_host, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("http"));
+        assert_eq!(cells[1].http_host, ["split.example"]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].http_host, ["inner.example"]);
+        assert_eq!(cells[2].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_prefix_extension_non_request_stays_blank() {
+        for extra in [b"X".as_slice(), b"not a request".as_slice()] {
+            let mut second = GET_A.to_vec();
+            second.extend_from_slice(extra);
+            let cells = walk_http_frames(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, GET_A),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, &second),
+            ]);
+            assert_eq!(cells[0].http_host, ["a.example"], "{extra:?}");
+            assert_eq!(cells[0].counted, None, "{extra:?}");
+            assert_eq!(cells[1].http_host, [] as [&str; 0], "{extra:?}");
+            assert_eq!(cells[1].counted, None, "{extra:?}");
+        }
+    }
+
+    #[test]
     fn http_rst_does_not_print_host() {
         let payload = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
         for flags in [0x04u8, 0x14, 0x1c, 0x05, 0x06] {
@@ -2692,6 +2996,7 @@ mod tests {
 
     const SSTP_REQ: &[u8] = b"SSTP_DUPLEX_POST / HTTP/1.1\r\nHost: sstp.example\r\n\r\n";
     const SSTP_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n";
+    const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
     const INNER_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
 
     #[test]

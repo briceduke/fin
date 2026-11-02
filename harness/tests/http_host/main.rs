@@ -2052,6 +2052,241 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ),
         (
+            "same-seq-open-complete-plus-truncated",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let mut first = GET_A.to_vec();
+                    first.extend_from_slice(b"GET / HTTP/1.1\r\nHost: ");
+                    let mut second = first.clone();
+                    second.extend_from_slice(b"inner.example\r\n\r\n");
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &first),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &second),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-open-mid-header-then-two-requests",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let mut first = GET_A.to_vec();
+                    first.extend_from_slice(b"GET / HTTP/1.1\r\nHos");
+                    let mut second = GET_A.to_vec();
+                    second.extend_from_slice(INNER_GET);
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &first),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &second),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-open-200-prefix-then-get",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let resp = b"HTTP/1.1 200 OK\r\nHost: st.example\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, &resp[..20]),
+                        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, INNER_GET),
+                    ]
+                },
+            ),
+        ),
+        (
+            "overlap-seq-2",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 2, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-5",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 5, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "overlap-seq-35",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 35, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "in-order-seq-36",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 36, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "split-headers-then-overlap-seq-1",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &full[..20]),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 21, &full[20..]),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, INNER_GET),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-prefix-extension",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &concat_bytes(GET_A, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-after-handshake",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
+                    eth_ipv4_tcp_to_flags(PEER, OUTER, 80, 50000, 0, 0x12, b""),
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1, 0x10, b""),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &concat_bytes(GET_A, INNER_GET)),
+                ],
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-after-post-cl4",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let first =
+                        b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\n\r\nxxxx";
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, first),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &concat_bytes(first, INNER_GET)),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-after-200-cl0",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let first = b"HTTP/1.1 200 OK\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, first),
+                        eth_ipv4_tcp_to(
+                            PEER,
+                            OUTER,
+                            80,
+                            50000,
+                            1,
+                            &concat_bytes(first, INNER_GET),
+                        ),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-after-204-cl0",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let first =
+                        b"HTTP/1.1 204 No Content\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, first),
+                        eth_ipv4_tcp_to(
+                            PEER,
+                            OUTER,
+                            80,
+                            50000,
+                            1,
+                            &concat_bytes(first, INNER_GET),
+                        ),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-after-two-pipelined",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let get_b = b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n";
+                    let get_c = b"GET / HTTP/1.1\r\nHost: c.example\r\n\r\n";
+                    let mut first = GET_A.to_vec();
+                    first.extend_from_slice(get_b);
+                    let mut second = first.clone();
+                    second.extend_from_slice(get_c);
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &first),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &second),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-partial-then-full-then-prefix-extension",
+            pcap(
+                LINK_ETHERNET,
+                &{
+                    let full = b"GET / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+                    vec![
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &full[..20]),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, full),
+                        eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &concat_bytes(full, INNER_GET)),
+                    ]
+                },
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-one-byte-x",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, &concat_bytes(GET_A, b"X")),
+                ],
+            ),
+        ),
+        (
+            "same-seq-prefix-extension-non-request",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(
+                        OUTER,
+                        50000,
+                        80,
+                        1,
+                        &concat_bytes(GET_A, b"not a request"),
+                    ),
+                ],
+            ),
+        ),
+        (
             "desegment-200-no-cl-same-dir",
             pcap(
                 LINK_ETHERNET,
