@@ -6,10 +6,9 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::thread;
 
 use memmap2::Mmap;
-use reader::{read_capture, read_capture_chunked, IpSrc};
+use reader::{read_capture, IpSrc};
 
 /// Packet rows and counted lines share this buffer so a capture is not one write per line.
 const OUTPUT_BUF: usize = 1 << 20;
@@ -55,12 +54,9 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<i32, String> {
     // Linux a concurrent truncation can SIGBUS instead of reporting a fault.
     let mapped =
         unsafe { Mmap::map(&file) }.map_err(|error| format!("{}: {error}", path.display()))?;
-    let threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
     write_rows(
         &path.display().to_string(),
-        read_capture_chunked(&mapped, threads),
+        read_capture(&mapped),
         &args.fields,
     )
     .map_err(|error| error.to_string())

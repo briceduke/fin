@@ -1,10 +1,7 @@
 //! Capture reader.
 //!
-//! [`read_capture`] walks a file front to back on one core. [`read_capture_chunked`]
-//! splits a classic pcap across cores and falls back to [`read_capture`] when a
-//! seam does not prove. pcapng uses [`read_capture`].
+//! [`read_capture`] walks a file front to back on one core.
 
-mod chunk;
 mod http_host;
 mod ip_src;
 mod options;
@@ -13,9 +10,6 @@ mod pcapng;
 pub mod ports;
 mod tls_sni;
 
-pub use chunk::read_capture_chunked;
-#[doc(hidden)]
-pub use chunk::read_capture_seams;
 pub use ip_src::{Cell, IpSrc};
 
 /// Largest captured length tshark 4.6.9 will read.
