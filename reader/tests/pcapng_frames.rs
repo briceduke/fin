@@ -1071,12 +1071,14 @@ fn an_isb_custom_option_faults() {
             &option(Endian::Little, 2988, &[]),
         ]),
     );
-    let after = read_capture(&concat(&[&prefix(Some(1)), &isb]));
+    let after_bytes = concat(&[&prefix(Some(1)), &isb]);
+    let after = read_capture(&after_bytes);
     assert_eq!(after.frames.len(), 1);
     assert_eq!(after.fault, Some(Fault::CustomOption { length: 0 }));
     assert_eq!(after.exit_code(), 14);
 
-    let opening = read_capture(&concat(&[&prefix(None), &isb]));
+    let opening_bytes = concat(&[&prefix(None), &isb]);
+    let opening = read_capture(&opening_bytes);
     assert_eq!(opening.frames.len(), 0);
     assert_eq!(opening.exit_code(), 3);
     assert_eq!(
