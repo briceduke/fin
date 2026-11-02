@@ -54,20 +54,6 @@ pub struct Cell {
     pub counted: Option<&'static str>,
 }
 
-/// Fragment-group ports remembered from the first fragment.
-#[derive(Debug, Default)]
-struct FragTable {
-    ipv4: HashMap<Ipv4Frag, Option<(u16, u16)>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Ipv4Frag {
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    id: u16,
-    proto: u8,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum FlowHost {
     V4(Ipv4Addr),
@@ -118,7 +104,6 @@ struct TlsNeed {
 /// Session state for a sequential field walk.
 pub struct IpSrc {
     tables: &'static PortTables,
-    frags: FragTable,
     tls_seen: HashSet<TcpSeq>,
     tls_need: HashMap<TcpFlow, TlsNeed>,
     /// Conversation keys. tshark keeps TLS version on the TCP 4-tuple.
@@ -177,7 +162,6 @@ impl IpSrc {
     pub fn fields(ip_src: bool, tls_sni: bool, http_host: bool) -> Self {
         Self {
             tables: snapshot(),
-            frags: FragTable::default(),
             tls_seen: HashSet::new(),
             tls_need: HashMap::new(),
             tls_claimed: HashSet::new(),
@@ -200,7 +184,7 @@ impl IpSrc {
     }
 }
 
-/// Walk one frame. `session` holds the port snapshot and fragment groups.
+/// Walk one frame. `session` holds the port snapshot and conversation state.
 pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
     let mut walk = Walk {
         values: Vec::new(),
@@ -208,7 +192,6 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         http_host: Vec::new(),
         counted: None,
         tables: session.tables,
-        frags: &mut session.frags,
         tls_seen: &mut session.tls_seen,
         tls_need: &mut session.tls_need,
         tls_claimed: &mut session.tls_claimed,
@@ -243,7 +226,6 @@ struct Walk<'a> {
     http_host: Vec<String>,
     counted: Option<&'static str>,
     tables: &'static PortTables,
-    frags: &'a mut FragTable,
     tls_seen: &'a mut HashSet<TcpSeq>,
     tls_need: &'a mut HashMap<TcpFlow, TlsNeed>,
     tls_claimed: &'a mut HashSet<TcpFlow>,
@@ -387,7 +369,6 @@ impl Walk<'_> {
             self.flow_src = Some(FlowHost::V4(src));
             self.flow_dst = Some(FlowHost::V4(dst));
         }
-        let id = u16::from_be_bytes([bytes[4], bytes[5]]);
         let frag = u16::from_be_bytes([bytes[6], bytes[7]]);
         let offset = frag & 0x1fff;
         let more = frag & 0x2000 != 0;
@@ -398,57 +379,11 @@ impl Walk<'_> {
         } else {
             take_len(rest, total - ihl)
         };
-        let fragmented = more || offset != 0;
-        if fragmented {
-            self.ipv4_fragment(src, dst, id, proto, offset, payload);
-            return;
-        }
-        self.ip_proto(proto, payload, false);
-    }
-
-    fn ipv4_fragment(
-        &mut self,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        id: u16,
-        proto: u8,
-        offset: u16,
-        payload: &[u8],
-    ) {
-        if proto != UDP {
+        if more || offset != 0 {
             self.count("fragment");
             return;
         }
-        let key = Ipv4Frag {
-            src,
-            dst,
-            id,
-            proto,
-        };
-        if offset == 0 {
-            let ports = udp_ports(payload);
-            self.frags.ipv4.insert(key, ports);
-            if let Some((src_port, dst_port)) = ports {
-                if self.udp_counts_or_vxlan(src_port, dst_port) {
-                    self.count("fragment");
-                }
-            } else {
-                self.count("fragment");
-            }
-            return;
-        }
-        match self.frags.ipv4.get(&key).copied() {
-            None => {
-                self.frags.ipv4.insert(key, None);
-                self.count("fragment");
-            }
-            Some(None) => self.count("fragment"),
-            Some(Some((src_port, dst_port))) => {
-                if self.udp_counts_or_vxlan(src_port, dst_port) {
-                    self.count("fragment");
-                }
-            }
-        }
+        self.ip_proto(proto, payload, false);
     }
 
     fn ipv6(&mut self, bytes: &[u8]) {
@@ -1167,11 +1102,6 @@ impl Walk<'_> {
         if self.nest() {
             self.ethernet(&bytes[VXLAN_HEADER..]);
         }
-    }
-
-    fn udp_counts_or_vxlan(&self, src: u16, dst: u16) -> bool {
-        let pick = self.tables.udp(src, dst);
-        pick.must_count() || pick.is_vxlan()
     }
 }
 
