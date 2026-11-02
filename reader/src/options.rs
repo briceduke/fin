@@ -47,12 +47,8 @@ const VERDICT_XDP: u8 = 2;
 
 enum Role<'a> {
     Section,
-    Interface(&'a mut Collected),
+    Interface(&'a mut Option<u8>),
     Packet,
-}
-
-struct Collected {
-    resol: Option<u8>,
 }
 
 pub(crate) fn walk_common(
@@ -70,15 +66,9 @@ pub(crate) fn walk_idb(
     end: usize,
     big_endian: bool,
 ) -> Result<(), Fault> {
-    let mut collected = Collected { resol: None };
-    walk(
-        bytes,
-        start,
-        end,
-        big_endian,
-        Role::Interface(&mut collected),
-    )?;
-    if let Some(value) = collected.resol {
+    let mut resol = None;
+    walk(bytes, start, end, big_endian, Role::Interface(&mut resol))?;
+    if let Some(value) = resol {
         check_tsresol(value)?;
     }
     Ok(())
@@ -130,7 +120,7 @@ fn walk(
                     });
                 }
             }
-            _ => role.apply(code, length, &bytes[cursor..cursor + value_len], big_endian)?,
+            _ => role.apply(code, length, &bytes[cursor..cursor + value_len])?,
         }
         cursor += rounded;
         remaining -= rounded;
@@ -139,16 +129,10 @@ fn walk(
 }
 
 impl Role<'_> {
-    fn apply(
-        &mut self,
-        code: u16,
-        length: u16,
-        content: &[u8],
-        _big_endian: bool,
-    ) -> Result<(), Fault> {
+    fn apply(&mut self, code: u16, length: u16, content: &[u8]) -> Result<(), Fault> {
         match self {
             Role::Section => Ok(()),
-            Role::Interface(collected) => idb_option(code, length, content, collected),
+            Role::Interface(resol) => idb_option(code, length, content, resol),
             Role::Packet => packet_option(code, length, content),
         }
     }
@@ -158,11 +142,11 @@ fn idb_option(
     code: u16,
     length: u16,
     content: &[u8],
-    collected: &mut Collected,
+    resol: &mut Option<u8>,
 ) -> Result<(), Fault> {
     match code {
-        IF_TSRESOL if length == 1 && collected.resol.is_none() => {
-            collected.resol = Some(content[0]);
+        IF_TSRESOL if length == 1 && resol.is_none() => {
+            *resol = Some(content[0]);
         }
         IF_FILTER if length < 1 => {
             return Err(Fault::IdbFilter {
