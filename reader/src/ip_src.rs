@@ -107,6 +107,14 @@ struct TcpSeq {
     seq: u32,
 }
 
+/// Payload already walked at one TCP seq.
+#[derive(Debug, Clone, Copy)]
+struct HttpSeen {
+    len: u32,
+    /// Incomplete at this seq; a later longer overlap may complete it.
+    open: bool,
+}
+
 #[derive(Debug, Clone)]
 struct TlsNeed {
     next_seq: u32,
@@ -126,8 +134,8 @@ pub struct IpSrc {
     tls_session: HashMap<TcpFlow, TlsSession>,
     /// Conversation CCS. tshark `client_ccs_frame` / `server_ccs_frame`.
     tls_ccs: HashMap<TcpFlow, TlsCcs>,
-    /// Max payload length already dissected at this TCP seq.
-    http_seen: HashMap<TcpSeq, u32>,
+    /// Payload already walked at this TCP seq.
+    http_seen: HashMap<TcpSeq, HttpSeen>,
     /// Direction waiting for `http.desegment_body` continuation.
     http_desegment: HashSet<TcpFlow>,
     /// Heuristic `http_tcp` or an HTTP/2 preface on a named `http` port
@@ -247,7 +255,7 @@ struct Walk<'a> {
     tls_claimed: &'a mut HashSet<TcpFlow>,
     tls_session: &'a mut HashMap<TcpFlow, TlsSession>,
     tls_ccs: &'a mut HashMap<TcpFlow, TlsCcs>,
-    http_seen: &'a mut HashMap<TcpSeq, u32>,
+    http_seen: &'a mut HashMap<TcpSeq, HttpSeen>,
     http_desegment: &'a mut HashSet<TcpFlow>,
     http_claimed: &'a mut HashSet<TcpFlow>,
     http_sstp: &'a mut HashSet<TcpFlow>,
@@ -712,8 +720,12 @@ impl Walk<'_> {
         });
         let len = payload.len() as u32;
         if let Some(key) = key {
-            if let Some(&prev) = self.http_seen.get(&key) {
-                if len <= prev {
+            if let Some(prev) = self.http_seen.get(&key) {
+                // Shorter or equal is a retransmission. A later longer
+                // segment at a seq that already completed HTTP is tshark
+                // 4.6.9 [TCP Out-Of-Order] Continuation, not a new Host.
+                // A still-open partial at this seq may complete.
+                if len <= prev.len || !prev.open {
                     return;
                 }
             }
@@ -723,12 +735,12 @@ impl Walk<'_> {
                 .map(|key| self.http_seen.contains_key(&key))
                 .unwrap_or(false);
             if !same_seq_again && self.http_desegment.contains(&flow) {
-                self.note_http_seen(key, len);
+                self.note_http_seen(key, len, false);
                 self.count("http");
                 return;
             }
             if self.http_tunnel.contains(&flow.conversation()) {
-                self.note_http_seen(key, len);
+                self.note_http_seen(key, len, false);
                 self.count("http-tunnel");
                 return;
             }
@@ -742,7 +754,7 @@ impl Walk<'_> {
         if pick.is_http() {
             if let Some(flow) = flow {
                 if self.http_claimed.contains(&flow.conversation()) {
-                    self.note_http_seen(key, len);
+                    self.note_http_seen(key, len, false);
                     self.count("http");
                     return;
                 }
@@ -751,13 +763,13 @@ impl Walk<'_> {
                 if let Some(flow) = flow {
                     self.http_claimed.insert(flow.conversation());
                 }
-                self.note_http_seen(key, len);
+                self.note_http_seen(key, len, false);
                 self.count("http");
                 return;
             }
             match parse_http_pending(payload, fin, sstp_pending, connect_pending) {
                 HttpParse::Message(proved) => {
-                    self.note_http_seen(key, len);
+                    self.note_http_seen(key, len, proved.desegment);
                     if let Some(flow) = flow {
                         if proved.http2 {
                             self.http_claimed.insert(flow.conversation());
@@ -771,7 +783,7 @@ impl Walk<'_> {
                     }
                 }
                 HttpParse::Partial(hosts) => {
-                    self.note_http_seen(key, len);
+                    self.note_http_seen(key, len, true);
                     if let Some(flow) = flow {
                         self.http_desegment.insert(flow);
                     }
@@ -779,14 +791,14 @@ impl Walk<'_> {
                     self.count("http");
                 }
                 HttpParse::Unproved => {
-                    self.note_http_seen(key, len);
+                    self.note_http_seen(key, len, true);
                     if let Some(flow) = flow {
                         self.http_desegment.insert(flow);
                     }
                     self.count("http");
                 }
                 HttpParse::Other => {
-                    self.note_http_seen(key, len);
+                    self.note_http_seen(key, len, false);
                     self.count("http");
                 }
             }
@@ -799,22 +811,25 @@ impl Walk<'_> {
             if let Some(flow) = flow {
                 self.http_claimed.insert(flow.conversation());
             }
-            self.note_http_seen(key, len);
+            self.note_http_seen(key, len, false);
             self.count("http-heuristic");
             return;
         }
         if pick.is_tls() {
-            self.note_http_seen(key, len);
+            self.note_http_seen(key, len, false);
             self.count("http-over-tls");
         }
     }
 
-    fn note_http_seen(&mut self, key: Option<TcpSeq>, len: u32) {
+    fn note_http_seen(&mut self, key: Option<TcpSeq>, len: u32, open: bool) {
         if let Some(key) = key {
             self.http_seen
                 .entry(key)
-                .and_modify(|prev| *prev = (*prev).max(len))
-                .or_insert(len);
+                .and_modify(|prev| {
+                    prev.len = prev.len.max(len);
+                    prev.open = open;
+                })
+                .or_insert(HttpSeen { len, open });
         }
     }
 
@@ -2344,18 +2359,40 @@ mod tests {
     }
 
     #[test]
-    fn http_same_seq_longer_is_out_of_order() {
+    fn http_same_seq_longer_is_continuation() {
         let first = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
         let second = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
-        assert_ne!(first.len(), second.len());
+        assert_eq!(first.len(), 35);
+        assert_eq!(second.len(), 39);
         let cells = walk_http_frames(&[
             eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, first),
             eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, second),
         ]);
         assert_eq!(cells[0].http_host, ["a.example"]);
         assert_eq!(cells[0].counted, None);
-        assert_eq!(cells[1].http_host, ["inner.example"]);
+        assert_eq!(cells[1].http_host, [] as [&str; 0]);
         assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn http_same_seq_longer_after_handshake_is_continuation() {
+        let first = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        let second = b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n";
+        let cells = walk_http_frames(&[
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 0, 0x02, b""),
+            eth_ipv4_tcp_flow_flags(SERVER, CLIENT, 80, 50000, 0, 0x12, b""),
+            eth_ipv4_tcp_flow_flags(CLIENT, SERVER, 50000, 80, 1, 0x10, b""),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 80, 1, second),
+        ]);
+        for cell in &cells[..3] {
+            assert_eq!(cell.http_host, [] as [&str; 0]);
+            assert_eq!(cell.counted, None);
+        }
+        assert_eq!(cells[3].http_host, ["a.example"]);
+        assert_eq!(cells[3].counted, None);
+        assert_eq!(cells[4].http_host, [] as [&str; 0]);
+        assert_eq!(cells[4].counted, None);
     }
 
     #[test]

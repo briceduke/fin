@@ -1988,14 +1988,21 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
             pcap(
                 LINK_ETHERNET,
                 &[
-                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"),
-                    eth_ipv4_tcp_seq(
-                        OUTER,
-                        50000,
-                        80,
-                        1,
-                        b"GET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
-                    ),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, INNER_GET),
+                ],
+            ),
+        ),
+        (
+            "same-seq-longer-after-handshake",
+            pcap(
+                LINK_ETHERNET,
+                &[
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 0, 0x02, b""),
+                    eth_ipv4_tcp_to_flags(PEER, OUTER, 80, 50000, 0, 0x12, b""),
+                    eth_ipv4_tcp_to_flags(OUTER, PEER, 50000, 80, 1, 0x10, b""),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, GET_A),
+                    eth_ipv4_tcp_seq(OUTER, 50000, 80, 1, INNER_GET),
                 ],
             ),
         ),
@@ -3342,9 +3349,17 @@ fn check_one(tshark: &Path, fin: &Path, dir: &Path, name: &str, file: &[u8]) -> 
     fs::write(&path, file).unwrap();
     let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
     args.extend(
-        ["-n", "-T", "fields", "-e", FIELD]
-            .into_iter()
-            .map(OsString::from),
+        [
+            "-n",
+            "-T",
+            "fields",
+            "-e",
+            FIELD,
+            "-o",
+            "tcp.reassemble_out_of_order:TRUE",
+        ]
+        .into_iter()
+        .map(OsString::from),
     );
     let output = match run_pair(tshark, fin, &args) {
         Ok(output) => output,
