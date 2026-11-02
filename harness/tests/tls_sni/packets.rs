@@ -139,20 +139,6 @@ pub fn eth_ipv4_udp(src: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec
     eth(0x0800, &ipv4(src, 17, &udp(sport, dport, payload)))
 }
 
-pub fn eth_ipv6_tcp_flow(
-    src: [u8; 16],
-    dst: [u8; 16],
-    sport: u16,
-    dport: u16,
-    seq: u32,
-    payload: &[u8],
-) -> Vec<u8> {
-    eth(
-        0x86dd,
-        &ipv6_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
-    )
-}
-
 pub fn client_hello(sni: Option<&str>) -> Vec<u8> {
     client_hello_host(sni.map(str::as_bytes), 0x0301)
 }
@@ -218,40 +204,7 @@ pub fn client_hello_host(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
 }
 
 pub fn ccs() -> Vec<u8> {
-    ccs_version(0x0303)
-}
-
-pub fn ccs_version(version: u16) -> Vec<u8> {
-    let mut rec = vec![0x14];
-    rec.extend_from_slice(&version.to_be_bytes());
-    rec.extend_from_slice(&[0x00, 0x01, 0x01]);
-    rec
-}
-
-pub fn alert() -> Vec<u8> {
-    vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]
-}
-
-pub fn app_data() -> Vec<u8> {
-    vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x01]
-}
-
-pub fn heartbeat() -> Vec<u8> {
-    vec![0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00]
-}
-
-pub fn client_hello_early_data() -> Vec<u8> {
-    let mut body = vec![0x03, 0x03];
-    body.extend_from_slice(&[0x11u8; 32]);
-    body.push(0);
-    body.extend_from_slice(&[0, 2, 0x00, 0x2f]);
-    body.extend_from_slice(&[1, 0]);
-    body.extend_from_slice(&[0, 4, 0, 42, 0, 0]);
-    handshake_record(&handshake(1, &body))
-}
-
-pub fn empty_record(content: u8) -> Vec<u8> {
-    vec![content, 0x03, 0x03, 0x00, 0x00]
+    vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
 }
 
 pub fn handshake_record(body: &[u8]) -> Vec<u8> {
@@ -261,14 +214,6 @@ pub fn handshake_record(body: &[u8]) -> Vec<u8> {
     rec
 }
 
-pub fn handshake_type_record(msg_type: u8, version: u16) -> Vec<u8> {
-    handshake_body_record(msg_type, version, &[])
-}
-
-pub fn handshake_body_record(msg_type: u8, version: u16, body: &[u8]) -> Vec<u8> {
-    handshake_messages_record(version, &[(msg_type, body)])
-}
-
 pub fn handshake_messages_record(version: u16, messages: &[(u8, &[u8])]) -> Vec<u8> {
     let mut body = Vec::new();
     for &(msg_type, msg_body) in messages {
@@ -276,35 +221,6 @@ pub fn handshake_messages_record(version: u16, messages: &[(u8, &[u8])]) -> Vec<
     }
     let mut rec = handshake_record(&body);
     rec[1..3].copy_from_slice(&version.to_be_bytes());
-    rec
-}
-
-pub fn tls_record(content: u8, version: u16, body: &[u8]) -> Vec<u8> {
-    let mut rec = vec![content];
-    rec.extend_from_slice(&version.to_be_bytes());
-    rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
-    rec.extend_from_slice(body);
-    rec
-}
-
-pub fn server_hello() -> Vec<u8> {
-    let mut hello = Vec::from(0x0303u16.to_be_bytes());
-    hello.extend_from_slice(&[0x22u8; 32]);
-    hello.push(0);
-    hello.extend_from_slice(&[0x00, 0x2f]);
-    hello.push(0);
-    handshake_body_record(2, 0x0303, &hello)
-}
-
-pub fn tls13_server_hello() -> Vec<u8> {
-    let mut hello = Vec::from(0x0303u16.to_be_bytes());
-    hello.extend_from_slice(&[0x22u8; 32]);
-    hello.push(0);
-    hello.extend_from_slice(&[0x13, 0x01]);
-    hello.push(0);
-    hello.extend_from_slice(&[0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
-    let mut rec = handshake_record(&handshake(2, &hello));
-    rec[1..3].copy_from_slice(&0x0303u16.to_be_bytes());
     rec
 }
 
