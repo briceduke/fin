@@ -201,8 +201,9 @@ enum Take {
     },
     Incomplete,
     TransferEncoding,
-    /// Later NOTIFY/WebDAV, a no-colon header, unreadable Content-Length,
-    /// or a 1xx/204/304 that carries Content-Length. Counted.
+    /// Later NOTIFY/WebDAV/RPC_*, a no-colon header, a request or status
+    /// line in headers, unreadable Content-Length, or a 1xx/204/304 that
+    /// carries Content-Length. Counted.
     Unproved,
     Other,
     Done,
@@ -256,7 +257,7 @@ fn take_message(
             break;
         }
         if classify_line(line).is_some() {
-            return Take::Incomplete;
+            return Take::Unproved;
         }
         let Some(colon) = line.iter().position(|b| *b == b':') else {
             return Take::Unproved;
@@ -453,14 +454,14 @@ fn is_notification_method(method: &[u8]) -> bool {
 }
 
 /// A later request line this reader does not prove: NOTIFY, M-NOTIFY,
-/// SEARCH, PROPFIND, TRACE, and other method tokens with a space.
+/// SEARCH, PROPFIND, TRACE, RPC_IN_DATA, and other method tokens with a space.
 fn looks_like_unproved_method(line: &[u8]) -> bool {
     let method = first_method(line);
     !method.is_empty()
         && method.len() < line.len()
         && method
             .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_'))
 }
 
 fn is_request_method(method: &[u8]) -> bool {
@@ -809,6 +810,113 @@ mod tests {
             ),
             HttpParse::Unproved
         );
+    }
+
+    fn rpc_message(method: &[u8]) -> Vec<u8> {
+        let mut rest = method.to_vec();
+        rest.extend_from_slice(b" / HTTP/1.1\r\nHost: rpc.example\r\n\r\n");
+        rest
+    }
+
+    #[test]
+    fn leftover_rpc_after_get_is_partial() {
+        for method in [b"RPC_IN_DATA".as_slice(), b"RPC_OUT_DATA", b"RPC_CONNECT"] {
+            assert_eq!(
+                parse_http(&leftover_after_get(&rpc_message(method)), false),
+                HttpParse::Partial(vec!["a.example".to_string()]),
+                "{}",
+                method.escape_ascii()
+            );
+        }
+        let mut two_gets = leftover_after_get(b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n");
+        two_gets.extend_from_slice(&rpc_message(b"RPC_IN_DATA"));
+        assert_eq!(
+            parse_http(&two_gets, false),
+            HttpParse::Partial(vec!["a.example".to_string(), "b.example".to_string()])
+        );
+        let mut get_rpc_get = leftover_after_get(&rpc_message(b"RPC_IN_DATA"));
+        get_rpc_get.extend_from_slice(b"GET / HTTP/1.1\r\nHost: c.example\r\n\r\n");
+        assert_eq!(
+            parse_http(&get_rpc_get, false),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec![])
+        );
+        assert_eq!(
+            parse_http(&rpc_message(b"RPC_IN_DATA"), false),
+            HttpParse::Other
+        );
+    }
+
+    fn mid_header_get(inner: &[u8]) -> Vec<u8> {
+        let mut rest = b"GET / HTTP/1.1\r\nHost: b.example\r\n".to_vec();
+        rest.extend_from_slice(inner);
+        rest.extend_from_slice(b"\r\nHost: inner.example\r\n\r\n");
+        rest
+    }
+
+    #[test]
+    fn leftover_mid_header_request_after_get_is_partial() {
+        let inners = [
+            b"GET / HTTP/1.1".as_slice(),
+            b"POST / HTTP/1.1",
+            b"HTTP/1.1 200 OK",
+            b"ICY 200",
+        ];
+        for inner in inners {
+            assert_eq!(
+                parse_http(&leftover_after_get(&mid_header_get(inner)), false),
+                HttpParse::Partial(vec!["a.example".to_string()]),
+                "{}",
+                inner.escape_ascii()
+            );
+        }
+        assert_eq!(
+            parse_http(
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec![])
+        );
+        assert_eq!(
+            parse_http(&mid_header_get(b"GET / HTTP/1.1"), false),
+            HttpParse::Unproved
+        );
+    }
+
+    #[test]
+    fn leftover_short_post_after_get_still_desegments() {
+        let proved = message(&leftover_after_get(
+            b"POST / HTTP/1.1\r\nHost: b.example\r\nContent-Length: 100\r\n\r\nno",
+        ));
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(proved.desegment);
     }
 
     #[test]

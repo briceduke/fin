@@ -27,7 +27,8 @@ These frames are counted when they look like HTTP that v1 does not prove, and le
 | --- | --- |
 | Headers split across TCP segments | tshark desegments (`http.desegment_headers`); v1 counts. |
 | A header line with no colon | Counted. tshark leftover is Continuation; v1 does not port `req_resp_hdrs_do_reassembly`. |
-| NOTIFY, SUBSCRIBE, UNSUBSCRIBE, `M-` methods, WebDAV | Counted. ICY stays a status line so an SSTP 2xx still switches. |
+| NOTIFY, SUBSCRIBE, UNSUBSCRIBE, `M-` methods, WebDAV, `RPC_*` | Counted. ICY stays a status line so an SSTP 2xx still switches. |
+| A later message whose headers contain a request or status line | Counted. v1 does not parse a request line as a pipelined header. |
 | Unreadable Content-Length (not SP/HT digits) | Counted. Not a GLib 2.80 `isspace` replica. |
 | 1xx, 204, or 304 with Content-Length | Counted. No-CL 204/1xx/304 still print. |
 | Body not in this segment (Content-Length leftover, no-CL 200 without FIN, Transfer-Encoding) | tshark desegments (`http.desegment_body`). The next in-order payload on that TCP direction is continuation; v1 counts it. |

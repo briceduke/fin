@@ -410,6 +410,10 @@ fn tcp_http_ports(payload: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
             pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 8080, payload)]),
         ),
         (
+            "3128",
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 3128, payload)]),
+        ),
+        (
             "src80",
             pcap(
                 LINK_ETHERNET,
@@ -1283,6 +1287,102 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
             )),
         ),
+        (
+            "get-then-rpc-in-data",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-out-data",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_OUT_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-connect",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_CONNECT / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "two-gets-then-rpc-in-data",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-then-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "204-no-cl-then-rpc-in-data",
+            tcp80(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-no-host-then-rpc-in-data",
+            tcp80(
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-then-mid-header-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-mid-header-post",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nPOST / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-mid-header-200",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nHTTP/1.1 200 OK\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-mid-header-icy",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nICY 200\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-mid-header-get",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-mid-header-get",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"),
+        ),
+        (
+            "get-no-host-then-mid-header-get",
+            tcp80(
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-then-short-post",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"POST / HTTP/1.1\r\nHost: b.example\r\nContent-Length: 100\r\n\r\nno",
+            )),
+        ),
     ];
     for (suffix, file) in tcp_http_ports(&concat_bytes(
         GET_A,
@@ -1291,6 +1391,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         out.push((
             match suffix {
                 "8080" => "get-then-notify-8080",
+                "3128" => "get-then-notify-3128",
                 "src80" => "get-then-notify-src80",
                 _ => "get-then-notify-ipv6",
             },
@@ -1304,6 +1405,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         out.push((
             match suffix {
                 "8080" => "get-then-no-colon-8080",
+                "3128" => "get-then-no-colon-3128",
                 "src80" => "get-then-no-colon-src80",
                 _ => "get-then-no-colon-ipv6",
             },
@@ -1317,8 +1419,37 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         out.push((
             match suffix {
                 "8080" => "get-then-204-cl0-8080",
+                "3128" => "get-then-204-cl0-3128",
                 "src80" => "get-then-204-cl0-src80",
                 _ => "get-then-204-cl0-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"RPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-rpc-in-data-8080",
+                "3128" => "get-then-rpc-in-data-3128",
+                "src80" => "get-then-rpc-in-data-src80",
+                _ => "get-then-rpc-in-data-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"GET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-mid-header-get-8080",
+                "3128" => "get-then-mid-header-get-3128",
+                "src80" => "get-then-mid-header-get-src80",
+                _ => "get-then-mid-header-get-ipv6",
             },
             file,
         ));
