@@ -8,8 +8,9 @@ use crate::http_host::{
 };
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
-    looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tls,
-    parse_tls_seen, truncated_handshake_prefix, TlsOutcome, TlsParse,
+    draft_after_claimed, looks_like_dtls_handshake, looks_like_quic_initial,
+    looks_like_tls_handshake, parse_tls, parse_tls_seen, truncated_handshake_prefix, TlsOutcome,
+    TlsParse,
 };
 use crate::Frame;
 
@@ -106,6 +107,9 @@ pub struct IpSrc {
     tables: &'static PortTables,
     tls_seen: HashSet<TcpSeq>,
     tls_need: HashMap<TcpFlow, TlsNeed>,
+    /// Direction that had pending TLS bytes or GREASE after claimed TLS.
+    /// Later ClientHellos on this direction are Unproved.
+    tls_later: HashSet<TcpFlow>,
     /// Conversation keys. A named TLS port or a proved first record claims it.
     tls_claimed: HashSet<TcpFlow>,
     /// Next unused TCP seq on that direction. SYN consumes one.
@@ -152,6 +156,7 @@ impl IpSrc {
             tables: snapshot(),
             tls_seen: HashSet::new(),
             tls_need: HashMap::new(),
+            tls_later: HashSet::new(),
             tls_claimed: HashSet::new(),
             http_next_seq: HashMap::new(),
             http_desegment: HashSet::new(),
@@ -180,6 +185,7 @@ pub fn walk_ip_src(frame: &Frame<'_>, session: &mut IpSrc) -> Cell {
         tables: session.tables,
         tls_seen: &mut session.tls_seen,
         tls_need: &mut session.tls_need,
+        tls_later: &mut session.tls_later,
         tls_claimed: &mut session.tls_claimed,
         http_next_seq: &mut session.http_next_seq,
         http_desegment: &mut session.http_desegment,
@@ -212,6 +218,7 @@ struct Walk<'a> {
     tables: &'static PortTables,
     tls_seen: &'a mut HashSet<TcpSeq>,
     tls_need: &'a mut HashMap<TcpFlow, TlsNeed>,
+    tls_later: &'a mut HashSet<TcpFlow>,
     tls_claimed: &'a mut HashSet<TcpFlow>,
     http_next_seq: &'a mut HashMap<TcpFlow, u32>,
     http_desegment: &'a mut HashSet<TcpFlow>,
@@ -879,8 +886,7 @@ impl Walk<'_> {
                 self.apply_tls_outcome(Some(flow), seq, &parsed, payload.len(), outcome);
                 return;
             }
-            // Leftover is still pending; a gap or overlap is not a new hello.
-            if self.tls_need.contains_key(&flow) {
+            if self.tls_later.contains(&flow) {
                 self.apply_tls_outcome(
                     Some(flow),
                     seq,
@@ -919,6 +925,7 @@ impl Walk<'_> {
     ) {
         if let Some(flow) = flow {
             let conv = flow.conversation();
+            let already_claimed = self.tls_claimed.contains(&conv);
             if outcome.claimed {
                 self.tls_claimed.insert(conv);
                 self.set_tls_need(
@@ -928,6 +935,9 @@ impl Walk<'_> {
                     payload_len,
                     matches!(outcome.counted, Some("tls-hello-ext-uncertain")),
                 );
+            }
+            if draft_after_claimed(parsed, already_claimed) {
+                self.tls_later.insert(flow);
             }
         }
         if let Some(reason) = outcome.counted {
@@ -972,6 +982,7 @@ impl Walk<'_> {
     ) {
         match truncated_handshake_prefix(parsed) {
             Some(prefix) => {
+                self.tls_later.insert(flow);
                 self.tls_need.insert(
                     flow,
                     TlsNeed {
@@ -1002,11 +1013,7 @@ impl Walk<'_> {
         buf.extend_from_slice(payload);
         let mut outcome = parse_tls(&buf, false);
         if matches!(outcome.kind, TlsParse::Other) {
-            // Handshake leftover has no record header. Stitching an abutting
-            // payload is not a new hello; keep tls_need so a later hello is
-            // counted instead of printed.
             outcome.kind = TlsParse::Unproved;
-            outcome.claimed = false;
         }
         if uncertain && outcome.counted.is_none() {
             outcome.counted = Some("tls-hello-ext-uncertain");
@@ -4870,8 +4877,8 @@ mod tests {
             eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7, &grease),
             eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7 + grease.len() as u32, &other),
         ]);
-        assert_eq!(later[2].tls_sni, ["other.example"]);
-        assert_eq!(later[2].counted, None);
+        assert_eq!(later[2].tls_sni, [] as [&str; 0]);
+        assert_eq!(later[2].counted, Some("tls-handshake"));
         let mut lone = grease.clone();
         lone.extend_from_slice(&other[..40]);
         let lone_cells = walk_tls_seq(&[
@@ -5217,6 +5224,50 @@ mod tests {
         assert_eq!(filled[1].tls_sni, ["www.example.com"]);
         assert_eq!(filled[2].tls_sni, ["other.example"]);
         assert_eq!(filled[3].tls_sni, ["third.example"]);
+    }
+
+    #[test]
+    fn later_hellos_after_pending_are_counted() {
+        let hello = sni_hello("www.example.com");
+        let leftover = tls_record_leftover(hello.clone(), &[0x01]);
+        let second = sni_hello("other.example");
+        let third = sni_hello("third.example");
+        let gapped = sni_hello("gapped.example");
+        let seq2 = 1 + leftover.len() as u32;
+        let seq3 = seq2 + second.len() as u32;
+        let seq4 = seq3 + third.len() as u32 + 8;
+        let cells = walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &leftover),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, seq2, &second),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, seq3, &third),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, seq4, &gapped),
+        ]);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, Some("tls-handshake"));
+        for (i, label) in [(1, "second"), (2, "third"), (3, "gapped")] {
+            assert_eq!(cells[i].tls_sni, [] as [&str; 0], "{label}");
+            assert_eq!(cells[i].counted, Some("tls-handshake"), "{label}");
+        }
+    }
+
+    #[test]
+    fn clean_flow_prints_each_sni() {
+        let first = sni_hello("www.example.com");
+        let second = sni_hello("other.example");
+        let third = sni_hello("third.example");
+        let seq2 = 1 + first.len() as u32;
+        let seq3 = seq2 + second.len() as u32;
+        let cells = walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, seq2, &second),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, seq3, &third),
+        ]);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, None);
+        assert_eq!(cells[1].tls_sni, ["other.example"]);
+        assert_eq!(cells[1].counted, None);
+        assert_eq!(cells[2].tls_sni, ["third.example"]);
+        assert_eq!(cells[2].counted, None);
     }
 
     #[test]

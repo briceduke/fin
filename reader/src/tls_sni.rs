@@ -203,6 +203,31 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
     length != 0 && length < TLS_MAX_RECORD
 }
 
+/// True when a GREASE/draft record version appears after this conversation
+/// already claimed TLS, or after an authoritative record in `payload`.
+pub fn draft_after_claimed(payload: &[u8], mut claimed: bool) -> bool {
+    let mut offset = 0;
+    while offset < payload.len() {
+        let rest = &payload[offset..];
+        if rest.len() < RECORD_HEADER {
+            return false;
+        }
+        let Some((_, version, length)) = tls_record_header(rest) else {
+            return false;
+        };
+        if !is_record_version(version) {
+            return claimed;
+        }
+        claimed = true;
+        let need = RECORD_HEADER + length;
+        if need > rest.len() {
+            return false;
+        }
+        offset += need;
+    }
+    false
+}
+
 /// Bytes of `payload` from the incomplete record or handshake onward.
 ///
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
@@ -860,6 +885,22 @@ mod tests {
         hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
         assert_eq!(parse_tls(&hello, false).kind, TlsParse::Other);
         assert_eq!(parse_tls_seen(&hello, false, true).kind, TlsParse::Unproved);
+    }
+
+    #[test]
+    fn draft_after_claimed_is_sticky_only_after_tls() {
+        let mut grease = client_hello(Some("www.example.com"));
+        grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        assert!(!draft_after_claimed(&grease, false));
+        assert!(draft_after_claimed(&grease, true));
+        let mut ccs_grease = record(0x14, 0x0303, &[0x01]);
+        ccs_grease.extend_from_slice(&grease);
+        assert!(draft_after_claimed(&ccs_grease, false));
+        assert!(!draft_after_claimed(
+            &client_hello(Some("www.example.com")),
+            true
+        ));
+        assert!(!draft_after_claimed(&record(0x14, 0x0303, &[0x01]), false));
     }
 
     #[test]

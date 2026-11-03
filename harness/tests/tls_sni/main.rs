@@ -241,6 +241,7 @@ fn assert_no_later_hello(fin: &Path, name: &str, file: Vec<u8>, rows: &[&str], c
         "b.example",
         "c.example",
         "d.example",
+        "gapped.example",
     ] {
         assert!(
             !stdout.contains(host),
@@ -455,6 +456,54 @@ fn abutting_later_hello_after_leftover_does_not_print_a_second_hello() {
             "counted 5 tls-handshake",
             "counted 6 tls-handshake",
         ],
+    );
+}
+
+#[test]
+fn later_hellos_after_pending_are_counted() {
+    let fin = fin_bin();
+    let leftover = append_record_leftover(client_hello(Some("www.example.com")), &[0x01]);
+    assert_no_later_hello(
+        &fin,
+        "leftover-then-second-third-gapped",
+        leftover_then_second_third_gapped(&leftover),
+        &["www.example.com", "", "", ""],
+        &[
+            "counted 1 tls-handshake",
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+            "counted 4 tls-handshake",
+        ],
+    );
+}
+
+#[test]
+fn clean_flow_prints_each_sni() {
+    let Some((tshark, fin)) = tools() else {
+        return;
+    };
+    let dir = work_dir();
+    let file = clean_three_hellos();
+    let path = dir.join("clean-three-hellos.pcap");
+    fs::write(&path, file).unwrap();
+    let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
+    args.extend(
+        ["-n", "-T", "fields", "-e", FIELD]
+            .into_iter()
+            .map(OsString::from),
+    );
+    let output = run_pair(&tshark, &fin, &args).expect("pair");
+    let report = check_pair(&output).expect("check");
+    assert!(
+        report.faults.is_empty(),
+        "clean-three-hellos: {report} tshark={:?} fin={:?} stderr={}",
+        output.tshark_stdout,
+        output.fin_stdout,
+        output.fin_stderr
+    );
+    assert_eq!(
+        output.fin_stdout.lines().collect::<Vec<_>>(),
+        ["www.example.com", "other.example", "third.example"]
     );
 }
 
@@ -1455,8 +1504,38 @@ fn incomplete_later_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
             "ccs-then-complete-hello-then-two-hellos",
             ccs_then_later_hellos(&hello, &["other.example", "third.example"]),
         ),
+        (
+            "leftover-then-second-third-gapped",
+            leftover_then_second_third_gapped(&append_record_leftover(hello.clone(), &[0x01])),
+        ),
+        ("clean-three-hellos", clean_three_hellos()),
     ]);
     cases
+}
+
+fn leftover_then_second_third_gapped(first: &[u8]) -> Vec<u8> {
+    let second = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    let gapped = client_hello(Some("gapped.example"));
+    let seq2 = 1 + first.len() as u32;
+    let seq3 = seq2 + second.len() as u32;
+    let seq4 = seq3 + third.len() as u32 + 8;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, first),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, &second),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq3, &third),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq4, &gapped),
+        ],
+    )
+}
+
+fn clean_three_hellos() -> Vec<u8> {
+    let first = client_hello(Some("www.example.com"));
+    let second = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    sequential_payloads(50000, 443, &[&first, &second, &third])
 }
 
 fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
