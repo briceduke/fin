@@ -237,6 +237,17 @@ pub fn bump_handshake_u24(mut rec: Vec<u8>, extra: u32) -> Vec<u8> {
     rec
 }
 
+pub fn append_record_leftover(mut rec: Vec<u8>, leftover: &[u8]) -> Vec<u8> {
+    let n = u16::from_be_bytes([rec[3], rec[4]]) as usize + leftover.len();
+    rec[3..5].copy_from_slice(&(n as u16).to_be_bytes());
+    rec.extend_from_slice(leftover);
+    rec
+}
+
+pub fn hello_request(version: u16) -> Vec<u8> {
+    handshake_messages_record(version, &[(0, &[])])
+}
+
 pub fn handshake_body_record(version: u16, body: &[u8]) -> Vec<u8> {
     let mut rec = vec![0x16];
     rec.extend_from_slice(&version.to_be_bytes());

@@ -4394,6 +4394,29 @@ mod tests {
         rec
     }
 
+    fn tls_record_leftover(mut rec: Vec<u8>, leftover: &[u8]) -> Vec<u8> {
+        let n = u16::from_be_bytes([rec[3], rec[4]]) as usize + leftover.len();
+        rec[3..5].copy_from_slice(&(n as u16).to_be_bytes());
+        rec.extend_from_slice(leftover);
+        rec
+    }
+
+    fn tls_hello_request(version: u16) -> Vec<u8> {
+        let mut rec = vec![0x16];
+        rec.extend_from_slice(&version.to_be_bytes());
+        rec.extend_from_slice(&[0x00, 0x04, 0x00, 0x00, 0x00, 0x00]);
+        rec
+    }
+
+    fn two_hello_requests_leftover(leftover: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        body.extend_from_slice(leftover);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&body);
+        rec
+    }
+
     #[test]
     fn split_client_hello_prints_sni_on_the_completing_segment() {
         let hello = sni_hello("www.example.com");
@@ -4929,6 +4952,76 @@ mod tests {
             eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7 + overrun.len() as u32, &other),
         ]);
         assert_split_grease_cells(&cells, "valid-0x0301-overrun");
+    }
+
+    fn walk_ccs_then_later_hello(second: &[u8]) -> Vec<Cell> {
+        let other = sni_hello("other.example");
+        walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7, second),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7 + second.len() as u32, &other),
+        ])
+    }
+
+    #[test]
+    fn incomplete_later_handshake_does_not_print_later_hello() {
+        let hello = sni_hello("www.example.com");
+        let hs = hello[5..].to_vec();
+        for n in 1..=8 {
+            let cells = walk_ccs_then_later_hello(&tls_record_leftover(hello.clone(), &hs[..n]));
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "leftover {n}");
+            assert_eq!(cells[1].tls_sni, ["www.example.com"], "leftover {n}");
+            assert_eq!(cells[1].counted, Some("tls-handshake"), "leftover {n}");
+            assert_eq!(cells[2].tls_sni, [] as [&str; 0], "leftover {n}");
+            assert_eq!(cells[2].counted, Some("tls-handshake"), "leftover {n}");
+        }
+        for leftover in [&[0x01u8][..], &[0x01, 0x00]] {
+            let cells = walk_ccs_then_later_hello(&tls_record_leftover(
+                tls_hello_request(0x0301),
+                leftover,
+            ));
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "hr {leftover:?}");
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "hr {leftover:?}");
+            assert_eq!(cells[1].counted, Some("tls-handshake"), "hr {leftover:?}");
+            assert_eq!(cells[2].tls_sni, [] as [&str; 0], "hr {leftover:?}");
+            assert_eq!(cells[2].counted, Some("tls-handshake"), "hr {leftover:?}");
+        }
+        let cells = walk_ccs_then_later_hello(&two_hello_requests_leftover(&[0x01]));
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("tls-handshake"));
+        let cells =
+            walk_ccs_then_later_hello(&tls_record_leftover(tls_hello_request(0x0a0a), &[0x01]));
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("tls-handshake"));
+        let mut grease = sni_hello("www.example.com");
+        grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        let cells = walk_ccs_then_later_hello(&tls_record_leftover(grease, &[0x01]));
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("tls-handshake"));
+        let mut same = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        same.extend_from_slice(&tls_record_leftover(
+            tls_hello_request(0x0301),
+            &hello[5..15],
+        ));
+        let other = sni_hello("other.example");
+        let cells = walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &same),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + same.len() as u32, &other),
+        ]);
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("tls-handshake"));
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("tls-handshake"));
+        let filled = walk_ccs_then_later_hello(&hello);
+        assert_eq!(filled[1].tls_sni, ["www.example.com"]);
+        assert_eq!(filled[2].tls_sni, ["other.example"]);
+        let empty_rec = walk_ccs_then_later_hello(&[0x16, 0x03, 0x01, 0x00, 0x00]);
+        assert_eq!(empty_rec[2].tls_sni, ["other.example"]);
+        let empty_msg = walk_ccs_then_later_hello(&tls_hello_request(0x0301));
+        assert_eq!(empty_msg[2].tls_sni, ["other.example"]);
     }
 
     #[test]

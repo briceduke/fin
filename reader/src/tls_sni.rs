@@ -203,7 +203,7 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
     length != 0 && length < TLS_MAX_RECORD
 }
 
-/// Bytes of `payload` from the incomplete record onward.
+/// Bytes of `payload` from the incomplete record or handshake onward.
 ///
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
@@ -213,7 +213,11 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 /// record, is kept even when the version fails `ssl_looks_like_sslv3`: after
 /// claimed TLS, tshark 4.6.9 still desegments that GREASE/draft fragment.
 /// Leftover after a complete GREASE handshake is kept from the GREASE record
-/// so the completing frame is Unproved instead of a silent blank.
+/// so the completing frame is Unproved instead of a silent blank. Leftover
+/// after a complete first handshake message is kept from that later message:
+/// tshark 4.6.9 `dissect_tls_handshake` still desegments when leftover is
+/// shorter than 4 bytes or its u24 overruns the record, and the next in-order
+/// payload is continuation.
 pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
     let mut offset = 0;
     while offset < payload.len() {
@@ -232,18 +236,31 @@ pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
         }
         if content == CONTENT_HANDSHAKE {
             let body = &rest[RECORD_HEADER..need];
-            if body.len() < 4 {
-                return Some(rest);
-            }
-            let msg_end = 4usize.saturating_add(u24(&body[1..4]));
-            if msg_end > body.len() {
-                return Some(rest);
+            if let Some(hs) = truncated_handshake_offset(body) {
+                return Some(if hs == 0 { rest } else { &body[hs..] });
             }
         }
         if !is_record_version(version) {
             return truncated_handshake_prefix(&payload[offset + need..]).map(|_| rest);
         }
         offset += need;
+    }
+    None
+}
+
+/// Offset of an incomplete handshake message in a complete record body.
+fn truncated_handshake_offset(body: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while offset < body.len() {
+        let left = body.len() - offset;
+        if left < 4 {
+            return Some(offset);
+        }
+        let msg_end = 4usize.saturating_add(u24(&body[offset + 1..offset + 4]));
+        if msg_end > left {
+            return Some(offset);
+        }
+        offset += msg_end;
     }
     None
 }
@@ -466,6 +483,17 @@ mod tests {
         rec[7] = (n >> 8) as u8;
         rec[8] = n as u8;
         rec
+    }
+
+    fn record_leftover(mut rec: Vec<u8>, leftover: &[u8]) -> Vec<u8> {
+        let n = u16::from_be_bytes([rec[3], rec[4]]) as usize + leftover.len();
+        rec[3..5].copy_from_slice(&(n as u16).to_be_bytes());
+        rec.extend_from_slice(leftover);
+        rec
+    }
+
+    fn hello_request(version: u16) -> Vec<u8> {
+        record(CONTENT_HANDSHAKE, version, &handshake(0, &[]))
     }
 
     fn client_hello(sni: Option<&str>) -> Vec<u8> {
@@ -766,6 +794,64 @@ mod tests {
         }
         let valid = bump_handshake_u24(client_hello(Some("www.example.com")), 40);
         assert_eq!(truncated_handshake_prefix(&valid), Some(valid.as_slice()));
+    }
+
+    #[test]
+    fn truncated_handshake_prefix_keeps_incomplete_later_handshake() {
+        let hello = client_hello(Some("www.example.com"));
+        let hs = hello[5..].to_vec();
+        for n in 1..=8 {
+            let rec = record_leftover(hello.clone(), &hs[..n]);
+            assert_eq!(
+                truncated_handshake_prefix(&rec),
+                Some(&rec[hello.len()..]),
+                "leftover {n}"
+            );
+            let mut after_ccs = record(0x14, 0x0303, &[0x01]);
+            after_ccs.extend_from_slice(&rec);
+            assert_eq!(
+                truncated_handshake_prefix(&after_ccs),
+                Some(&after_ccs[after_ccs.len() - n..]),
+                "ccs leftover {n}"
+            );
+        }
+        let hr = hello_request(0x0301);
+        for leftover in [&[0x01u8][..], &[0x01, 0x00]] {
+            let rec = record_leftover(hr.clone(), leftover);
+            assert_eq!(
+                truncated_handshake_prefix(&rec),
+                Some(&rec[hr.len()..]),
+                "hello-request leftover {leftover:?}"
+            );
+        }
+        let mut two = handshake(0, &[]);
+        two.extend_from_slice(&handshake(0, &[]));
+        two.push(0x01);
+        let two_rec = record(CONTENT_HANDSHAKE, 0x0301, &two);
+        assert_eq!(truncated_handshake_prefix(&two_rec), Some(&[0x01u8][..]));
+        let grease_hr = record_leftover(hello_request(0x0a0a), &[0x01]);
+        assert_eq!(
+            truncated_handshake_prefix(&grease_hr),
+            Some(&grease_hr[grease_hr.len() - 1..])
+        );
+        let grease = client_hello(Some("www.example.com"));
+        let mut grease = grease;
+        grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        let grease_len = grease.len();
+        let grease = record_leftover(grease, &[0x01]);
+        assert_eq!(
+            truncated_handshake_prefix(&grease),
+            Some(&grease[grease_len..])
+        );
+        assert_eq!(truncated_handshake_prefix(&hello), None);
+        assert_eq!(truncated_handshake_prefix(&hello_request(0x0301)), None);
+        let empty = record(CONTENT_HANDSHAKE, 0x0301, &[]);
+        let mut empty_then = empty.clone();
+        empty_then.extend_from_slice(&hello);
+        assert_eq!(truncated_handshake_prefix(&empty_then), None);
+        let mut empty_msg_then = hello_request(0x0301);
+        empty_msg_then.extend_from_slice(&hello);
+        assert_eq!(truncated_handshake_prefix(&empty_msg_then), None);
     }
 
     #[test]

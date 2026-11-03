@@ -219,6 +219,102 @@ fn incomplete_grease_handshake_after_ccs_does_not_print_later_hello() {
     }
 }
 
+fn assert_no_later_hello(fin: &Path, name: &str, file: Vec<u8>, rows: &[&str], counted: &[&str]) {
+    let path = work_dir().join(format!("{name}.pcap"));
+    fs::write(&path, file).unwrap();
+    let output = Command::new(fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        rows,
+        "{name} stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("other.example"),
+        "{name} stdout={stdout:?} stderr={stderr:?}"
+    );
+    for line in counted {
+        assert!(
+            stderr.contains(line),
+            "{name} missing {line} stderr={stderr:?}"
+        );
+    }
+    assert!(
+        !output.status.success(),
+        "{name} exit={:?}",
+        output.status.code()
+    );
+}
+
+#[test]
+fn incomplete_later_handshake_after_ccs_does_not_print_later_hello() {
+    let fin = fin_bin();
+    let counted3: &[&str] = &["counted 2 tls-handshake", "counted 3 tls-handshake"];
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    for n in 1..=8 {
+        assert_no_later_hello(
+            &fin,
+            &format!("ccs-then-hello-leftover-{n}-then-hello"),
+            ccs_then_later_hello(&append_record_leftover(hello.clone(), &hs[..n])),
+            &["", "www.example.com", ""],
+            counted3,
+        );
+    }
+    let blanks3: &[&str] = &["", "", ""];
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-1-then-hello",
+        ccs_then_later_hello(&append_record_leftover(hello_request(0x0301), &[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-2-then-hello",
+        ccs_then_later_hello(&append_record_leftover(
+            hello_request(0x0301),
+            &[0x01, 0x00],
+        )),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-two-hello-requests-leftover-1-then-hello",
+        ccs_then_later_hello(&two_hello_requests_leftover(&[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-grease-hello-request-leftover-then-hello",
+        ccs_then_later_hello(&append_record_leftover(hello_request(0x0a0a), &[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-grease-hello-leftover-1-then-hello",
+        ccs_then_later_hello(&append_record_leftover(grease_hello(0x0a0a), &[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "same-payload-ccs-hello-request-incomplete-hello-then-hello",
+        same_payload_ccs_hello_request_incomplete_then_later_hello(),
+        &["", ""],
+        &["counted 1 tls-handshake", "counted 2 tls-handshake"],
+    );
+}
+
 #[test]
 fn complete_grease_then_truncated_hello_counts_the_completing_segment() {
     let fin = fin_bin();
@@ -389,6 +485,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(hello_ext_throw_cases())
     .chain(complete_grease_leftover_cases())
     .chain(incomplete_grease_handshake_cases())
+    .chain(incomplete_later_handshake_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -838,6 +935,97 @@ fn incomplete_grease_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
             incomplete_grease_then_later_hello(&ccs(), 0x0301),
         ),
     ]
+}
+
+fn ccs_then_later_hello(second: &[u8]) -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[&ccs(), second, &client_hello(Some("other.example"))],
+    )
+}
+
+fn two_hello_requests_leftover(leftover: &[u8]) -> Vec<u8> {
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    body.extend_from_slice(leftover);
+    handshake_body_record(0x0301, &body)
+}
+
+fn same_payload_ccs_hello_request_incomplete_then_later_hello() -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let mut first = ccs();
+    first.extend_from_slice(&append_record_leftover(
+        hello_request(0x0301),
+        &hello[5..15],
+    ));
+    sequential_payloads(50000, 443, &[&first, &client_hello(Some("other.example"))])
+}
+
+fn incomplete_later_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    let leftover_hello = [
+        "ccs-then-hello-leftover-1-then-hello",
+        "ccs-then-hello-leftover-2-then-hello",
+        "ccs-then-hello-leftover-3-then-hello",
+        "ccs-then-hello-leftover-4-then-hello",
+        "ccs-then-hello-leftover-5-then-hello",
+        "ccs-then-hello-leftover-6-then-hello",
+        "ccs-then-hello-leftover-7-then-hello",
+        "ccs-then-hello-leftover-8-then-hello",
+    ];
+    let mut cases: Vec<(&'static str, Vec<u8>)> = leftover_hello
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                name,
+                ccs_then_later_hello(&append_record_leftover(hello.clone(), &hs[..i + 1])),
+            )
+        })
+        .collect();
+    cases.extend([
+        (
+            "ccs-then-hello-request-leftover-1-then-hello",
+            ccs_then_later_hello(&append_record_leftover(hello_request(0x0301), &[0x01])),
+        ),
+        (
+            "ccs-then-hello-request-leftover-2-then-hello",
+            ccs_then_later_hello(&append_record_leftover(
+                hello_request(0x0301),
+                &[0x01, 0x00],
+            )),
+        ),
+        (
+            "ccs-then-two-hello-requests-leftover-1-then-hello",
+            ccs_then_later_hello(&two_hello_requests_leftover(&[0x01])),
+        ),
+        (
+            "ccs-then-grease-hello-request-leftover-then-hello",
+            ccs_then_later_hello(&append_record_leftover(hello_request(0x0a0a), &[0x01])),
+        ),
+        (
+            "ccs-then-grease-hello-leftover-1-then-hello",
+            ccs_then_later_hello(&append_record_leftover(grease_hello(0x0a0a), &[0x01])),
+        ),
+        (
+            "same-payload-ccs-hello-request-incomplete-hello-then-hello",
+            same_payload_ccs_hello_request_incomplete_then_later_hello(),
+        ),
+        (
+            "ccs-then-complete-hello-then-later-hello",
+            ccs_then_later_hello(&hello),
+        ),
+        (
+            "ccs-then-empty-handshake-record-then-hello",
+            ccs_then_later_hello(&[0x16, 0x03, 0x01, 0x00, 0x00]),
+        ),
+        (
+            "ccs-then-empty-handshake-message-then-hello",
+            ccs_then_later_hello(&hello_request(0x0301)),
+        ),
+    ]);
+    cases
 }
 
 fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
