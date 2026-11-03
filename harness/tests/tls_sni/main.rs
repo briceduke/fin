@@ -104,6 +104,122 @@ fn truncated_grease_after_ccs_counts_the_completing_segment() {
 }
 
 #[test]
+fn incomplete_grease_handshake_after_ccs_does_not_print_later_hello() {
+    let fin = fin_bin();
+    let cases: Vec<(&str, Vec<u8>, usize, &[&str])> = vec![
+        (
+            "ccs-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0a0a),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "alert-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], 0x0a0a),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "app-data-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x01], 0x0a0a),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "heartbeat-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(
+                &[0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00],
+                0x0a0a,
+            ),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "hello-request-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(
+                &[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+                0x0a0a,
+            ),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-overrun-draft-0002-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0002),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-overrun-draft-0305-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0305),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-overrun-draft-7f1c-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x7f1c),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "same-payload-ccs-overrun-grease-then-hello",
+            same_payload_ccs_incomplete_grease_then_later_hello(),
+            2,
+            &["counted 1 tls-handshake", "counted 2 tls-handshake"],
+        ),
+        (
+            "ccs-then-1-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01]),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-3-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01, 0x00, 0x00]),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+    ];
+    for (name, file, frames, counted) in cases {
+        let path = work_dir().join(format!("{name}.pcap"));
+        fs::write(&path, file).unwrap();
+        let output = Command::new(&fin)
+            .arg("-r")
+            .arg(&path)
+            .args(["-n", "-T", "fields", "-e", FIELD])
+            .output()
+            .expect("fin");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let rows: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            rows,
+            vec![""; frames],
+            "{name} stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("www.example.com"),
+            "{name} stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("other.example"),
+            "{name} stdout={stdout:?} stderr={stderr:?}"
+        );
+        for line in counted {
+            assert!(
+                stderr.contains(line),
+                "{name} missing {line} stderr={stderr:?}"
+            );
+        }
+        assert!(
+            !output.status.success(),
+            "{name} exit={:?}",
+            output.status.code()
+        );
+    }
+}
+
+#[test]
 fn complete_grease_then_truncated_hello_counts_the_completing_segment() {
     let fin = fin_bin();
     let path = work_dir().join("ccs-then-complete-grease-split-hello-40.pcap");
@@ -272,6 +388,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(review_cases())
     .chain(hello_ext_throw_cases())
     .chain(complete_grease_leftover_cases())
+    .chain(incomplete_grease_handshake_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -632,6 +749,93 @@ fn complete_grease_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
         (
             "empty-ccs-then-complete-grease-split-hello-40",
             empty_ccs_then_complete_grease_split_hello(40),
+        ),
+    ]
+}
+
+fn incomplete_grease_then_later_hello(prefix: &[u8], version: u16) -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[
+            prefix,
+            &bump_handshake_u24(grease_hello(version), 40),
+            &client_hello(Some("other.example")),
+        ],
+    )
+}
+
+fn same_payload_ccs_incomplete_grease_then_later_hello() -> Vec<u8> {
+    let mut first = ccs();
+    first.extend_from_slice(&bump_handshake_u24(grease_hello(0x0a0a), 40));
+    sequential_payloads(50000, 443, &[&first, &client_hello(Some("other.example"))])
+}
+
+fn short_grease_then_later_hello(prefix: &[u8], body: &[u8]) -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[
+            prefix,
+            &handshake_body_record(0x0a0a, body),
+            &client_hello(Some("other.example")),
+        ],
+    )
+}
+
+fn incomplete_grease_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let app = [0x17, 0x03, 0x03, 0x00, 0x01, 0x01];
+    let heartbeat = [0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00];
+    let hello_request = [0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+    vec![
+        (
+            "ccs-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0a0a),
+        ),
+        (
+            "alert-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&alert, 0x0a0a),
+        ),
+        (
+            "app-data-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&app, 0x0a0a),
+        ),
+        (
+            "heartbeat-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&heartbeat, 0x0a0a),
+        ),
+        (
+            "hello-request-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&hello_request, 0x0a0a),
+        ),
+        (
+            "ccs-then-overrun-draft-0002-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0002),
+        ),
+        (
+            "ccs-then-overrun-draft-0305-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0305),
+        ),
+        (
+            "ccs-then-overrun-draft-7f1c-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x7f1c),
+        ),
+        (
+            "same-payload-ccs-overrun-grease-then-hello",
+            same_payload_ccs_incomplete_grease_then_later_hello(),
+        ),
+        (
+            "ccs-then-1-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01]),
+        ),
+        (
+            "ccs-then-3-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01, 0x00, 0x00]),
+        ),
+        (
+            "ccs-then-overrun-0301-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0301),
         ),
     ]
 }

@@ -4385,6 +4385,15 @@ mod tests {
         hello
     }
 
+    fn bump_handshake_u24(mut rec: Vec<u8>, extra: u32) -> Vec<u8> {
+        let msg_len = (u32::from(rec[6]) << 16) | (u32::from(rec[7]) << 8) | u32::from(rec[8]);
+        let n = msg_len + extra;
+        rec[6] = (n >> 16) as u8;
+        rec[7] = (n >> 8) as u8;
+        rec[8] = n as u8;
+        rec
+    }
+
     #[test]
     fn split_client_hello_prints_sni_on_the_completing_segment() {
         let hello = sni_hello("www.example.com");
@@ -4839,6 +4848,87 @@ mod tests {
         ]);
         assert_eq!(empty_cells[0].tls_sni, [] as [&str; 0]);
         assert_eq!(empty_cells[1].tls_sni, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn incomplete_grease_handshake_after_claimed_tls_does_not_print_later_hello() {
+        let prefixes: &[(&str, &[u8])] = &[
+            ("ccs", &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            ("alert", &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+            ("app-data", &[0x17, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            (
+                "heartbeat",
+                &[0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00],
+            ),
+            (
+                "hello-request",
+                &[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+        let other = sni_hello("other.example");
+        for version in [0x0a0au16, 0x0002, 0x0305, 0x7f1c] {
+            let mut grease = sni_hello("www.example.com");
+            grease[1..3].copy_from_slice(&version.to_be_bytes());
+            let overrun = bump_handshake_u24(grease, 40);
+            for (label, prefix) in prefixes {
+                let cells = walk_tls_seq(&[
+                    eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, prefix),
+                    eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + prefix.len() as u32, &overrun),
+                    eth_ipv4_tcp_seq(
+                        CLIENT,
+                        50000,
+                        443,
+                        1 + prefix.len() as u32 + overrun.len() as u32,
+                        &other,
+                    ),
+                ]);
+                assert_split_grease_cells(&cells, &format!("{label} {version:#06x}"));
+            }
+            let mut same = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+            same.extend_from_slice(&overrun);
+            let cells = walk_tls_seq(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &same),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + same.len() as u32, &other),
+            ]);
+            assert_eq!(
+                cells[0].tls_sni,
+                [] as [&str; 0],
+                "same-payload {version:#06x}"
+            );
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-handshake"),
+                "same-payload {version:#06x}"
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                [] as [&str; 0],
+                "same-payload {version:#06x}"
+            );
+            assert_eq!(
+                cells[1].counted,
+                Some("tls-handshake"),
+                "same-payload {version:#06x}"
+            );
+        }
+        for body in [&[0x01u8][..], &[0x01, 0x00, 0x00]] {
+            let mut short = vec![0x16, 0x0a, 0x0a];
+            short.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            short.extend_from_slice(body);
+            let cells = walk_tls_seq(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7, &short),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7 + short.len() as u32, &other),
+            ]);
+            assert_split_grease_cells(&cells, &format!("short-body {body:?}"));
+        }
+        let overrun = bump_handshake_u24(sni_hello("www.example.com"), 40);
+        let cells = walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7, &overrun),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7 + overrun.len() as u32, &other),
+        ]);
+        assert_split_grease_cells(&cells, "valid-0x0301-overrun");
     }
 
     #[test]

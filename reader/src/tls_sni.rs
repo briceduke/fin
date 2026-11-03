@@ -208,11 +208,12 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
 /// Complete records, including length-0 CCS/alert/app-data/handshake, are
-/// skipped so a following truncated handshake stays in `tls_need`. A record
-/// whose version fails `ssl_looks_like_sslv3` is kept when it is incomplete, or
-/// when leftover after it is still truncated: after claimed TLS, tshark 4.6.9
-/// walks that GREASE/draft record and desegments leftover. Keeping from the
-/// GREASE record makes the completing frame Unproved instead of a silent blank.
+/// skipped so a following truncated handshake stays in `tls_need`. A complete
+/// handshake whose body is shorter than 4 bytes, or whose u24 overruns the
+/// record, is kept even when the version fails `ssl_looks_like_sslv3`: after
+/// claimed TLS, tshark 4.6.9 still desegments that GREASE/draft fragment.
+/// Leftover after a complete GREASE handshake is kept from the GREASE record
+/// so the completing frame is Unproved instead of a silent blank.
 pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
     let mut offset = 0;
     while offset < payload.len() {
@@ -222,12 +223,6 @@ pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
         }
         let (content, version, length) = tls_record_header(rest)?;
         let need = RECORD_HEADER + length;
-        if !is_record_version(version) {
-            if need > rest.len() {
-                return Some(rest);
-            }
-            return truncated_handshake_prefix(&payload[offset + need..]).map(|_| rest);
-        }
         if need > rest.len() {
             return Some(rest);
         }
@@ -244,6 +239,9 @@ pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
             if msg_end > body.len() {
                 return Some(rest);
             }
+        }
+        if !is_record_version(version) {
+            return truncated_handshake_prefix(&payload[offset + need..]).map(|_| rest);
         }
         offset += need;
     }
@@ -460,6 +458,14 @@ mod tests {
         out[3] = len as u8;
         out.extend_from_slice(body);
         out
+    }
+
+    fn bump_handshake_u24(mut rec: Vec<u8>, extra: usize) -> Vec<u8> {
+        let n = u24(&rec[6..9]).saturating_add(extra) as u32;
+        rec[6] = (n >> 16) as u8;
+        rec[7] = (n >> 8) as u8;
+        rec[8] = n as u8;
+        rec
     }
 
     fn client_hello(sni: Option<&str>) -> Vec<u8> {
@@ -707,6 +713,59 @@ mod tests {
                 "{version:#06x}"
             );
         }
+    }
+
+    #[test]
+    fn truncated_handshake_prefix_keeps_complete_grease_with_incomplete_handshake() {
+        let hello = client_hello(Some("other.example"));
+        let prefixes = [
+            record(0x14, 0x0303, &[0x01]),
+            record(0x15, 0x0303, &[0x02, 0x28]),
+            record(0x17, 0x0303, &[0x01]),
+            record(0x18, 0x0303, &[0x01, 0x00, 0x00]),
+            record(CONTENT_HANDSHAKE, 0x0303, &handshake(0, &[])),
+        ];
+        for version in [0x0a0au16, 0x0002, 0x0305, 0x7f1c] {
+            let mut grease = client_hello(Some("www.example.com"));
+            grease[1..3].copy_from_slice(&version.to_be_bytes());
+            let overrun = bump_handshake_u24(grease, 40);
+            assert_eq!(
+                truncated_handshake_prefix(&overrun),
+                Some(overrun.as_slice()),
+                "{version:#06x}"
+            );
+            for prefix in &prefixes {
+                let mut payload = prefix.clone();
+                payload.extend_from_slice(&overrun);
+                assert_eq!(
+                    truncated_handshake_prefix(&payload),
+                    Some(overrun.as_slice()),
+                    "prefix {:02x?} {version:#06x}",
+                    &prefix[..prefix.len().min(5)]
+                );
+                let mut with_hello = payload;
+                with_hello.extend_from_slice(&hello);
+                assert_eq!(
+                    truncated_handshake_prefix(&with_hello),
+                    Some(&with_hello[prefix.len()..]),
+                    "leftover hello {version:#06x}"
+                );
+            }
+        }
+        for body in [&[0x01u8][..], &[0x01, 0x00, 0x00]] {
+            let short = record(CONTENT_HANDSHAKE, 0x0a0a, body);
+            assert_eq!(truncated_handshake_prefix(&short), Some(short.as_slice()));
+            let mut ccs_short = record(0x14, 0x0303, &[0x01]);
+            ccs_short.extend_from_slice(&short);
+            ccs_short.extend_from_slice(&hello);
+            assert_eq!(
+                truncated_handshake_prefix(&ccs_short),
+                Some(&ccs_short[6..]),
+                "body {body:?}"
+            );
+        }
+        let valid = bump_handshake_u24(client_hello(Some("www.example.com")), 40);
+        assert_eq!(truncated_handshake_prefix(&valid), Some(valid.as_slice()));
     }
 
     #[test]

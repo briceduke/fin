@@ -228,6 +228,23 @@ pub fn ccs() -> Vec<u8> {
     vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
 }
 
+pub fn bump_handshake_u24(mut rec: Vec<u8>, extra: u32) -> Vec<u8> {
+    let msg_len = (u32::from(rec[6]) << 16) | (u32::from(rec[7]) << 8) | u32::from(rec[8]);
+    let n = msg_len + extra;
+    rec[6] = (n >> 16) as u8;
+    rec[7] = (n >> 8) as u8;
+    rec[8] = n as u8;
+    rec
+}
+
+pub fn handshake_body_record(version: u16, body: &[u8]) -> Vec<u8> {
+    let mut rec = vec![0x16];
+    rec.extend_from_slice(&version.to_be_bytes());
+    rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    rec.extend_from_slice(body);
+    rec
+}
+
 pub fn handshake_record(body: &[u8]) -> Vec<u8> {
     let mut rec = vec![0x16, 0x03, 0x01];
     rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
