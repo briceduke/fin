@@ -77,6 +77,471 @@ fn uncertain_last_hello_ext_counts_tls_hello_ext_uncertain() {
 }
 
 #[test]
+fn truncated_grease_after_ccs_counts_the_completing_segment() {
+    let fin = fin_bin();
+    let path = work_dir().join("ccs-then-split-grease-40.pcap");
+    fs::write(&path, split_grease_after(&ccs(), 40, 0x0a0a)).unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows, ["", "", ""], "stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        stderr.contains("counted 2 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 3 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(stderr.contains("total 2"), "stderr={stderr:?}");
+    assert!(!output.status.success(), "exit={:?}", output.status.code());
+}
+
+#[test]
+fn incomplete_grease_handshake_after_ccs_does_not_print_later_hello() {
+    let fin = fin_bin();
+    let cases: Vec<(&str, Vec<u8>, usize, &[&str])> = vec![
+        (
+            "ccs-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0a0a),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "alert-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], 0x0a0a),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "app-data-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x01], 0x0a0a),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "heartbeat-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(
+                &[0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00],
+                0x0a0a,
+            ),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "hello-request-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(
+                &[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+                0x0a0a,
+            ),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-overrun-draft-0002-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0002),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-overrun-draft-0305-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0305),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-overrun-draft-7f1c-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x7f1c),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "same-payload-ccs-overrun-grease-then-hello",
+            same_payload_ccs_incomplete_grease_then_later_hello(),
+            2,
+            &["counted 1 tls-handshake", "counted 2 tls-handshake"],
+        ),
+        (
+            "ccs-then-1-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01]),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+        (
+            "ccs-then-3-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01, 0x00, 0x00]),
+            3,
+            &["counted 2 tls-handshake", "counted 3 tls-handshake"],
+        ),
+    ];
+    for (name, file, frames, counted) in cases {
+        let path = work_dir().join(format!("{name}.pcap"));
+        fs::write(&path, file).unwrap();
+        let output = Command::new(&fin)
+            .arg("-r")
+            .arg(&path)
+            .args(["-n", "-T", "fields", "-e", FIELD])
+            .output()
+            .expect("fin");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let rows: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            rows,
+            vec![""; frames],
+            "{name} stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("www.example.com"),
+            "{name} stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("other.example"),
+            "{name} stdout={stdout:?} stderr={stderr:?}"
+        );
+        for line in counted {
+            assert!(
+                stderr.contains(line),
+                "{name} missing {line} stderr={stderr:?}"
+            );
+        }
+        assert!(
+            !output.status.success(),
+            "{name} exit={:?}",
+            output.status.code()
+        );
+    }
+}
+
+fn assert_no_later_hello(fin: &Path, name: &str, file: Vec<u8>, rows: &[&str], counted: &[&str]) {
+    let path = work_dir().join(format!("{name}.pcap"));
+    fs::write(&path, file).unwrap();
+    let output = Command::new(fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        rows,
+        "{name} stdout={stdout:?} stderr={stderr:?}"
+    );
+    for host in [
+        "other.example",
+        "third.example",
+        "b.example",
+        "c.example",
+        "d.example",
+        "gapped.example",
+    ] {
+        assert!(
+            !stdout.contains(host),
+            "{name} has {host} stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    for line in counted {
+        assert!(
+            stderr.contains(line),
+            "{name} missing {line} stderr={stderr:?}"
+        );
+    }
+    assert!(
+        !output.status.success(),
+        "{name} exit={:?}",
+        output.status.code()
+    );
+}
+
+#[test]
+fn incomplete_later_handshake_after_ccs_does_not_print_later_hello() {
+    let fin = fin_bin();
+    let counted3: &[&str] = &["counted 2 tls-handshake", "counted 3 tls-handshake"];
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    for n in 1..=8 {
+        assert_no_later_hello(
+            &fin,
+            &format!("ccs-then-hello-leftover-{n}-then-hello"),
+            ccs_then_later_hello(&append_record_leftover(hello.clone(), &hs[..n])),
+            &["", "www.example.com", ""],
+            counted3,
+        );
+    }
+    let blanks3: &[&str] = &["", "", ""];
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-1-then-hello",
+        ccs_then_later_hello(&append_record_leftover(hello_request(0x0301), &[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-2-then-hello",
+        ccs_then_later_hello(&append_record_leftover(
+            hello_request(0x0301),
+            &[0x01, 0x00],
+        )),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-two-hello-requests-leftover-1-then-hello",
+        ccs_then_later_hello(&two_hello_requests_leftover(&[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-grease-hello-request-leftover-then-hello",
+        ccs_then_later_hello(&append_record_leftover(hello_request(0x0a0a), &[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-grease-hello-leftover-1-then-hello",
+        ccs_then_later_hello(&append_record_leftover(grease_hello(0x0a0a), &[0x01])),
+        blanks3,
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "same-payload-ccs-hello-request-incomplete-hello-then-hello",
+        same_payload_ccs_hello_request_incomplete_then_later_hello(),
+        &["", ""],
+        &["counted 1 tls-handshake", "counted 2 tls-handshake"],
+    );
+}
+
+#[test]
+fn gapped_later_hello_after_leftover_does_not_print_sni() {
+    let fin = fin_bin();
+    let counted3: &[&str] = &["counted 2 tls-handshake", "counted 3 tls-handshake"];
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    let leftover1 = append_record_leftover(hello.clone(), &hs[..1]);
+    for gap in [1i32, 2, 8, 10, 40, 100, -1] {
+        assert_no_later_hello(
+            &fin,
+            &format!("ccs-then-hello-leftover-1-then-hello-gap-{gap}"),
+            ccs_then_later_hello_gap(&leftover1, gap),
+            &["", "www.example.com", ""],
+            counted3,
+        );
+    }
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-leftover-4-then-hello-gap-1",
+        ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..4]), 1),
+        &["", "www.example.com", ""],
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-1-then-hello-gap-1",
+        ccs_then_later_hello_gap(&append_record_leftover(hello_request(0x0301), &[0x01]), 1),
+        &["", "", ""],
+        counted3,
+    );
+    assert_no_later_hello(
+        &fin,
+        "hello-leftover-1-then-hello-gap-1",
+        leftover_hello_then_gapped_hello(&[0x01], 1),
+        &["www.example.com", ""],
+        &["counted 1 tls-handshake", "counted 2 tls-handshake"],
+    );
+}
+
+#[test]
+fn abutting_later_hello_after_leftover_does_not_print_a_second_hello() {
+    let fin = fin_bin();
+    let counted4: &[&str] = &[
+        "counted 2 tls-handshake",
+        "counted 3 tls-handshake",
+        "counted 4 tls-handshake",
+    ];
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    let later = ["other.example", "third.example"];
+    let rows4: &[&str] = &["", "www.example.com", "", ""];
+    for n in [1usize, 2, 3, 4, 5, 8] {
+        assert_no_later_hello(
+            &fin,
+            &format!("ccs-then-hello-leftover-{n}-then-two-hellos"),
+            ccs_then_later_hellos(&append_record_leftover(hello.clone(), &hs[..n]), &later),
+            rows4,
+            counted4,
+        );
+    }
+    let blanks4: &[&str] = &["", "", "", ""];
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-1-then-two-hellos",
+        ccs_then_later_hellos(
+            &append_record_leftover(hello_request(0x0301), &[0x01]),
+            &later,
+        ),
+        blanks4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-two-hello-requests-leftover-1-then-two-hellos",
+        ccs_then_later_hellos(&two_hello_requests_leftover(&[0x01]), &later),
+        blanks4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-grease-hello-leftover-1-then-two-hellos",
+        ccs_then_later_hellos(
+            &append_record_leftover(grease_hello(0x0a0a), &[0x01]),
+            &later,
+        ),
+        blanks4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "hello-leftover-1-then-two-hellos",
+        leftover_hello_then_later_hellos(&[0x01], &later),
+        &["www.example.com", "", ""],
+        &[
+            "counted 1 tls-handshake",
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+        ],
+    );
+    assert_no_later_hello(
+        &fin,
+        "same-payload-ccs-hello-leftover-1-then-two-hellos",
+        same_payload_ccs_leftover_then_later_hellos(&[0x01], &later),
+        &["", "", ""],
+        &[
+            "counted 1 tls-handshake",
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+        ],
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-leftover-1-then-hello-then-gap-1",
+        leftover_abutting_then_gapped_third(&append_record_leftover(hello.clone(), &hs[..1]), 1),
+        rows4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-leftover-1-then-four-hellos",
+        ccs_then_later_hellos(
+            &append_record_leftover(hello.clone(), &hs[..1]),
+            &["other.example", "b.example", "c.example", "d.example"],
+        ),
+        &["", "www.example.com", "", "", "", ""],
+        &[
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+            "counted 4 tls-handshake",
+            "counted 5 tls-handshake",
+            "counted 6 tls-handshake",
+        ],
+    );
+}
+
+#[test]
+fn later_hellos_after_pending_are_counted() {
+    let fin = fin_bin();
+    let leftover = append_record_leftover(client_hello(Some("www.example.com")), &[0x01]);
+    assert_no_later_hello(
+        &fin,
+        "leftover-then-second-third-gapped",
+        leftover_then_second_third_gapped(&leftover),
+        &["www.example.com", "", "", ""],
+        &[
+            "counted 1 tls-handshake",
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+            "counted 4 tls-handshake",
+        ],
+    );
+}
+
+#[test]
+fn clean_flow_prints_each_sni() {
+    let Some((tshark, fin)) = tools() else {
+        return;
+    };
+    let dir = work_dir();
+    let file = clean_three_hellos();
+    let path = dir.join("clean-three-hellos.pcap");
+    fs::write(&path, file).unwrap();
+    let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
+    args.extend(
+        ["-n", "-T", "fields", "-e", FIELD]
+            .into_iter()
+            .map(OsString::from),
+    );
+    let output = run_pair(&tshark, &fin, &args).expect("pair");
+    let report = check_pair(&output).expect("check");
+    assert!(
+        report.faults.is_empty(),
+        "clean-three-hellos: {report} tshark={:?} fin={:?} stderr={}",
+        output.tshark_stdout,
+        output.fin_stdout,
+        output.fin_stderr
+    );
+    assert_eq!(
+        output.fin_stdout.lines().collect::<Vec<_>>(),
+        ["www.example.com", "other.example", "third.example"]
+    );
+}
+
+#[test]
+fn complete_grease_then_truncated_hello_counts_the_completing_segment() {
+    let fin = fin_bin();
+    let path = work_dir().join("ccs-then-complete-grease-split-hello-40.pcap");
+    fs::write(&path, complete_grease_then_split_hello(&ccs(), 40, 0x0a0a)).unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows, ["", "", ""], "stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        !stdout.contains("www.example.com"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("other.example"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 2 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 3 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(!output.status.success(), "exit={:?}", output.status.code());
+}
+
+#[test]
 fn combined_ip_src_and_sni_matches_tshark_469() {
     let Some((tshark, fin)) = tools() else {
         return;
@@ -210,6 +675,9 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(record_version_cases())
     .chain(review_cases())
     .chain(hello_ext_throw_cases())
+    .chain(complete_grease_leftover_cases())
+    .chain(incomplete_grease_handshake_cases())
+    .chain(incomplete_later_handshake_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -340,12 +808,746 @@ fn split_hello_at(cut: usize) -> Vec<u8> {
     )
 }
 
+fn split_hello_after_prefix(prefix: &[u8], cut: usize) -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let mut first = prefix.to_vec();
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn complete_hello_then_split_second() -> Vec<u8> {
+    let first = client_hello(Some("www.example.com"));
+    let second = client_hello(Some("other.example"));
+    let mut payload = first.clone();
+    payload.extend_from_slice(&second[..10]);
+    sequential_payloads(50000, 443, &[&payload, &second[10..]])
+}
+
+fn later_grease_after(prefix: &[u8]) -> Vec<u8> {
+    let mut grease = client_hello(Some("www.example.com"));
+    grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+    sequential_payloads(50000, 443, &[prefix, &grease])
+}
+
+fn later_grease_after_server_hello() -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0x22u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.push(0);
+    later_grease_after(&handshake_messages_record(0x0303, &[(2, &body)]))
+}
+
+fn reverse_ccs_then_grease() -> Vec<u8> {
+    let mut grease = client_hello(Some("www.example.com"));
+    grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs()),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &grease),
+        ],
+    )
+}
+
+fn grease_hello(version: u16) -> Vec<u8> {
+    let mut hello = client_hello(Some("www.example.com"));
+    hello[1..3].copy_from_slice(&version.to_be_bytes());
+    hello
+}
+
+fn split_grease_after(prefix: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let hello = grease_hello(version);
+    sequential_payloads(50000, 443, &[prefix, &hello[..cut], &hello[cut..]])
+}
+
+fn reverse_ccs_then_split_grease(cut: usize) -> Vec<u8> {
+    let hello = grease_hello(0x0a0a);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs()),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &hello[..cut]),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1 + cut as u32, &hello[cut..]),
+        ],
+    )
+}
+
+fn same_payload_ccs_then_split_grease(cut: usize) -> Vec<u8> {
+    let hello = grease_hello(0x0a0a);
+    let mut first = ccs();
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn complete_grease_then_split_hello(prefix: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let grease = grease_hello(version);
+    let hello = client_hello(Some("other.example"));
+    let mut second = grease;
+    second.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[prefix, &second, &hello[cut..]])
+}
+
+fn reverse_ccs_then_complete_grease_split_hello(cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut second = grease;
+    second.extend_from_slice(&hello[..cut]);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs()),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &second),
+            eth_ipv4_tcp_flow(
+                OUTER,
+                PEER,
+                50000,
+                443,
+                1 + second.len() as u32,
+                &hello[cut..],
+            ),
+        ],
+    )
+}
+
+fn same_payload_ccs_complete_grease_then_split_hello(cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut first = ccs();
+    first.extend_from_slice(&grease);
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn split_grease_completing_then_split_hello(grease_cut: usize, hello_cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut third = grease[grease_cut..].to_vec();
+    third.extend_from_slice(&hello[..hello_cut]);
+    sequential_payloads(
+        50000,
+        443,
+        &[&ccs(), &grease[..grease_cut], &third, &hello[hello_cut..]],
+    )
+}
+
+fn later_hello_after_complete_grease() -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[
+            &ccs(),
+            &grease_hello(0x0a0a),
+            &client_hello(Some("other.example")),
+        ],
+    )
+}
+
+fn lone_grease_then_split_hello(cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut first = grease;
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn empty_ccs_then_complete_grease_split_hello(cut: usize) -> Vec<u8> {
+    let empty = [0x14, 0x03, 0x03, 0x00, 0x00];
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut second = grease;
+    second.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&empty, &second, &hello[cut..]])
+}
+
+fn complete_grease_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let app = [0x17, 0x03, 0x03, 0x00, 0x01, 0x01];
+    let hello_request = [0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+    let mut server_body = vec![0x03, 0x03];
+    server_body.extend_from_slice(&[0x22u8; 32]);
+    server_body.push(0);
+    server_body.extend_from_slice(&[0x00, 0x2f]);
+    server_body.push(0);
+    let server = handshake_messages_record(0x0303, &[(2, &server_body)]);
+    vec![
+        (
+            "ccs-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&ccs(), 40, 0x0a0a),
+        ),
+        (
+            "alert-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&alert, 40, 0x0a0a),
+        ),
+        (
+            "app-data-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&app, 40, 0x0a0a),
+        ),
+        (
+            "hello-request-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&hello_request, 40, 0x0a0a),
+        ),
+        (
+            "server-hello-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&server, 40, 0x0a0a),
+        ),
+        (
+            "reverse-ccs-then-complete-grease-split-hello-40",
+            reverse_ccs_then_complete_grease_split_hello(40),
+        ),
+        (
+            "ccs-then-complete-grease-ver-0002-split-hello-40",
+            complete_grease_then_split_hello(&ccs(), 40, 0x0002),
+        ),
+        (
+            "ccs-then-complete-grease-ver-0305-split-hello-40",
+            complete_grease_then_split_hello(&ccs(), 40, 0x0305),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-3",
+            complete_grease_then_split_hello(&ccs(), 3, 0x0a0a),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-4",
+            complete_grease_then_split_hello(&ccs(), 4, 0x0a0a),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-5",
+            complete_grease_then_split_hello(&ccs(), 5, 0x0a0a),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-10",
+            complete_grease_then_split_hello(&ccs(), 10, 0x0a0a),
+        ),
+        (
+            "same-payload-ccs-complete-grease-split-hello-40",
+            same_payload_ccs_complete_grease_then_split_hello(40),
+        ),
+        (
+            "split-grease-completing-then-split-hello-40",
+            split_grease_completing_then_split_hello(40, 40),
+        ),
+        (
+            "later-hello-after-complete-grease",
+            later_hello_after_complete_grease(),
+        ),
+        (
+            "lone-grease-then-split-hello-40",
+            lone_grease_then_split_hello(40),
+        ),
+        (
+            "empty-ccs-then-complete-grease-split-hello-40",
+            empty_ccs_then_complete_grease_split_hello(40),
+        ),
+    ]
+}
+
+fn incomplete_grease_then_later_hello(prefix: &[u8], version: u16) -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[
+            prefix,
+            &bump_handshake_u24(grease_hello(version), 40),
+            &client_hello(Some("other.example")),
+        ],
+    )
+}
+
+fn same_payload_ccs_incomplete_grease_then_later_hello() -> Vec<u8> {
+    let mut first = ccs();
+    first.extend_from_slice(&bump_handshake_u24(grease_hello(0x0a0a), 40));
+    sequential_payloads(50000, 443, &[&first, &client_hello(Some("other.example"))])
+}
+
+fn short_grease_then_later_hello(prefix: &[u8], body: &[u8]) -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[
+            prefix,
+            &handshake_body_record(0x0a0a, body),
+            &client_hello(Some("other.example")),
+        ],
+    )
+}
+
+fn incomplete_grease_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let app = [0x17, 0x03, 0x03, 0x00, 0x01, 0x01];
+    let heartbeat = [0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00];
+    let hello_request = [0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+    vec![
+        (
+            "ccs-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0a0a),
+        ),
+        (
+            "alert-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&alert, 0x0a0a),
+        ),
+        (
+            "app-data-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&app, 0x0a0a),
+        ),
+        (
+            "heartbeat-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&heartbeat, 0x0a0a),
+        ),
+        (
+            "hello-request-then-overrun-grease-then-hello",
+            incomplete_grease_then_later_hello(&hello_request, 0x0a0a),
+        ),
+        (
+            "ccs-then-overrun-draft-0002-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0002),
+        ),
+        (
+            "ccs-then-overrun-draft-0305-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0305),
+        ),
+        (
+            "ccs-then-overrun-draft-7f1c-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x7f1c),
+        ),
+        (
+            "same-payload-ccs-overrun-grease-then-hello",
+            same_payload_ccs_incomplete_grease_then_later_hello(),
+        ),
+        (
+            "ccs-then-1-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01]),
+        ),
+        (
+            "ccs-then-3-byte-grease-then-hello",
+            short_grease_then_later_hello(&ccs(), &[0x01, 0x00, 0x00]),
+        ),
+        (
+            "ccs-then-overrun-0301-then-hello",
+            incomplete_grease_then_later_hello(&ccs(), 0x0301),
+        ),
+    ]
+}
+
+fn ccs_then_later_hello(second: &[u8]) -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[&ccs(), second, &client_hello(Some("other.example"))],
+    )
+}
+
+fn ccs_then_later_hellos(second: &[u8], names: &[&str]) -> Vec<u8> {
+    let hellos: Vec<Vec<u8>> = names.iter().map(|name| client_hello(Some(name))).collect();
+    let ccs = ccs();
+    let mut payloads: Vec<&[u8]> = vec![&ccs, second];
+    payloads.extend(hellos.iter().map(|hello| hello.as_slice()));
+    sequential_payloads(50000, 443, &payloads)
+}
+
+fn leftover_hello_then_later_hellos(leftover: &[u8], names: &[&str]) -> Vec<u8> {
+    let first = append_record_leftover(client_hello(Some("www.example.com")), leftover);
+    let hellos: Vec<Vec<u8>> = names.iter().map(|name| client_hello(Some(name))).collect();
+    let mut payloads: Vec<&[u8]> = vec![&first];
+    payloads.extend(hellos.iter().map(|hello| hello.as_slice()));
+    sequential_payloads(50000, 443, &payloads)
+}
+
+fn same_payload_ccs_leftover_then_later_hellos(leftover: &[u8], names: &[&str]) -> Vec<u8> {
+    let mut first = ccs();
+    first.extend_from_slice(&append_record_leftover(
+        client_hello(Some("www.example.com")),
+        leftover,
+    ));
+    let hellos: Vec<Vec<u8>> = names.iter().map(|name| client_hello(Some(name))).collect();
+    let mut payloads: Vec<&[u8]> = vec![&first];
+    payloads.extend(hellos.iter().map(|hello| hello.as_slice()));
+    sequential_payloads(50000, 443, &payloads)
+}
+
+fn leftover_abutting_then_gapped_third(second: &[u8], gap: i32) -> Vec<u8> {
+    let ccs = ccs();
+    let other = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    let seq2 = 1 + ccs.len() as u32;
+    let seq3 = seq2 + second.len() as u32;
+    let seq4 = (seq3 + other.len() as u32).wrapping_add_signed(gap);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, second),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq3, &other),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq4, &third),
+        ],
+    )
+}
+
+fn leftover_two_gapped_hellos(second: &[u8], gap: i32) -> Vec<u8> {
+    let ccs = ccs();
+    let other = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    let seq2 = 1 + ccs.len() as u32;
+    let seq3 = (seq2 + second.len() as u32).wrapping_add_signed(gap);
+    let seq4 = (seq3 + other.len() as u32).wrapping_add_signed(gap);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, second),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq3, &other),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq4, &third),
+        ],
+    )
+}
+
+fn leftover_then_reverse_hello(second: &[u8]) -> Vec<u8> {
+    let ccs = ccs();
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1 + ccs.len() as u32, second),
+            eth_ipv4_tcp_flow(
+                PEER,
+                OUTER,
+                443,
+                50000,
+                1,
+                &client_hello(Some("other.example")),
+            ),
+        ],
+    )
+}
+
+fn truncated_hello_then_gapped_hello(cut: usize, gap: i32) -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let other = client_hello(Some("other.example"));
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &hello[..cut]),
+            eth_ipv4_tcp_flow(
+                OUTER,
+                PEER,
+                50000,
+                443,
+                (1 + cut as u32).wrapping_add_signed(gap),
+                &other,
+            ),
+        ],
+    )
+}
+
+fn ccs_then_later_hello_gap(second: &[u8], gap: i32) -> Vec<u8> {
+    let ccs = ccs();
+    let other = client_hello(Some("other.example"));
+    let seq2 = 1 + ccs.len() as u32;
+    let next = seq2 + second.len() as u32;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, second),
+            eth_ipv4_tcp_flow(
+                OUTER,
+                PEER,
+                50000,
+                443,
+                next.wrapping_add_signed(gap),
+                &other,
+            ),
+        ],
+    )
+}
+
+fn leftover_hello_then_gapped_hello(leftover: &[u8], gap: i32) -> Vec<u8> {
+    let first = append_record_leftover(client_hello(Some("www.example.com")), leftover);
+    let other = client_hello(Some("other.example"));
+    let next = 1 + first.len() as u32;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &first),
+            eth_ipv4_tcp_flow(
+                OUTER,
+                PEER,
+                50000,
+                443,
+                next.wrapping_add_signed(gap),
+                &other,
+            ),
+        ],
+    )
+}
+
+fn two_hello_requests_leftover(leftover: &[u8]) -> Vec<u8> {
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    body.extend_from_slice(leftover);
+    handshake_body_record(0x0301, &body)
+}
+
+fn same_payload_ccs_hello_request_incomplete_then_later_hello() -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let mut first = ccs();
+    first.extend_from_slice(&append_record_leftover(
+        hello_request(0x0301),
+        &hello[5..15],
+    ));
+    sequential_payloads(50000, 443, &[&first, &client_hello(Some("other.example"))])
+}
+
+fn incomplete_later_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    let leftover_hello = [
+        "ccs-then-hello-leftover-1-then-hello",
+        "ccs-then-hello-leftover-2-then-hello",
+        "ccs-then-hello-leftover-3-then-hello",
+        "ccs-then-hello-leftover-4-then-hello",
+        "ccs-then-hello-leftover-5-then-hello",
+        "ccs-then-hello-leftover-6-then-hello",
+        "ccs-then-hello-leftover-7-then-hello",
+        "ccs-then-hello-leftover-8-then-hello",
+    ];
+    let mut cases: Vec<(&'static str, Vec<u8>)> = leftover_hello
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                name,
+                ccs_then_later_hello(&append_record_leftover(hello.clone(), &hs[..i + 1])),
+            )
+        })
+        .collect();
+    cases.extend([
+        (
+            "ccs-then-hello-request-leftover-1-then-hello",
+            ccs_then_later_hello(&append_record_leftover(hello_request(0x0301), &[0x01])),
+        ),
+        (
+            "ccs-then-hello-request-leftover-2-then-hello",
+            ccs_then_later_hello(&append_record_leftover(
+                hello_request(0x0301),
+                &[0x01, 0x00],
+            )),
+        ),
+        (
+            "ccs-then-two-hello-requests-leftover-1-then-hello",
+            ccs_then_later_hello(&two_hello_requests_leftover(&[0x01])),
+        ),
+        (
+            "ccs-then-grease-hello-request-leftover-then-hello",
+            ccs_then_later_hello(&append_record_leftover(hello_request(0x0a0a), &[0x01])),
+        ),
+        (
+            "ccs-then-grease-hello-leftover-1-then-hello",
+            ccs_then_later_hello(&append_record_leftover(grease_hello(0x0a0a), &[0x01])),
+        ),
+        (
+            "same-payload-ccs-hello-request-incomplete-hello-then-hello",
+            same_payload_ccs_hello_request_incomplete_then_later_hello(),
+        ),
+        (
+            "ccs-then-complete-hello-then-later-hello",
+            ccs_then_later_hello(&hello),
+        ),
+        (
+            "ccs-then-empty-handshake-record-then-hello",
+            ccs_then_later_hello(&[0x16, 0x03, 0x01, 0x00, 0x00]),
+        ),
+        (
+            "ccs-then-empty-handshake-message-then-hello",
+            ccs_then_later_hello(&hello_request(0x0301)),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap-1",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), 1),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap-2",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), 2),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap-8",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), 8),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap-10",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), 10),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap-40",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), 40),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap-100",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), 100),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-gap--1",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..1]), -1),
+        ),
+        (
+            "ccs-then-hello-leftover-4-then-hello-gap-1",
+            ccs_then_later_hello_gap(&append_record_leftover(hello.clone(), &hs[..4]), 1),
+        ),
+        (
+            "ccs-then-hello-request-leftover-1-then-hello-gap-1",
+            ccs_then_later_hello_gap(&append_record_leftover(hello_request(0x0301), &[0x01]), 1),
+        ),
+        (
+            "hello-leftover-1-then-hello-gap-1",
+            leftover_hello_then_gapped_hello(&[0x01], 1),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..1]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-2-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..2]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-3-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..3]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-4-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..4]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-5-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..5]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-8-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..8]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-request-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello_request(0x0301), &[0x01]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-two-hello-requests-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &two_hello_requests_leftover(&[0x01]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-grease-hello-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(grease_hello(0x0a0a), &[0x01]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "hello-leftover-1-then-two-hellos",
+            leftover_hello_then_later_hellos(&[0x01], &["other.example", "third.example"]),
+        ),
+        (
+            "same-payload-ccs-hello-leftover-1-then-two-hellos",
+            same_payload_ccs_leftover_then_later_hellos(
+                &[0x01],
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-then-gap-1",
+            leftover_abutting_then_gapped_third(
+                &append_record_leftover(hello.clone(), &hs[..1]),
+                1,
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-four-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..1]),
+                &["other.example", "b.example", "c.example", "d.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-two-gapped-hellos",
+            leftover_two_gapped_hellos(&append_record_leftover(hello.clone(), &hs[..1]), 1),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-reverse-hello",
+            leftover_then_reverse_hello(&append_record_leftover(hello.clone(), &hs[..1])),
+        ),
+        (
+            "truncated-hello-40-then-hello-gap-1",
+            truncated_hello_then_gapped_hello(40, 1),
+        ),
+        (
+            "ccs-then-complete-hello-then-two-hellos",
+            ccs_then_later_hellos(&hello, &["other.example", "third.example"]),
+        ),
+        (
+            "leftover-then-second-third-gapped",
+            leftover_then_second_third_gapped(&append_record_leftover(hello.clone(), &[0x01])),
+        ),
+        ("clean-three-hellos", clean_three_hellos()),
+    ]);
+    cases
+}
+
+fn leftover_then_second_third_gapped(first: &[u8]) -> Vec<u8> {
+    let second = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    let gapped = client_hello(Some("gapped.example"));
+    let seq2 = 1 + first.len() as u32;
+    let seq3 = seq2 + second.len() as u32;
+    let seq4 = seq3 + third.len() as u32 + 8;
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, first),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, &second),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq3, &third),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq4, &gapped),
+        ],
+    )
+}
+
+fn clean_three_hellos() -> Vec<u8> {
+    let first = client_hello(Some("www.example.com"));
+    let second = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    sequential_payloads(50000, 443, &[&first, &second, &third])
+}
+
 fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     let hello = client_hello(Some("www.example.com"));
     let mut hello_0304 = hello.clone();
     hello_0304[1..3].copy_from_slice(&0x0304u16.to_be_bytes());
     let mut ccs_hello = ccs();
     ccs_hello.extend_from_slice(&hello);
+    let mut grease = hello.clone();
+    grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+    let mut ccs_grease = ccs();
+    ccs_grease.extend_from_slice(&grease);
     vec![
         (
             "unnamed-0304",
@@ -446,12 +1648,120 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
                 &[eth_ipv4_tcp(OUTER, 50000, 443, &ccs_hello)],
             ),
         ),
+        (
+            "ccs-then-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 443, &ccs_grease)],
+            ),
+        ),
+        (
+            "rst-hello",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flow_flags(
+                    OUTER, PEER, 50000, 443, 1, 0x14, &hello,
+                )],
+            ),
+        ),
         ("leftover-00-then-hello", leftover_then_hello(&[0x00])),
         (
             "throwing-handshake-then-hello",
             throwing_handshake_then_hello(),
         ),
+        ("ccs-then-split-hello", split_hello_after_prefix(&ccs(), 40)),
+        (
+            "empty-ccs-then-split-hello",
+            split_hello_after_prefix(&[0x14, 0x03, 0x03, 0x00, 0x00], 40),
+        ),
+        (
+            "alert-then-split-hello",
+            split_hello_after_prefix(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], 40),
+        ),
+        (
+            "app-data-then-split-hello",
+            split_hello_after_prefix(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x01], 40),
+        ),
+        (
+            "hello-request-then-split-hello",
+            split_hello_after_prefix(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00], 40),
+        ),
+        (
+            "complete-hello-then-split-second",
+            complete_hello_then_split_second(),
+        ),
+        ("ccs-then-later-grease", later_grease_after(&ccs())),
+        (
+            "alert-then-later-grease",
+            later_grease_after(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+        ),
+        (
+            "app-data-then-later-grease",
+            later_grease_after(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x01]),
+        ),
+        (
+            "hello-request-then-later-grease",
+            later_grease_after(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]),
+        ),
+        (
+            "server-hello-then-later-grease",
+            later_grease_after_server_hello(),
+        ),
+        ("reverse-ccs-then-later-grease", reverse_ccs_then_grease()),
+        (
+            "ccs-then-split-grease-40",
+            split_grease_after(&ccs(), 40, 0x0a0a),
+        ),
+        (
+            "ccs-then-split-grease-5",
+            split_grease_after(&ccs(), 5, 0x0a0a),
+        ),
+        (
+            "ccs-then-split-grease-50",
+            split_grease_after(&ccs(), 50, 0x0a0a),
+        ),
+        (
+            "alert-then-split-grease-40",
+            split_grease_after(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], 40, 0x0a0a),
+        ),
+        (
+            "heartbeat-then-split-grease-40",
+            split_grease_after(
+                &[0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00],
+                40,
+                0x0a0a,
+            ),
+        ),
+        (
+            "server-hello-then-split-grease-40",
+            split_grease_after_server_hello(40),
+        ),
+        (
+            "reverse-ccs-then-split-grease-40",
+            reverse_ccs_then_split_grease(40),
+        ),
+        (
+            "same-payload-ccs-split-grease-40",
+            same_payload_ccs_then_split_grease(40),
+        ),
+        (
+            "ccs-then-split-grease-ver-0002-40",
+            split_grease_after(&ccs(), 40, 0x0002),
+        ),
     ]
+}
+
+fn split_grease_after_server_hello(cut: usize) -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0x22u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.push(0);
+    split_grease_after(
+        &handshake_messages_record(0x0303, &[(2, &body)]),
+        cut,
+        0x0a0a,
+    )
 }
 
 fn sequential_payloads(sport: u16, dport: u16, payloads: &[&[u8]]) -> Vec<u8> {

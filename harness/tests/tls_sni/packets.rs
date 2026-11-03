@@ -96,10 +96,14 @@ pub fn tcp(src: u16, dst: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn tcp_seq(src: u16, dst: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+    tcp_seq_flags(src, dst, seq, 0x18, payload)
+}
+
+pub fn tcp_seq_flags(src: u16, dst: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
     let mut hdr = Vec::from(src.to_be_bytes());
     hdr.extend_from_slice(&dst.to_be_bytes());
     hdr.extend_from_slice(&seq.to_be_bytes());
-    hdr.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+    hdr.extend_from_slice(&[0, 0, 0, 0, 0x50, flags, 0, 64, 0, 0, 0, 0]);
     hdr.extend_from_slice(payload);
     hdr
 }
@@ -129,9 +133,26 @@ pub fn eth_ipv4_tcp_flow(
     seq: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    eth_ipv4_tcp_flow_flags(src, dst, sport, dport, seq, 0x18, payload)
+}
+
+pub fn eth_ipv4_tcp_flow_flags(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     eth(
         0x0800,
-        &ipv4_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+        &ipv4_to(
+            src,
+            dst,
+            6,
+            &tcp_seq_flags(sport, dport, seq, flags, payload),
+        ),
     )
 }
 
@@ -205,6 +226,34 @@ pub fn client_hello_host(sni: Option<&[u8]>, version: u16) -> Vec<u8> {
 
 pub fn ccs() -> Vec<u8> {
     vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]
+}
+
+pub fn bump_handshake_u24(mut rec: Vec<u8>, extra: u32) -> Vec<u8> {
+    let msg_len = (u32::from(rec[6]) << 16) | (u32::from(rec[7]) << 8) | u32::from(rec[8]);
+    let n = msg_len + extra;
+    rec[6] = (n >> 16) as u8;
+    rec[7] = (n >> 8) as u8;
+    rec[8] = n as u8;
+    rec
+}
+
+pub fn append_record_leftover(mut rec: Vec<u8>, leftover: &[u8]) -> Vec<u8> {
+    let n = u16::from_be_bytes([rec[3], rec[4]]) as usize + leftover.len();
+    rec[3..5].copy_from_slice(&(n as u16).to_be_bytes());
+    rec.extend_from_slice(leftover);
+    rec
+}
+
+pub fn hello_request(version: u16) -> Vec<u8> {
+    handshake_messages_record(version, &[(0, &[])])
+}
+
+pub fn handshake_body_record(version: u16, body: &[u8]) -> Vec<u8> {
+    let mut rec = vec![0x16];
+    rec.extend_from_slice(&version.to_be_bytes());
+    rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    rec.extend_from_slice(body);
+    rec
 }
 
 pub fn handshake_record(body: &[u8]) -> Vec<u8> {
