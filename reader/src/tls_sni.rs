@@ -208,10 +208,11 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
 /// Complete records, including length-0 CCS/alert/app-data/handshake, are
-/// skipped so a following truncated handshake stays in `tls_need`. An incomplete
-/// record whose version fails `ssl_looks_like_sslv3` is kept too: after claimed
-/// TLS, tshark 4.6.9 still desegments it, and the completing segment must be
-/// counted instead of parsed as a new payload.
+/// skipped so a following truncated handshake stays in `tls_need`. A record
+/// whose version fails `ssl_looks_like_sslv3` is kept when it is incomplete, or
+/// when leftover after it is still truncated: after claimed TLS, tshark 4.6.9
+/// walks that GREASE/draft record and desegments leftover. Keeping from the
+/// GREASE record makes the completing frame Unproved instead of a silent blank.
 pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
     let mut offset = 0;
     while offset < payload.len() {
@@ -222,7 +223,10 @@ pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
         let (content, version, length) = tls_record_header(rest)?;
         let need = RECORD_HEADER + length;
         if !is_record_version(version) {
-            return (need > rest.len()).then_some(rest);
+            if need > rest.len() {
+                return Some(rest);
+            }
+            return truncated_handshake_prefix(&payload[offset + need..]).map(|_| rest);
         }
         if need > rest.len() {
             return Some(rest);
@@ -677,12 +681,29 @@ mod tests {
             Some(&grease[..cut])
         );
         assert_eq!(truncated_handshake_prefix(&grease), None);
+        let hello = client_hello(Some("other.example"));
+        let mut grease_then_cut = grease.clone();
+        grease_then_cut.extend_from_slice(&hello[..cut]);
+        assert_eq!(
+            truncated_handshake_prefix(&grease_then_cut),
+            Some(grease_then_cut.as_slice())
+        );
+        let mut grease_then_hello = grease.clone();
+        grease_then_hello.extend_from_slice(&hello);
+        assert_eq!(truncated_handshake_prefix(&grease_then_hello), None);
         for version in [0x0002u16, 0x0100, 0x7f1c, 0xfb17, 0xfeff, 0x0305] {
-            let mut hello = client_hello(Some("www.example.com"));
-            hello[1..3].copy_from_slice(&version.to_be_bytes());
+            let mut draft = client_hello(Some("www.example.com"));
+            draft[1..3].copy_from_slice(&version.to_be_bytes());
             assert_eq!(
-                truncated_handshake_prefix(&hello[..cut]),
-                Some(&hello[..cut]),
+                truncated_handshake_prefix(&draft[..cut]),
+                Some(&draft[..cut]),
+                "{version:#06x}"
+            );
+            let mut draft_then_cut = draft.clone();
+            draft_then_cut.extend_from_slice(&hello[..cut]);
+            assert_eq!(
+                truncated_handshake_prefix(&draft_then_cut),
+                Some(draft_then_cut.as_slice()),
                 "{version:#06x}"
             );
         }

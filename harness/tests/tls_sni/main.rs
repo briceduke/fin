@@ -104,6 +104,40 @@ fn truncated_grease_after_ccs_counts_the_completing_segment() {
 }
 
 #[test]
+fn complete_grease_then_truncated_hello_counts_the_completing_segment() {
+    let fin = fin_bin();
+    let path = work_dir().join("ccs-then-complete-grease-split-hello-40.pcap");
+    fs::write(&path, complete_grease_then_split_hello(&ccs(), 40, 0x0a0a)).unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows, ["", "", ""], "stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        !stdout.contains("www.example.com"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("other.example"),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 2 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 3 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(!output.status.success(), "exit={:?}", output.status.code());
+}
+
+#[test]
 fn combined_ip_src_and_sni_matches_tshark_469() {
     let Some((tshark, fin)) = tools() else {
         return;
@@ -237,6 +271,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     .chain(record_version_cases())
     .chain(review_cases())
     .chain(hello_ext_throw_cases())
+    .chain(complete_grease_leftover_cases())
     .filter(|(_, bytes)| !bytes.is_empty())
     .collect()
 }
@@ -437,6 +472,168 @@ fn same_payload_ccs_then_split_grease(cut: usize) -> Vec<u8> {
     let mut first = ccs();
     first.extend_from_slice(&hello[..cut]);
     sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn complete_grease_then_split_hello(prefix: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let grease = grease_hello(version);
+    let hello = client_hello(Some("other.example"));
+    let mut second = grease;
+    second.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[prefix, &second, &hello[cut..]])
+}
+
+fn reverse_ccs_then_complete_grease_split_hello(cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut second = grease;
+    second.extend_from_slice(&hello[..cut]);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs()),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &second),
+            eth_ipv4_tcp_flow(
+                OUTER,
+                PEER,
+                50000,
+                443,
+                1 + second.len() as u32,
+                &hello[cut..],
+            ),
+        ],
+    )
+}
+
+fn same_payload_ccs_complete_grease_then_split_hello(cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut first = ccs();
+    first.extend_from_slice(&grease);
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn split_grease_completing_then_split_hello(grease_cut: usize, hello_cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut third = grease[grease_cut..].to_vec();
+    third.extend_from_slice(&hello[..hello_cut]);
+    sequential_payloads(
+        50000,
+        443,
+        &[&ccs(), &grease[..grease_cut], &third, &hello[hello_cut..]],
+    )
+}
+
+fn later_hello_after_complete_grease() -> Vec<u8> {
+    sequential_payloads(
+        50000,
+        443,
+        &[
+            &ccs(),
+            &grease_hello(0x0a0a),
+            &client_hello(Some("other.example")),
+        ],
+    )
+}
+
+fn lone_grease_then_split_hello(cut: usize) -> Vec<u8> {
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut first = grease;
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn empty_ccs_then_complete_grease_split_hello(cut: usize) -> Vec<u8> {
+    let empty = [0x14, 0x03, 0x03, 0x00, 0x00];
+    let grease = grease_hello(0x0a0a);
+    let hello = client_hello(Some("other.example"));
+    let mut second = grease;
+    second.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&empty, &second, &hello[cut..]])
+}
+
+fn complete_grease_leftover_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let app = [0x17, 0x03, 0x03, 0x00, 0x01, 0x01];
+    let hello_request = [0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+    let mut server_body = vec![0x03, 0x03];
+    server_body.extend_from_slice(&[0x22u8; 32]);
+    server_body.push(0);
+    server_body.extend_from_slice(&[0x00, 0x2f]);
+    server_body.push(0);
+    let server = handshake_messages_record(0x0303, &[(2, &server_body)]);
+    vec![
+        (
+            "ccs-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&ccs(), 40, 0x0a0a),
+        ),
+        (
+            "alert-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&alert, 40, 0x0a0a),
+        ),
+        (
+            "app-data-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&app, 40, 0x0a0a),
+        ),
+        (
+            "hello-request-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&hello_request, 40, 0x0a0a),
+        ),
+        (
+            "server-hello-then-complete-grease-split-hello-40",
+            complete_grease_then_split_hello(&server, 40, 0x0a0a),
+        ),
+        (
+            "reverse-ccs-then-complete-grease-split-hello-40",
+            reverse_ccs_then_complete_grease_split_hello(40),
+        ),
+        (
+            "ccs-then-complete-grease-ver-0002-split-hello-40",
+            complete_grease_then_split_hello(&ccs(), 40, 0x0002),
+        ),
+        (
+            "ccs-then-complete-grease-ver-0305-split-hello-40",
+            complete_grease_then_split_hello(&ccs(), 40, 0x0305),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-3",
+            complete_grease_then_split_hello(&ccs(), 3, 0x0a0a),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-4",
+            complete_grease_then_split_hello(&ccs(), 4, 0x0a0a),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-5",
+            complete_grease_then_split_hello(&ccs(), 5, 0x0a0a),
+        ),
+        (
+            "ccs-then-complete-grease-split-hello-10",
+            complete_grease_then_split_hello(&ccs(), 10, 0x0a0a),
+        ),
+        (
+            "same-payload-ccs-complete-grease-split-hello-40",
+            same_payload_ccs_complete_grease_then_split_hello(40),
+        ),
+        (
+            "split-grease-completing-then-split-hello-40",
+            split_grease_completing_then_split_hello(40, 40),
+        ),
+        (
+            "later-hello-after-complete-grease",
+            later_hello_after_complete_grease(),
+        ),
+        (
+            "lone-grease-then-split-hello-40",
+            lone_grease_then_split_hello(40),
+        ),
+        (
+            "empty-ccs-then-complete-grease-split-hello-40",
+            empty_ccs_then_complete_grease_split_hello(40),
+        ),
+    ]
 }
 
 fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
