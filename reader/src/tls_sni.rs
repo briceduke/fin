@@ -208,7 +208,10 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
 /// Complete records, including length-0 CCS/alert/app-data/handshake, are
-/// skipped so a following truncated handshake stays in `tls_need`.
+/// skipped so a following truncated handshake stays in `tls_need`. An incomplete
+/// record whose version fails `ssl_looks_like_sslv3` is kept too: after claimed
+/// TLS, tshark 4.6.9 still desegments it, and the completing segment must be
+/// counted instead of parsed as a new payload.
 pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
     let mut offset = 0;
     while offset < payload.len() {
@@ -217,10 +220,10 @@ pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
             return Some(rest);
         }
         let (content, version, length) = tls_record_header(rest)?;
-        if !is_record_version(version) {
-            return None;
-        }
         let need = RECORD_HEADER + length;
+        if !is_record_version(version) {
+            return (need > rest.len()).then_some(rest);
+        }
         if need > rest.len() {
             return Some(rest);
         }
@@ -655,6 +658,34 @@ mod tests {
             truncated_handshake_prefix(&record(0x14, 0x0303, &[0x01])),
             None
         );
+    }
+
+    #[test]
+    fn truncated_handshake_prefix_keeps_incomplete_non_sslv3_records() {
+        let mut grease = client_hello(Some("www.example.com"));
+        grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        let cut = 40;
+        assert!(grease.len() > cut);
+        assert_eq!(
+            truncated_handshake_prefix(&grease[..cut]),
+            Some(&grease[..cut])
+        );
+        let mut ccs_grease = record(0x14, 0x0303, &[0x01]);
+        ccs_grease.extend_from_slice(&grease[..cut]);
+        assert_eq!(
+            truncated_handshake_prefix(&ccs_grease),
+            Some(&grease[..cut])
+        );
+        assert_eq!(truncated_handshake_prefix(&grease), None);
+        for version in [0x0002u16, 0x0100, 0x7f1c, 0xfb17, 0xfeff, 0x0305] {
+            let mut hello = client_hello(Some("www.example.com"));
+            hello[1..3].copy_from_slice(&version.to_be_bytes());
+            assert_eq!(
+                truncated_handshake_prefix(&hello[..cut]),
+                Some(&hello[..cut]),
+                "{version:#06x}"
+            );
+        }
     }
 
     #[test]

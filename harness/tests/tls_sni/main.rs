@@ -77,6 +77,33 @@ fn uncertain_last_hello_ext_counts_tls_hello_ext_uncertain() {
 }
 
 #[test]
+fn truncated_grease_after_ccs_counts_the_completing_segment() {
+    let fin = fin_bin();
+    let path = work_dir().join("ccs-then-split-grease-40.pcap");
+    fs::write(&path, split_grease_after(&ccs(), 40, 0x0a0a)).unwrap();
+    let output = Command::new(&fin)
+        .arg("-r")
+        .arg(&path)
+        .args(["-n", "-T", "fields", "-e", FIELD])
+        .output()
+        .expect("fin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows, ["", "", ""], "stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        stderr.contains("counted 2 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("counted 3 tls-handshake"),
+        "stderr={stderr:?}"
+    );
+    assert!(stderr.contains("total 2"), "stderr={stderr:?}");
+    assert!(!output.status.success(), "exit={:?}", output.status.code());
+}
+
+#[test]
 fn combined_ip_src_and_sni_matches_tshark_469() {
     let Some((tshark, fin)) = tools() else {
         return;
@@ -382,6 +409,36 @@ fn reverse_ccs_then_grease() -> Vec<u8> {
     )
 }
 
+fn grease_hello(version: u16) -> Vec<u8> {
+    let mut hello = client_hello(Some("www.example.com"));
+    hello[1..3].copy_from_slice(&version.to_be_bytes());
+    hello
+}
+
+fn split_grease_after(prefix: &[u8], cut: usize, version: u16) -> Vec<u8> {
+    let hello = grease_hello(version);
+    sequential_payloads(50000, 443, &[prefix, &hello[..cut], &hello[cut..]])
+}
+
+fn reverse_ccs_then_split_grease(cut: usize) -> Vec<u8> {
+    let hello = grease_hello(0x0a0a);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs()),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &hello[..cut]),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1 + cut as u32, &hello[cut..]),
+        ],
+    )
+}
+
+fn same_payload_ccs_then_split_grease(cut: usize) -> Vec<u8> {
+    let hello = grease_hello(0x0a0a);
+    let mut first = ccs();
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
 fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     let hello = client_hello(Some("www.example.com"));
     let mut hello_0304 = hello.clone();
@@ -552,7 +609,60 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             later_grease_after_server_hello(),
         ),
         ("reverse-ccs-then-later-grease", reverse_ccs_then_grease()),
+        (
+            "ccs-then-split-grease-40",
+            split_grease_after(&ccs(), 40, 0x0a0a),
+        ),
+        (
+            "ccs-then-split-grease-5",
+            split_grease_after(&ccs(), 5, 0x0a0a),
+        ),
+        (
+            "ccs-then-split-grease-50",
+            split_grease_after(&ccs(), 50, 0x0a0a),
+        ),
+        (
+            "alert-then-split-grease-40",
+            split_grease_after(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], 40, 0x0a0a),
+        ),
+        (
+            "heartbeat-then-split-grease-40",
+            split_grease_after(
+                &[0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00],
+                40,
+                0x0a0a,
+            ),
+        ),
+        (
+            "server-hello-then-split-grease-40",
+            split_grease_after_server_hello(40),
+        ),
+        (
+            "reverse-ccs-then-split-grease-40",
+            reverse_ccs_then_split_grease(40),
+        ),
+        (
+            "same-payload-ccs-split-grease-40",
+            same_payload_ccs_then_split_grease(40),
+        ),
+        (
+            "ccs-then-split-grease-ver-0002-40",
+            split_grease_after(&ccs(), 40, 0x0002),
+        ),
     ]
+}
+
+fn split_grease_after_server_hello(cut: usize) -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0x22u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.push(0);
+    split_grease_after(
+        &handshake_messages_record(0x0303, &[(2, &body)]),
+        cut,
+        0x0a0a,
+    )
 }
 
 fn sequential_payloads(sport: u16, dport: u16, payloads: &[&[u8]]) -> Vec<u8> {

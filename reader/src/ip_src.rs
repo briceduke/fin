@@ -4562,6 +4562,137 @@ mod tests {
     }
 
     #[test]
+    fn truncated_grease_after_claimed_tls_counts_the_completing_segment() {
+        let prefixes: &[(&str, &[u8])] = &[
+            ("ccs", &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            ("empty-ccs", &[0x14, 0x03, 0x03, 0x00, 0x00]),
+            ("alert", &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+            ("app-data", &[0x17, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            (
+                "hello-request",
+                &[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                "heartbeat",
+                &[0x18, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00],
+            ),
+        ];
+        let versions = [0x0a0au16, 0x0002, 0x0100, 0x7f1c, 0xfb17, 0xfeff, 0x0305];
+        for version in versions {
+            let mut hello = sni_hello("www.example.com");
+            hello[1..3].copy_from_slice(&version.to_be_bytes());
+            assert!(hello.len() > 50, "{version:#06x}");
+            for (label, prefix) in prefixes {
+                for cut in [5usize, 6, 10, 20, 40, 50] {
+                    assert_truncated_grease_completing_is_counted(
+                        prefix,
+                        &hello,
+                        cut,
+                        &format!("{label} {version:#06x} cut {cut}"),
+                    );
+                }
+            }
+            let server = tls_server_hello();
+            assert_truncated_grease_completing_is_counted(
+                &server,
+                &hello,
+                40,
+                &format!("server-hello {version:#06x}"),
+            );
+            let reverse = walk_tls_seq(&[
+                eth_ipv4_tcp_flow(
+                    SERVER,
+                    CLIENT,
+                    443,
+                    50000,
+                    1,
+                    &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01],
+                ),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 443, 1, &hello[..40]),
+                eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 443, 1 + 40, &hello[40..]),
+            ]);
+            assert_split_grease_cells(&reverse, &format!("reverse-ccs {version:#06x}"));
+            let mut same = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+            same.extend_from_slice(&hello[..40]);
+            let cells = walk_tls_seq(&[
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &same),
+                eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + same.len() as u32, &hello[40..]),
+            ]);
+            assert_eq!(
+                cells[0].tls_sni,
+                [] as [&str; 0],
+                "same-payload {version:#06x}"
+            );
+            assert_eq!(
+                cells[0].counted,
+                Some("tls-handshake"),
+                "same-payload {version:#06x}"
+            );
+            assert_eq!(
+                cells[1].tls_sni,
+                [] as [&str; 0],
+                "same-payload {version:#06x}"
+            );
+            assert_eq!(
+                cells[1].counted,
+                Some("tls-handshake"),
+                "same-payload {version:#06x}"
+            );
+        }
+        let grease = grease_sni_hello("www.example.com");
+        for cut in 1..5 {
+            assert_truncated_grease_completing_is_counted(
+                &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01],
+                &grease,
+                cut,
+                &format!("ccs short cut {cut}"),
+            );
+        }
+        let mut empty_then_grease = vec![0x14, 0x03, 0x03, 0x00, 0x00];
+        empty_then_grease.extend_from_slice(&grease[..40]);
+        let empty = walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &empty_then_grease),
+            eth_ipv4_tcp_seq(
+                CLIENT,
+                50000,
+                443,
+                1 + empty_then_grease.len() as u32,
+                &grease[40..],
+            ),
+        ]);
+        assert_eq!(empty[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(empty[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(empty[1].counted, Some("tls-handshake"));
+    }
+
+    fn assert_truncated_grease_completing_is_counted(
+        prefix: &[u8],
+        hello: &[u8],
+        cut: usize,
+        label: &str,
+    ) {
+        let first = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, prefix);
+        let second = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + prefix.len() as u32, &hello[..cut]);
+        let third = eth_ipv4_tcp_seq(
+            CLIENT,
+            50000,
+            443,
+            1 + prefix.len() as u32 + cut as u32,
+            &hello[cut..],
+        );
+        assert_split_grease_cells(&walk_tls_seq(&[first, second, third]), label);
+    }
+
+    fn assert_split_grease_cells(cells: &[Cell], label: &str) {
+        assert_eq!(cells.len(), 3, "{label}");
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0], "{label}");
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0], "{label}");
+        assert_eq!(cells[1].counted, Some("tls-handshake"), "{label}");
+        assert_eq!(cells[2].tls_sni, [] as [&str; 0], "{label}");
+        assert_eq!(cells[2].counted, Some("tls-handshake"), "{label}");
+    }
+
+    #[test]
     fn lone_grease_hello_on_tls_port_is_blank() {
         let frame = eth_ipv4_tcp(CLIENT, 50000, 443, &grease_sni_hello("www.example.com"));
         let cell = walk_tls(&frame);
