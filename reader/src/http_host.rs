@@ -6,8 +6,8 @@
 pub enum HttpParse {
     /// Complete HTTP/1.x message(s) whose Host values follow tshark field order.
     Message(HttpProved),
-    /// Hosts from complete messages before a Transfer-Encoding message
-    /// this reader does not parse. Counted; values are a subset.
+    /// Hosts from complete messages before a later message this reader
+    /// does not prove. Counted; values are a subset.
     Partial(Vec<String>),
     /// HTTP that this reader cannot prove.
     Unproved,
@@ -93,6 +93,7 @@ pub fn parse_http_pending(
         return HttpParse::Other;
     }
     let mut proved = HttpProved::default();
+    let mut complete = false;
     while offset < payload.len() {
         let sstp = sstp_pending || proved.sstp_duplex_post;
         let connect = connect_pending || proved.connect;
@@ -108,6 +109,7 @@ pub fn parse_http_pending(
                 upgrade,
                 http2,
             } => {
+                complete = true;
                 if proved.has_response {
                     proved.hosts_after_response.extend(found.iter().cloned());
                 }
@@ -148,13 +150,15 @@ pub fn parse_http_pending(
                     break;
                 }
             }
-            Take::Incomplete if proved.hosts.is_empty() => return HttpParse::Unproved,
+            Take::Incomplete if !complete => return HttpParse::Unproved,
             Take::Incomplete => {
                 proved.desegment = true;
                 return HttpParse::Message(proved);
             }
-            Take::TransferEncoding if proved.hosts.is_empty() => return HttpParse::Unproved,
-            Take::TransferEncoding => return HttpParse::Partial(proved.hosts),
+            Take::TransferEncoding | Take::Unproved if complete => {
+                return HttpParse::Partial(proved.hosts);
+            }
+            Take::TransferEncoding | Take::Unproved => return HttpParse::Unproved,
             Take::Other => break,
         }
     }
@@ -197,6 +201,9 @@ enum Take {
     },
     Incomplete,
     TransferEncoding,
+    /// Later NOTIFY/WebDAV, a no-colon header, unreadable Content-Length,
+    /// or a 1xx/204/304 that carries Content-Length. Counted.
+    Unproved,
     Other,
     Done,
 }
@@ -229,6 +236,9 @@ fn take_message(
         return Take::Incomplete;
     };
     let Some(kind) = classify_line(first) else {
+        if looks_like_unproved_method(first) {
+            return Take::Unproved;
+        }
         return Take::Other;
     };
     let mut offset = after_first;
@@ -249,7 +259,7 @@ fn take_message(
             return Take::Incomplete;
         }
         let Some(colon) = line.iter().position(|b| *b == b':') else {
-            return Take::Incomplete;
+            return Take::Unproved;
         };
         offset += next;
         if !valid_header_name(&line[..colon]) {
@@ -288,12 +298,12 @@ fn take_message(
         || connect_2xx
         || matches!(kind, LineKind::Response { status } if rfc_no_body(status));
     if content_length_bad {
-        return Take::Incomplete;
+        return Take::Unproved;
     }
     if matches!(kind, LineKind::Response { status } if rfc_no_body(status))
         && content_length.is_some()
     {
-        return Take::Incomplete;
+        return Take::Unproved;
     }
     if transfer_encoding && !skip_body {
         return Take::TransferEncoding;
@@ -440,6 +450,17 @@ fn parse_strtol_u32(bytes: &[u8]) -> u32 {
 
 fn is_notification_method(method: &[u8]) -> bool {
     matches!(method, b"NOTIFY" | b"SUBSCRIBE" | b"UNSUBSCRIBE")
+}
+
+/// A later request line this reader does not prove: NOTIFY, M-NOTIFY,
+/// SEARCH, PROPFIND, TRACE, and other method tokens with a space.
+fn looks_like_unproved_method(line: &[u8]) -> bool {
+    let method = first_method(line);
+    !method.is_empty()
+        && method.len() < line.len()
+        && method
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
 }
 
 fn is_request_method(method: &[u8]) -> bool {
@@ -679,6 +700,114 @@ mod tests {
                 false
             ),
             HttpParse::Partial(vec!["a.example".to_string()])
+        );
+    }
+
+    fn leftover_after_get(rest: &[u8]) -> Vec<u8> {
+        let mut payload = b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n".to_vec();
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    #[test]
+    fn leftover_notify_after_get_is_partial() {
+        let methods = [
+            b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n".as_slice(),
+            b"SUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"UNSUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"M-NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"SEARCH / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"PROPFIND / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"TRACE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+        ];
+        for rest in methods {
+            assert_eq!(
+                parse_http(&leftover_after_get(rest), false),
+                HttpParse::Partial(vec!["a.example".to_string()]),
+                "{}",
+                rest.escape_ascii()
+            );
+        }
+        assert_eq!(
+            parse_http(b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n", false),
+            HttpParse::Unproved
+        );
+        assert_eq!(
+            parse_http(
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+    }
+
+    #[test]
+    fn leftover_no_colon_after_get_is_partial() {
+        assert_eq!(
+            parse_http(
+                &leftover_after_get(b"GET / HTTP/1.1\r\nHost: b.example\r\nnot-a-header\r\n\r\n"),
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\n\r\n",
+                false
+            ),
+            HttpParse::Unproved
+        );
+    }
+
+    #[test]
+    fn leftover_rfc_no_body_content_length_after_get_is_partial() {
+        let rests = [
+            b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 304 Not Modified\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 4\r\n\r\nxxxx",
+        ];
+        for rest in rests {
+            assert_eq!(
+                parse_http(&leftover_after_get(rest), false),
+                HttpParse::Partial(vec!["a.example".to_string()]),
+                "{}",
+                rest.escape_ascii()
+            );
+        }
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+                false
+            ),
+            HttpParse::Unproved
+        );
+    }
+
+    #[test]
+    fn leftover_unreadable_content_length_after_get_is_partial() {
+        assert_eq!(
+            parse_http(
+                &leftover_after_get(
+                    b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"
+                ),
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\n",
+                false
+            ),
+            HttpParse::Unproved
         );
     }
 

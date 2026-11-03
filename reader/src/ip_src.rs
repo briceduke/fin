@@ -4013,6 +4013,119 @@ mod tests {
         assert_eq!(cell.counted, Some("http"));
     }
 
+    fn get_then_http(rest: &[u8]) -> Vec<u8> {
+        let mut payload = GET_A.to_vec();
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    fn assert_counted_a_example(frame: &[u8], label: &str) {
+        let cell = walk_http(frame);
+        assert_eq!(cell.http_host, ["a.example"], "{label}");
+        assert_eq!(cell.counted, Some("http"), "{label}");
+    }
+
+    fn assert_counted_a_on_named_ports(payload: &[u8], label: &str) {
+        assert_counted_a_example(&eth_ipv4_tcp(CLIENT, 50000, 80, payload), label);
+        assert_counted_a_example(
+            &eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 8080, 1, payload),
+            &format!("{label} dest 8080"),
+        );
+        assert_counted_a_example(
+            &eth_ipv4_tcp_flow(SERVER, CLIENT, 80, 50000, 1, payload),
+            &format!("{label} src 80"),
+        );
+        assert_counted_a_example(
+            &eth_ipv6_tcp_flow(V6_CLIENT, V6_SERVER, 50000, 80, 1, payload),
+            &format!("{label} ipv6"),
+        );
+    }
+
+    #[test]
+    fn http_leftover_notify_after_get_is_counted() {
+        let leftovers = [
+            b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n".as_slice(),
+            b"SUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"UNSUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"M-NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"SEARCH / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"PROPFIND / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"TRACE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+        ];
+        for rest in leftovers {
+            assert_counted_a_example(
+                &eth_ipv4_tcp(CLIENT, 50000, 80, &get_then_http(rest)),
+                &rest.escape_ascii().to_string(),
+            );
+        }
+        assert_counted_a_on_named_ports(
+            &get_then_http(b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n"),
+            "leftover NOTIFY",
+        );
+        assert_counted_a_example(
+            &eth_ipv4_tcp(
+                CLIENT,
+                50000,
+                80,
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            ),
+            "OPTIONS then NOTIFY",
+        );
+        assert_counted_a_example(
+            &eth_ipv4_tcp(
+                CLIENT,
+                50000,
+                80,
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            ),
+            "POST CL 0 then NOTIFY",
+        );
+    }
+
+    #[test]
+    fn http_leftover_no_colon_after_get_is_counted() {
+        let payload = get_then_http(b"GET / HTTP/1.1\r\nHost: b.example\r\nnot-a-header\r\n\r\n");
+        assert_counted_a_on_named_ports(&payload, "leftover no-colon");
+        let solo = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: b.example\r\nnot-a-header\r\n\r\n",
+        ));
+        assert_eq!(solo.http_host, [] as [&str; 0]);
+        assert_eq!(solo.counted, Some("http"));
+    }
+
+    #[test]
+    fn http_leftover_rfc_no_body_content_length_after_get_is_counted() {
+        let rests = [
+            b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 304 Not Modified\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 4\r\n\r\nxxxx",
+        ];
+        for rest in rests {
+            assert_counted_a_example(
+                &eth_ipv4_tcp(CLIENT, 50000, 80, &get_then_http(rest)),
+                &rest.escape_ascii().to_string(),
+            );
+        }
+        assert_counted_a_on_named_ports(
+            &get_then_http(
+                b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            ),
+            "leftover 204 CL 0",
+        );
+    }
+
+    #[test]
+    fn http_leftover_unreadable_content_length_after_get_is_counted() {
+        let payload = get_then_http(
+            b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        );
+        assert_counted_a_on_named_ports(&payload, "leftover unreadable CL");
+    }
+
     #[test]
     fn truncated_tls_record_is_counted() {
         let mut hello = sni_hello("cut.example");
