@@ -94,6 +94,7 @@ pub fn parse_http_pending(
     }
     let mut proved = HttpProved::default();
     let mut complete = false;
+    let mut head = false;
     while offset < payload.len() {
         let sstp = sstp_pending || proved.sstp_duplex_post;
         let connect = connect_pending || proved.connect;
@@ -108,8 +109,12 @@ pub fn parse_http_pending(
                 status,
                 upgrade,
                 http2,
+                request_is_head,
             } => {
                 complete = true;
+                if let Some(is_head) = request_is_head {
+                    head = is_head;
+                }
                 if proved.has_response {
                     proved.hosts_after_response.extend(found.iter().cloned());
                 }
@@ -151,6 +156,9 @@ pub fn parse_http_pending(
                 }
             }
             Take::Incomplete if !complete => return HttpParse::Unproved,
+            // After HEAD, tshark 4.6.9 prints the later 200 Host even
+            // when this reader cannot complete that body. Count.
+            Take::Incomplete if head => return HttpParse::Partial(proved.hosts),
             Take::Incomplete => {
                 proved.desegment = true;
                 return HttpParse::Message(proved);
@@ -198,6 +206,8 @@ enum Take {
         status: Option<u16>,
         upgrade: bool,
         http2: bool,
+        /// `Some` for a request: true when the method is HEAD.
+        request_is_head: Option<bool>,
     },
     Incomplete,
     TransferEncoding,
@@ -359,6 +369,10 @@ fn take_message(
         // payload still is.
         http2: looks_like_http2_preface(&payload[body_end..])
             || (body_end == payload.len() && looks_like_http2_preface(&payload[header_end..])),
+        request_is_head: match kind {
+            LineKind::Request { .. } => Some(first_method(first) == b"HEAD"),
+            LineKind::Response { .. } => None,
+        },
     }
 }
 
@@ -454,14 +468,15 @@ fn is_notification_method(method: &[u8]) -> bool {
 }
 
 /// A later request line this reader does not prove: NOTIFY, M-NOTIFY,
-/// SEARCH, PROPFIND, TRACE, RPC_IN_DATA, and other method tokens with a space.
+/// SEARCH, PROPFIND, TRACE, RPC_IN_DATA, leftover `Host:` / other
+/// headers, and other method tokens with a space.
 fn looks_like_unproved_method(line: &[u8]) -> bool {
     let method = first_method(line);
     !method.is_empty()
         && method.len() < line.len()
         && method
             .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b':'))
 }
 
 fn is_request_method(method: &[u8]) -> bool {
@@ -917,6 +932,106 @@ mod tests {
         ));
         assert_eq!(proved.hosts, ["a.example"]);
         assert!(proved.desegment);
+    }
+
+    fn leftover_after_head(rest: &[u8]) -> Vec<u8> {
+        let mut payload = b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n".to_vec();
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    #[test]
+    fn leftover_incomplete_200_after_head_is_partial() {
+        let rests = [
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nno",
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        ];
+        for rest in rests {
+            assert_eq!(
+                parse_http(&leftover_after_head(rest), false),
+                HttpParse::Partial(vec!["h.example".to_string()]),
+                "{}",
+                rest.escape_ascii()
+            );
+        }
+        assert_eq!(
+            parse_http(
+                b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\nHEAD / HTTP/1.1\r\nHost: h.example\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string(), "h.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"HEAD / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec![])
+        );
+    }
+
+    #[test]
+    fn leftover_200_cl0_after_head_still_prints() {
+        let proved = message(&leftover_after_head(
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        ));
+        assert_eq!(proved.hosts, ["h.example", "r.example", "inner.example"]);
+        assert!(!proved.desegment);
+    }
+
+    #[test]
+    fn leftover_incomplete_200_after_get_still_desegments() {
+        let proved = message(&leftover_after_get(
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        ));
+        assert_eq!(proved.hosts, ["a.example"]);
+        assert!(proved.desegment);
+    }
+
+    #[test]
+    fn leftover_host_header_after_get_is_partial() {
+        let rests = [
+            b"Host: n.example\r\n\r\n".as_slice(),
+            b"X-Foo: bar\r\nHost: n.example\r\n\r\n",
+            b"FOO:BAR / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+        ];
+        for rest in rests {
+            assert_eq!(
+                parse_http(&leftover_after_get(rest), false),
+                HttpParse::Partial(vec!["a.example".to_string()]),
+                "{}",
+                rest.escape_ascii()
+            );
+        }
+        assert_eq!(
+            parse_http(
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+        assert_eq!(
+            parse_http(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+                false
+            ),
+            HttpParse::Partial(vec!["a.example".to_string()])
+        );
+    }
+
+    #[test]
+    fn leftover_junk_after_get_still_prints() {
+        let proved = message(&leftover_after_get(b"junk"));
+        assert_eq!(proved.hosts, ["a.example"]);
     }
 
     #[test]

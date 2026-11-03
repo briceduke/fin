@@ -1383,6 +1383,79 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 b"POST / HTTP/1.1\r\nHost: b.example\r\nContent-Length: 100\r\n\r\nno",
             )),
         ),
+        (
+            "head-then-200-get",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "head-then-200-cl100-no",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nno",
+            )),
+        ),
+        (
+            "head-then-200-cl100-get",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-head-then-200",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "head-no-host-then-200",
+            tcp80(
+                b"HEAD / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ),
+        (
+            "head-then-200-cl0-get",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-leftover-host",
+            tcp80(&concat_bytes(GET_A, b"Host: n.example\r\n\r\n")),
+        ),
+        (
+            "get-then-leftover-x-foo-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"X-Foo: bar\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-leftover-foo-bar-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"FOO:BAR / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-leftover-host",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-leftover-host",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n"),
+        ),
+        (
+            "204-no-cl-then-leftover-host",
+            tcp80(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+            ),
+        ),
     ];
     for (suffix, file) in tcp_http_ports(&concat_bytes(
         GET_A,
@@ -1450,6 +1523,31 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 "3128" => "get-then-mid-header-get-3128",
                 "src80" => "get-then-mid-header-get-src80",
                 _ => "get-then-mid-header-get-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "head-then-200-get-8080",
+                "3128" => "head-then-200-get-3128",
+                "src80" => "head-then-200-get-src80",
+                _ => "head-then-200-get-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(GET_A, b"Host: n.example\r\n\r\n")) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-leftover-host-8080",
+                "3128" => "get-then-leftover-host-3128",
+                "src80" => "get-then-leftover-host-src80",
+                _ => "get-then-leftover-host-ipv6",
             },
             file,
         ));

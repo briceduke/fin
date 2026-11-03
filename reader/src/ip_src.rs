@@ -4261,6 +4261,106 @@ mod tests {
         assert_eq!(cell.counted, None);
     }
 
+    fn leftover_after_head(rest: &[u8]) -> Vec<u8> {
+        let mut payload = b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n".to_vec();
+        payload.extend_from_slice(rest);
+        payload
+    }
+
+    #[test]
+    fn http_leftover_incomplete_200_after_head_is_counted() {
+        let rests = [
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nno",
+            b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        ];
+        for rest in rests {
+            let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &leftover_after_head(rest)));
+            assert_eq!(cell.http_host, ["h.example"], "{}", rest.escape_ascii());
+            assert_eq!(cell.counted, Some("http"), "{}", rest.escape_ascii());
+        }
+        assert_counted_hosts_on_named_ports(
+            &leftover_after_head(
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+            &["h.example"],
+            "leftover incomplete 200 after HEAD",
+        );
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\nHEAD / HTTP/1.1\r\nHost: h.example\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+        ));
+        assert_eq!(cell.http_host, ["a.example", "h.example"]);
+        assert_eq!(cell.counted, Some("http"));
+        assert_counted_hosts_on_named_ports(
+            b"HEAD / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            &[],
+            "no-Host HEAD then incomplete 200",
+        );
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &leftover_after_head(
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ));
+        assert_eq!(cell.http_host, ["h.example", "r.example", "inner.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
+    #[test]
+    fn http_leftover_host_header_after_get_is_counted() {
+        let rests = [
+            b"Host: n.example\r\n\r\n".as_slice(),
+            b"X-Foo: bar\r\nHost: n.example\r\n\r\n",
+            b"FOO:BAR / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+        ];
+        for rest in rests {
+            assert_counted_a_example(
+                &eth_ipv4_tcp(CLIENT, 50000, 80, &get_then_http(rest)),
+                &rest.escape_ascii().to_string(),
+            );
+        }
+        assert_counted_a_on_named_ports(
+            &get_then_http(b"Host: n.example\r\n\r\n"),
+            "leftover Host header",
+        );
+        assert_counted_a_example(
+            &eth_ipv4_tcp(
+                CLIENT,
+                50000,
+                80,
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+            ),
+            "OPTIONS then leftover Host",
+        );
+        assert_counted_a_example(
+            &eth_ipv4_tcp(
+                CLIENT,
+                50000,
+                80,
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n",
+            ),
+            "POST CL 0 then leftover Host",
+        );
+        assert_counted_a_example(
+            &eth_ipv4_tcp(
+                CLIENT,
+                50000,
+                80,
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+            ),
+            "204 no-CL then leftover Host",
+        );
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &get_then_http(b"junk")));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+    }
+
     #[test]
     fn truncated_tls_record_is_counted() {
         let mut hello = sni_hello("cut.example");
