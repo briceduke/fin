@@ -39,6 +39,35 @@ fn http_host_matches_tshark_469() {
 }
 
 #[test]
+fn http_host_without_tcp_reassemble_matches_tshark_469() {
+    let Some((tshark, fin)) = tools() else {
+        return;
+    };
+    let dir = work_dir();
+    let file = pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(OUTER, 50000, 80, &get("www.example.com"))],
+    );
+    let path = dir.join("http-host-default-no-o.pcap");
+    fs::write(&path, file).unwrap();
+    let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
+    args.extend(
+        ["-n", "-T", "fields", "-e", FIELD]
+            .into_iter()
+            .map(OsString::from),
+    );
+    let output = run_pair(&tshark, &fin, &args).expect("pair");
+    let report = check_pair(&output).expect("check");
+    assert!(
+        report.faults.is_empty(),
+        "{report} tshark={:?} fin={:?} stderr={}",
+        output.tshark_stdout,
+        output.fin_stdout,
+        output.fin_stderr
+    );
+}
+
+#[test]
 fn stdin_matches_the_file_path() {
     let fin = fin_bin();
     let path = work_dir().join("http-stdin-vs-file.pcap");
