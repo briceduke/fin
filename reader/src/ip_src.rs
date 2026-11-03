@@ -3430,7 +3430,6 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n".as_slice(),
             b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n",
             b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\n",
-            b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n",
         ];
         for first in firsts {
             for leftover in [HTTP2_MAGIC, HTTP2_FIRST_LINE] {
@@ -3439,6 +3438,16 @@ mod tests {
                     "a.example",
                 );
             }
+        }
+        for leftover in [HTTP2_MAGIC, HTTP2_FIRST_LINE] {
+            let cells = http1_then_http2_then_get(
+                b"NOTIFY / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+                leftover,
+            );
+            assert_eq!(cells[0].http_host, [] as [&str; 0]);
+            assert_eq!(cells[0].counted, Some("http"));
+            assert_eq!(cells[1].http_host, [] as [&str; 0]);
+            assert_eq!(cells[1].counted, Some("http"));
         }
         let get = firsts[0];
         for (src, dst, sport, dport) in [
@@ -3488,7 +3497,6 @@ mod tests {
             b"OPTIONS / HTTP/1.1",
             b"POST / HTTP/1.1",
             b"HTTP/1.1 200 OK",
-            b"HTTP/1.1 204 No Content",
         ];
         for start in starts {
             let cell = walk_http(&eth_ipv4_tcp_flow(
@@ -3507,6 +3515,16 @@ mod tests {
             );
             assert_eq!(cell.counted, None, "{}", start.escape_ascii());
         }
+        let no_body = walk_http(&eth_ipv4_tcp_flow(
+            CLIENT,
+            SERVER,
+            50000,
+            80,
+            1,
+            &cl24_magic_then_get(b"HTTP/1.1 204 No Content"),
+        ));
+        assert_eq!(no_body.http_host, [] as [&str; 0]);
+        assert_eq!(no_body.counted, Some("http"));
         let cl0 = walk_http(&eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 80, 1, &{
             let mut payload =
                 b"GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\n".to_vec();
@@ -3671,17 +3689,10 @@ mod tests {
                 eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, &extra),
                 eth_ipv6_tcp_flow(V6_SERVER, V6_CLIENT, 80, 50000, 1, &drop),
             ];
-            let expected = [
-                &["st.example"][..],
-                &["st.example", "after.example"],
-                &["st.example"],
-                &["st.example"],
-                &["st.example", "after.example"],
-            ];
-            for (frame, hosts) in frames.iter().zip(expected) {
+            for frame in &frames {
                 let cell = walk_http(frame);
-                assert_eq!(cell.http_host, hosts, "{status:?}");
-                assert_eq!(cell.counted, None, "{status:?}");
+                assert_eq!(cell.http_host, [] as [&str; 0], "{status:?}");
+                assert_eq!(cell.counted, Some("http"), "{status:?}");
             }
         }
         for status in [
@@ -3841,22 +3852,30 @@ mod tests {
 
     #[test]
     fn http_content_length_vt_ff_and_nul_are_counted_without_a_body() {
-        let headers = [
+        let unreadable = [
             b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\n".as_slice(),
             b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0c4\r\n\r\n",
-            b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\n",
             b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x0c\r\n\r\n",
         ];
-        for payload in headers {
+        for payload in unreadable {
             let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, payload));
             assert_eq!(cell.http_host, [] as [&str; 0], "{payload:?}");
             assert_eq!(cell.counted, Some("http"), "{payload:?}");
             let mut with_body = payload.to_vec();
             with_body.extend_from_slice(b"body");
             let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
-            assert_eq!(cell.http_host, ["cllead.example"], "{payload:?}");
-            assert_eq!(cell.counted, None, "{payload:?}");
+            assert_eq!(cell.http_host, [] as [&str; 0], "{payload:?}");
+            assert_eq!(cell.counted, Some("http"), "{payload:?}");
         }
+        let nul = b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: 4\x00\r\n\r\n";
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, nul));
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
+        let mut with_body = nul.to_vec();
+        with_body.extend_from_slice(b"body");
+        let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
+        assert_eq!(cell.http_host, ["cllead.example"]);
+        assert_eq!(cell.counted, None);
     }
 
     fn http_junk_cl4(start: &[u8], after_junk: &[u8]) -> Vec<u8> {
@@ -3888,16 +3907,16 @@ mod tests {
             80,
             &http_junk_cl4(b"HTTP/1.1 200 OK", b"\r\nxxxx"),
         ));
-        assert_eq!(cell.http_host, ["a.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
         let cell = walk_http(&eth_ipv4_tcp_fin(
             CLIENT,
             50000,
             80,
             &http_junk_cl4(b"HTTP/1.1 200 OK", b"xxxx"),
         ));
-        assert_eq!(cell.http_host, ["a.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
     }
 
     fn http_after_junk(start: &[u8], rest: &[u8]) -> Vec<u8> {
@@ -3944,13 +3963,13 @@ mod tests {
         );
         complete.extend_from_slice(INNER_GET);
         let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &complete));
-        assert_eq!(cell.http_host, ["a.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
         let mut with_body = http_after_junk(b"POST / HTTP/1.1", b"Content-Length: 4\r\n\r\nxxxx");
         with_body.extend_from_slice(INNER_GET);
         let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &with_body));
-        assert_eq!(cell.http_host, ["a.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
         let cell = walk_http(&eth_ipv4_tcp(
             CLIENT,
             50000,
@@ -3960,13 +3979,13 @@ mod tests {
                 b"Content-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
             ),
         ));
-        assert_eq!(cell.http_host, ["a.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
         let mut fin = http_after_junk(b"POST / HTTP/1.1", b"Content-Length: 100\r\n\r\n");
         fin.extend_from_slice(INNER_GET);
         let cell = walk_http(&eth_ipv4_tcp_fin(CLIENT, 50000, 80, &fin));
-        assert_eq!(cell.http_host, ["a.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
     }
 
     #[test]
@@ -3975,23 +3994,23 @@ mod tests {
             b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nxxxx".to_vec();
         payload.extend_from_slice(INNER_GET);
         let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &payload));
-        assert_eq!(cell.http_host, ["cl.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
         let cell = walk_http(&eth_ipv4_tcp(
             CLIENT,
             50000,
             80,
             b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\n",
         ));
-        assert_eq!(cell.http_host, ["cl.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
         let mut lead =
             b"POST / HTTP/1.1\r\nHost: cllead.example\r\nContent-Length: \x0b4\r\n\r\nxxxx"
                 .to_vec();
         lead.extend_from_slice(INNER_GET);
         let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &lead));
-        assert_eq!(cell.http_host, ["cllead.example", "inner.example"]);
-        assert_eq!(cell.counted, None);
+        assert_eq!(cell.http_host, [] as [&str; 0]);
+        assert_eq!(cell.counted, Some("http"));
     }
 
     #[test]

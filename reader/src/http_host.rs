@@ -86,6 +86,9 @@ pub fn parse_http_pending(
     let Some((first, _)) = take_line(&payload[offset..]) else {
         return HttpParse::Unproved;
     };
+    if is_notification_method(first_method(first)) {
+        return HttpParse::Unproved;
+    }
     if classify_line(first).is_none() {
         return HttpParse::Other;
     }
@@ -203,8 +206,6 @@ enum LineKind {
         sstp_duplex_post: bool,
         connect: bool,
     },
-    /// tshark 4.6.9 `MEDIA_CONTAINER_HTTP_NOTIFICATION`.
-    Notification,
     Response {
         status: u16,
     },
@@ -233,9 +234,9 @@ fn take_message(
     let mut offset = after_first;
     let mut hosts = Vec::new();
     let mut content_length = None;
+    let mut content_length_bad = false;
     let mut transfer_encoding = false;
     let mut upgrade = false;
-    let mut after_no_colon_blank = None;
     loop {
         let Some((line, next)) = take_line(&payload[offset..]) else {
             return Take::Incomplete;
@@ -248,19 +249,7 @@ fn take_message(
             return Take::Incomplete;
         }
         let Some(colon) = line.iter().position(|b| *b == b':') else {
-            // tshark 4.6.9 `dissect_http_message` breaks when `memchr`
-            // finds no colon; offset stays on this line. Leftover
-            // starting here is Continuation. `req_resp_hdrs_do_reassembly`
-            // still walks until the later blank and honors a
-            // Content-Length or `Transfer-Encoding: chunked` after this
-            // junk line. Until those body bytes exist, Host is not
-            // emitted.
-            let Some(reasm) = header_reassembly_after(&payload[offset + next..], content_length)
-            else {
-                return Take::Incomplete;
-            };
-            after_no_colon_blank = Some(reasm);
-            break;
+            return Take::Incomplete;
         };
         offset += next;
         if !valid_header_name(&line[..colon]) {
@@ -278,7 +267,10 @@ fn take_message(
         } else if eq_ignore_ascii_case(name, b"Upgrade") {
             upgrade = true;
         } else if eq_ignore_ascii_case(name, b"Content-Length") {
-            content_length = parse_content_length(value);
+            match parse_content_length(value) {
+                Some(n) => content_length = Some(n),
+                None => content_length_bad = true,
+            }
         }
     }
     let sstp_2xx = matches!(
@@ -295,40 +287,22 @@ fn take_message(
     let skip_body = sstp_2xx
         || connect_2xx
         || matches!(kind, LineKind::Response { status } if rfc_no_body(status));
+    if content_length_bad {
+        return Take::Incomplete;
+    }
+    if matches!(kind, LineKind::Response { status } if rfc_no_body(status))
+        && content_length.is_some()
+    {
+        return Take::Incomplete;
+    }
     if transfer_encoding && !skip_body {
         return Take::TransferEncoding;
     }
-    if let Some(reasm) = after_no_colon_blank {
-        let try_desegment_body = !end_of_stream && !skip_body;
-        if try_desegment_body {
-            if reasm.chunked {
-                if !chunked_body_complete(reasm.after_blank) {
-                    return Take::Incomplete;
-                }
-            } else if let Some(n) = reasm.content_length {
-                if (reasm.after_blank.len() as u64) < n {
-                    return Take::Incomplete;
-                }
-            }
-        }
-    }
     let header_end = offset;
     let available = (payload.len() - header_end) as u64;
-    // tshark 4.6.9 `dissect_http_message`: `have_content_length &&
-    // transfer_encoding == HTTP_TE_NONE` sets datalen to
-    // min(remaining, content_length) before the RFC no-body arm.
     let body_need = match kind {
         LineKind::Request { .. } => content_length.unwrap_or(0),
-        // tshark 4.6.9 `is_http_request_or_reply` sets NOTIFY /
-        // SUBSCRIBE / UNSUBSCRIBE to `MEDIA_CONTAINER_HTTP_NOTIFICATION`,
-        // not `HTTP_REQUEST`. Without Content-Length, `dissect_http_message`
-        // takes the default datalen arm (`reported_datalen = -1`): leftover
-        // is the notification body. `desegment_until_fin` is only for
-        // `HTTP_RESPONSE`, so this segment is complete.
-        LineKind::Notification => content_length.unwrap_or(available),
-        LineKind::Response { status } if rfc_no_body(status) => {
-            content_length.map(|n| n.min(available)).unwrap_or(0)
-        }
+        LineKind::Response { status } if rfc_no_body(status) => 0,
         LineKind::Response { .. } if sstp_2xx || connect_2xx => {
             match (transfer_encoding, content_length) {
                 (false, Some(n)) => n.min(available),
@@ -364,124 +338,17 @@ fn take_message(
         },
         status: match kind {
             LineKind::Response { status } => Some(status),
-            LineKind::Request { .. } | LineKind::Notification => None,
+            LineKind::Request { .. } => None,
         },
         upgrade,
         // tshark 4.6.9 `dissect_http_message` clips `datalen` to
         // Content-Length, then walks leftover as the next message.
         // A Content-Length *body* with leftover after it is not an
-        // HTTP/2 preface. An unbounded body (NOTIFY, or a message
-        // that consumes the rest of the payload) still is.
+        // HTTP/2 preface. A message that consumes the rest of the
+        // payload still is.
         http2: looks_like_http2_preface(&payload[body_end..])
             || (body_end == payload.len() && looks_like_http2_preface(&payload[header_end..])),
     }
-}
-
-/// Headers after a no-colon line, through the later blank, matching
-/// tshark 4.6.9 `req_resp_hdrs_do_reassembly`. `None` when no blank is
-/// present.
-struct HeaderReassembly<'a> {
-    after_blank: &'a [u8],
-    content_length: Option<u64>,
-    chunked: bool,
-}
-
-fn header_reassembly_after(
-    bytes: &[u8],
-    mut content_length: Option<u64>,
-) -> Option<HeaderReassembly<'_>> {
-    let mut offset = 0;
-    let mut chunked = false;
-    while let Some((line, next)) = take_line(&bytes[offset..]) {
-        if line.is_empty() {
-            return Some(HeaderReassembly {
-                after_blank: &bytes[offset + next..],
-                content_length,
-                chunked,
-            });
-        }
-        note_reassembly_header(line, &mut content_length, &mut chunked);
-        offset += next;
-    }
-    None
-}
-
-/// tshark 4.6.9 first-byte C/T lines: `Content-Length:` and
-/// `Transfer-Encoding: chunked`.
-fn note_reassembly_header(line: &[u8], content_length: &mut Option<u64>, chunked: &mut bool) {
-    if let Some(value) = line_prefix(line, b"Content-Length:") {
-        if let Some(n) = parse_content_length(value) {
-            *content_length = Some(n);
-        }
-    } else if let Some(value) = line_prefix(line, b"Transfer-Encoding:") {
-        let mut rest = value;
-        while matches!(rest.first().copied(), Some(b' ' | b'\t')) {
-            rest = &rest[1..];
-        }
-        if starts_with_ignore_ascii_case(rest, b"chunked") {
-            *chunked = true;
-        }
-    }
-}
-
-fn line_prefix<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    if starts_with_ignore_ascii_case(line, prefix) {
-        Some(&line[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-/// tshark 4.6.9 `req_resp_hdrs_do_reassembly` chunked loop. `false`
-/// waits for more bytes. `true` is a last chunk, or a size parse that
-/// gave up.
-fn chunked_body_complete(bytes: &[u8]) -> bool {
-    let mut offset = 0;
-    loop {
-        let Some((line, next)) = take_line(&bytes[offset..]) else {
-            return false;
-        };
-        let Some(size) = parse_chunk_size(line) else {
-            return true;
-        };
-        if size > 1u32 << 31 {
-            return true;
-        }
-        let data = offset + next;
-        if size == 0 {
-            return take_line(&bytes[data..]).is_some();
-        }
-        let remaining = bytes.len().saturating_sub(data);
-        if remaining <= size as usize {
-            return false;
-        }
-        offset = data + size as usize + 2;
-        if offset > bytes.len() {
-            return false;
-        }
-    }
-}
-
-fn parse_chunk_size(line: &[u8]) -> Option<u32> {
-    let end = line
-        .iter()
-        .position(|b| matches!(*b, b';' | b' ' | b'\t'))
-        .unwrap_or(line.len());
-    let hex = &line[..end];
-    if hex.is_empty() {
-        return None;
-    }
-    let mut n: u32 = 0;
-    for &b in hex {
-        let digit = match b {
-            b'0'..=b'9' => u32::from(b - b'0'),
-            b'a'..=b'f' => u32::from(b - b'a' + 10),
-            b'A'..=b'F' => u32::from(b - b'A' + 10),
-            _ => return None,
-        };
-        n = n.checked_mul(16)?.checked_add(digit)?;
-    }
-    Some(n)
 }
 
 fn take_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
@@ -505,25 +372,19 @@ fn take_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
 }
 
 fn classify_line(line: &[u8]) -> Option<LineKind> {
-    let mut data = line;
-    if data.len() >= 2 && data.starts_with(b"M-") {
-        data = &data[2..];
-    }
-    if data.len() >= 5 && data.starts_with(b"HTTP/") {
+    if line.len() >= 5 && line.starts_with(b"HTTP/") {
         return Some(LineKind::Response {
-            status: parse_status(data),
+            status: parse_status(line),
         });
     }
-    if data.len() >= 3 && data.starts_with(b"ICY") {
+    // ICY is a tshark 4.6.9 status line; SSTP 2xx still switches on it.
+    if line.len() >= 3 && line.starts_with(b"ICY") {
         return Some(LineKind::Response {
-            status: parse_status(data),
+            status: parse_status(line),
         });
     }
-    let method_len = data.iter().position(|b| *b == b' ').unwrap_or(data.len());
-    let method = &data[..method_len];
-    if is_notification_method(method) {
-        Some(LineKind::Notification)
-    } else if is_request_method(method) {
+    let method = first_method(line);
+    if is_request_method(method) {
         Some(LineKind::Request {
             sstp_duplex_post: method == b"SSTP_DUPLEX_POST",
             connect: method == b"CONNECT",
@@ -531,6 +392,11 @@ fn classify_line(line: &[u8]) -> Option<LineKind> {
     } else {
         None
     }
+}
+
+fn first_method(line: &[u8]) -> &[u8] {
+    let method_len = line.iter().position(|b| *b == b' ').unwrap_or(line.len());
+    &line[..method_len]
 }
 
 /// tshark 4.6.9 `http_payload_subdissector`: `wmem_strsplit(uri, ":", 2)`
@@ -548,7 +414,7 @@ fn connect_uri_port(line: &[u8]) -> Option<u32> {
 /// optional sign, then digits.
 fn parse_strtol_u32(bytes: &[u8]) -> u32 {
     let mut i = 0;
-    while i < bytes.len() && strtoll_leading_space(bytes[i]) {
+    while i < bytes.len() && c_isspace(bytes[i]) {
         i += 1;
     }
     let mut neg = false;
@@ -581,51 +447,17 @@ fn is_request_method(method: &[u8]) -> bool {
         method,
         b"GET"
             | b"PUT"
-            | b"COPY"
             | b"HEAD"
-            | b"LOCK"
-            | b"MOVE"
-            | b"POLL"
             | b"POST"
-            | b"BCOPY"
-            | b"BMOVE"
-            | b"MKCOL"
-            | b"TRACE"
             | b"PATCH"
-            | b"LABEL"
-            | b"MERGE"
             | b"DELETE"
-            | b"SEARCH"
-            | b"UNLOCK"
-            | b"REPORT"
-            | b"UPDATE"
-            | b"NOTIFY"
-            | b"BDELETE"
             | b"CONNECT"
             | b"OPTIONS"
-            | b"CHECKIN"
-            | b"PROPFIND"
-            | b"CHECKOUT"
-            | b"CCM_POST"
-            | b"SUBSCRIBE"
-            | b"PROPPATCH"
-            | b"BPROPFIND"
-            | b"BPROPPATCH"
-            | b"UNCHECKOUT"
-            | b"MKACTIVITY"
-            | b"MKWORKSPACE"
-            | b"RPC_CONNECT"
-            | b"RPC_IN_DATA"
-            | b"UNSUBSCRIBE"
-            | b"RPC_OUT_DATA"
-            | b"VERSION-CONTROL"
-            | b"BASELINE-CONTROL"
             | b"SSTP_DUPLEX_POST"
     )
 }
 
-/// RFC 7230 §3.3 / tshark 4.6.9: 1xx, 204, and 304 have no body unless
-/// a Content-Length is present.
+/// RFC 7230 §3.3 / tshark 4.6.9: 1xx, 204, and 304 have no body.
 fn rfc_no_body(status: u16) -> bool {
     (100..200).contains(&status) || status == 204 || status == 304
 }
@@ -673,15 +505,14 @@ fn valid_header_name(name: &[u8]) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || TOKEN.contains(b))
 }
 
-/// tshark 4.6.9 `HDR_CONTENT_LENGTH`: `g_ascii_strtoll` on the ENC_ASCII
-/// C string. Leading skip follows `g_ascii_strtoll` (VT included). After
-/// the digits, NUL or GLib 2.80 `g_ascii_isspace` is accepted; VT `0x0b`
-/// is not space on this tshark, so `4\x0b` is an invalid length.
+/// Content-Length is SP/HT, optional `+`, digits, then SP/HT or end.
+/// NUL truncates first. Anything else is unreadable; the message is
+/// counted rather than cloning GLib 2.80 `g_ascii_isspace`.
 fn parse_content_length(value: &[u8]) -> Option<u64> {
     let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
     let value = &value[..end];
     let mut i = 0;
-    while i < value.len() && strtoll_leading_space(value[i]) {
+    while i < value.len() && matches!(value[i], b' ' | b'\t') {
         i += 1;
     }
     if i < value.len() && value[i] == b'+' {
@@ -695,7 +526,7 @@ fn parse_content_length(value: &[u8]) -> Option<u64> {
         n = n.checked_mul(10)?.checked_add(i64::from(value[i] - b'0'))?;
         i += 1;
     }
-    if i < value.len() && !ascii_isspace(value[i]) {
+    if i < value.len() && !matches!(value[i], b' ' | b'\t') {
         return None;
     }
     if n < 0 {
@@ -705,15 +536,9 @@ fn parse_content_length(value: &[u8]) -> Option<u64> {
     }
 }
 
-/// GLib 2.80 `g_ascii_isspace` on tshark 4.6.9 (`v4.6.9-0-g2d548b197c75`):
-/// SP, HT, LF, FF, CR. VT `0x0b` is not space.
-fn ascii_isspace(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
-}
-
-/// `g_ascii_strtoll` / C `strtol` still skip leading VT.
-fn strtoll_leading_space(b: u8) -> bool {
-    ascii_isspace(b) || b == 0x0b
+/// C `isspace` for a CONNECT URI port `strtol`.
+fn c_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
 /// tshark 4.6.9 `tvb_get_string_enc(..., ENC_ASCII)` then a C string:
