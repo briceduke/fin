@@ -340,6 +340,48 @@ fn split_hello_at(cut: usize) -> Vec<u8> {
     )
 }
 
+fn split_hello_after_prefix(prefix: &[u8], cut: usize) -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let mut first = prefix.to_vec();
+    first.extend_from_slice(&hello[..cut]);
+    sequential_payloads(50000, 443, &[&first, &hello[cut..]])
+}
+
+fn complete_hello_then_split_second() -> Vec<u8> {
+    let first = client_hello(Some("www.example.com"));
+    let second = client_hello(Some("other.example"));
+    let mut payload = first.clone();
+    payload.extend_from_slice(&second[..10]);
+    sequential_payloads(50000, 443, &[&payload, &second[10..]])
+}
+
+fn later_grease_after(prefix: &[u8]) -> Vec<u8> {
+    let mut grease = client_hello(Some("www.example.com"));
+    grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+    sequential_payloads(50000, 443, &[prefix, &grease])
+}
+
+fn later_grease_after_server_hello() -> Vec<u8> {
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0x22u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.push(0);
+    later_grease_after(&handshake_messages_record(0x0303, &[(2, &body)]))
+}
+
+fn reverse_ccs_then_grease() -> Vec<u8> {
+    let mut grease = client_hello(Some("www.example.com"));
+    grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(PEER, OUTER, 443, 50000, 1, &ccs()),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &grease),
+        ],
+    )
+}
+
 fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     let hello = client_hello(Some("www.example.com"));
     let mut hello_0304 = hello.clone();
@@ -471,6 +513,45 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             "throwing-handshake-then-hello",
             throwing_handshake_then_hello(),
         ),
+        ("ccs-then-split-hello", split_hello_after_prefix(&ccs(), 40)),
+        (
+            "empty-ccs-then-split-hello",
+            split_hello_after_prefix(&[0x14, 0x03, 0x03, 0x00, 0x00], 40),
+        ),
+        (
+            "alert-then-split-hello",
+            split_hello_after_prefix(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], 40),
+        ),
+        (
+            "app-data-then-split-hello",
+            split_hello_after_prefix(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x01], 40),
+        ),
+        (
+            "hello-request-then-split-hello",
+            split_hello_after_prefix(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00], 40),
+        ),
+        (
+            "complete-hello-then-split-second",
+            complete_hello_then_split_second(),
+        ),
+        ("ccs-then-later-grease", later_grease_after(&ccs())),
+        (
+            "alert-then-later-grease",
+            later_grease_after(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+        ),
+        (
+            "app-data-then-later-grease",
+            later_grease_after(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x01]),
+        ),
+        (
+            "hello-request-then-later-grease",
+            later_grease_after(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]),
+        ),
+        (
+            "server-hello-then-later-grease",
+            later_grease_after_server_hello(),
+        ),
+        ("reverse-ccs-then-later-grease", reverse_ccs_then_grease()),
     ]
 }
 

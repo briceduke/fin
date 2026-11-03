@@ -9,7 +9,7 @@ use crate::http_host::{
 use crate::ports::{snapshot, PortPick, PortTables};
 use crate::tls_sni::{
     looks_like_dtls_handshake, looks_like_quic_initial, looks_like_tls_handshake, parse_tls,
-    truncated_handshake_prefix, TlsOutcome, TlsParse,
+    parse_tls_seen, truncated_handshake_prefix, TlsOutcome, TlsParse,
 };
 use crate::Frame;
 
@@ -881,11 +881,11 @@ impl Walk<'_> {
             }
         }
         if pick.is_tls() || pick.name.is_none() {
-            let claimed = pick.is_tls()
-                || flow
-                    .map(|flow| self.tls_claimed.contains(&flow.conversation()))
-                    .unwrap_or(false);
-            let outcome = parse_tls(payload, !claimed);
+            let seen = flow
+                .map(|flow| self.tls_claimed.contains(&flow.conversation()))
+                .unwrap_or(false);
+            let claimed = pick.is_tls() || seen;
+            let outcome = parse_tls_seen(payload, !claimed, seen);
             self.apply_tls_outcome(flow, seq, payload, payload.len(), outcome);
             return;
         }
@@ -906,7 +906,13 @@ impl Walk<'_> {
             let conv = flow.conversation();
             if outcome.claimed {
                 self.tls_claimed.insert(conv);
-                self.set_tls_need(flow, seq, parsed, payload_len, outcome.counted.is_some());
+                self.set_tls_need(
+                    flow,
+                    seq,
+                    parsed,
+                    payload_len,
+                    matches!(outcome.counted, Some("tls-hello-ext-uncertain")),
+                );
             }
         }
         if let Some(reason) = outcome.counted {
@@ -4333,6 +4339,52 @@ mod tests {
         assert_eq!(cell.counted, Some("may-reject"));
     }
 
+    fn walk_tls_seq(frames: &[Vec<u8>]) -> Vec<Cell> {
+        let mut session = IpSrc::query(false, true);
+        frames
+            .iter()
+            .map(|captured| {
+                walk_ip_src(
+                    &Frame {
+                        link_type: ETHERNET,
+                        captured,
+                    },
+                    &mut session,
+                )
+            })
+            .collect()
+    }
+
+    fn tls_hello_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let hs_len = body.len() as u32;
+        let mut hs = vec![
+            msg_type,
+            (hs_len >> 16) as u8,
+            (hs_len >> 8) as u8,
+            hs_len as u8,
+        ];
+        hs.extend_from_slice(body);
+        let mut rec = vec![0x16, 0x03, 0x03];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    fn tls_server_hello() -> Vec<u8> {
+        let mut body = Vec::from(0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x22u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x2f]);
+        body.push(0);
+        tls_hello_record(2, &body)
+    }
+
+    fn grease_sni_hello(name: &str) -> Vec<u8> {
+        let mut hello = sni_hello(name);
+        hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        hello
+    }
+
     #[test]
     fn split_client_hello_prints_sni_on_the_completing_segment() {
         let hello = sni_hello("www.example.com");
@@ -4340,25 +4392,11 @@ mod tests {
         assert!(hello.len() > cut);
         let first = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1, &hello[..cut]);
         let second = eth_ipv4_tcp_seq([10, 0, 0, 1], 50000, 443, 1 + cut as u32, &hello[cut..]);
-        let mut session = IpSrc::query(false, true);
-        let start = walk_ip_src(
-            &Frame {
-                link_type: ETHERNET,
-                captured: &first,
-            },
-            &mut session,
-        );
-        let rest = walk_ip_src(
-            &Frame {
-                link_type: ETHERNET,
-                captured: &second,
-            },
-            &mut session,
-        );
-        assert_eq!(start.tls_sni, [] as [&str; 0]);
-        assert_eq!(start.counted, Some("tls-handshake"));
-        assert_eq!(rest.tls_sni, ["www.example.com"]);
-        assert_eq!(rest.counted, None);
+        let cells = walk_tls_seq(&[first, second]);
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[0].counted, Some("tls-handshake"));
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[1].counted, None);
     }
 
     #[test]
@@ -4429,6 +4467,106 @@ mod tests {
         let cell = walk_tls(&frame);
         assert_eq!(cell.tls_sni, [] as [&str; 0]);
         assert_eq!(cell.counted, Some("tls-handshake"));
+    }
+
+    #[test]
+    fn truncated_handshake_after_complete_record_prints_sni() {
+        let hello = sni_hello("www.example.com");
+        let cut = 40;
+        assert!(hello.len() > cut);
+        let prefixes: &[(&str, &[u8])] = &[
+            ("ccs", &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            ("empty-ccs", &[0x14, 0x03, 0x03, 0x00, 0x00]),
+            ("alert", &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+            ("app-data", &[0x17, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            (
+                "hello-request",
+                &[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+        for (label, prefix) in prefixes {
+            let mut first_payload = prefix.to_vec();
+            first_payload.extend_from_slice(&hello[..cut]);
+            let first = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &first_payload);
+            let second = eth_ipv4_tcp_seq(
+                CLIENT,
+                50000,
+                443,
+                1 + first_payload.len() as u32,
+                &hello[cut..],
+            );
+            let cells = walk_tls_seq(&[first, second]);
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "{label}");
+            assert_eq!(cells[0].counted, Some("tls-handshake"), "{label}");
+            assert_eq!(cells[1].tls_sni, ["www.example.com"], "{label}");
+            assert_eq!(cells[1].counted, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn complete_hello_then_truncated_second_hello_prints_each_sni() {
+        let first = sni_hello("www.example.com");
+        let second = sni_hello("other.example");
+        let mut payload = first.clone();
+        payload.extend_from_slice(&second[..10]);
+        let start = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &payload);
+        let rest = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + payload.len() as u32, &second[10..]);
+        let cells = walk_tls_seq(&[start, rest]);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, Some("tls-handshake"));
+        assert_eq!(cells[1].tls_sni, ["other.example"]);
+        assert_eq!(cells[1].counted, None);
+    }
+
+    #[test]
+    fn later_grease_hello_after_tls_record_is_counted() {
+        let grease = grease_sni_hello("www.example.com");
+        let prefixes: &[(&str, &[u8])] = &[
+            ("ccs", &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            ("alert", &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+            ("app-data", &[0x17, 0x03, 0x03, 0x00, 0x01, 0x01]),
+            (
+                "hello-request",
+                &[0x16, 0x03, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+        for (label, prefix) in prefixes {
+            let first = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, prefix);
+            let second = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + prefix.len() as u32, &grease);
+            let cells = walk_tls_seq(&[first, second]);
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "{label}");
+            assert_eq!(cells[1].tls_sni, [] as [&str; 0], "{label}");
+            assert_eq!(cells[1].counted, Some("tls-handshake"), "{label}");
+        }
+        let server = tls_server_hello();
+        let first = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &server);
+        let second = eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1 + server.len() as u32, &grease);
+        let cells = walk_tls_seq(&[first, second]);
+        assert_eq!(cells[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("tls-handshake"));
+        let reverse = walk_tls_seq(&[
+            eth_ipv4_tcp_flow(
+                SERVER,
+                CLIENT,
+                443,
+                50000,
+                1,
+                &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01],
+            ),
+            eth_ipv4_tcp_flow(CLIENT, SERVER, 50000, 443, 1, &grease),
+        ]);
+        assert_eq!(reverse[0].tls_sni, [] as [&str; 0]);
+        assert_eq!(reverse[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(reverse[1].counted, Some("tls-handshake"));
+    }
+
+    #[test]
+    fn lone_grease_hello_on_tls_port_is_blank() {
+        let frame = eth_ipv4_tcp(CLIENT, 50000, 443, &grease_sni_hello("www.example.com"));
+        let cell = walk_tls(&frame);
+        assert_eq!(cell.tls_sni, [] as [&str; 0]);
+        assert_eq!(cell.counted, None);
     }
 
     #[test]

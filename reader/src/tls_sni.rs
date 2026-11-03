@@ -36,6 +36,11 @@ pub struct TlsOutcome {
 
 /// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate.
 pub fn parse_tls(payload: &[u8], heuristic: bool) -> TlsOutcome {
+    parse_tls_seen(payload, heuristic, false)
+}
+
+/// `after_tls` is true when this TCP conversation already claimed a TLS record.
+pub(crate) fn parse_tls_seen(payload: &[u8], heuristic: bool, after_tls: bool) -> TlsOutcome {
     if heuristic && !is_sslv3_or_tls(payload) {
         return TlsOutcome {
             kind: TlsParse::Other,
@@ -43,7 +48,7 @@ pub fn parse_tls(payload: &[u8], heuristic: bool) -> TlsOutcome {
             counted: None,
         };
     }
-    let (kind, counted) = parse_first_hello(payload);
+    let (kind, counted) = parse_first_hello(payload, after_tls);
     TlsOutcome {
         kind,
         claimed: true,
@@ -51,7 +56,7 @@ pub fn parse_tls(payload: &[u8], heuristic: bool) -> TlsOutcome {
     }
 }
 
-fn parse_first_hello(payload: &[u8]) -> (TlsParse, Option<&'static str>) {
+fn parse_first_hello(payload: &[u8], after_tls: bool) -> (TlsParse, Option<&'static str>) {
     if payload.len() < RECORD_HEADER {
         return (TlsParse::Unproved, None);
     }
@@ -63,7 +68,11 @@ fn parse_first_hello(payload: &[u8]) -> (TlsParse, Option<&'static str>) {
         };
     };
     if !is_record_version(version) {
-        return (TlsParse::Other, None);
+        return if after_tls {
+            (TlsParse::Unproved, None)
+        } else {
+            (TlsParse::Other, None)
+        };
     }
     if length == 0 {
         if content == CONTENT_HANDSHAKE {
@@ -198,34 +207,38 @@ fn is_sslv3_or_tls(payload: &[u8]) -> bool {
 ///
 /// tshark 4.6.9 sets `desegment_offset` at that record, so a completing segment
 /// is parsed without the ClientHellos that already finished in the prefix.
+/// Complete records, including length-0 CCS/alert/app-data/handshake, are
+/// skipped so a following truncated handshake stays in `tls_need`.
 pub fn truncated_handshake_prefix(payload: &[u8]) -> Option<&[u8]> {
-    if payload.is_empty() {
-        return None;
-    }
-    if payload.len() < RECORD_HEADER {
-        return Some(payload);
-    }
-    let (content, version, length) = tls_record_header(payload)?;
-    if !is_record_version(version) {
-        return None;
-    }
-    let need = RECORD_HEADER + length;
-    if need > payload.len() {
-        return Some(payload);
-    }
-    if content == CONTENT_HANDSHAKE {
-        let body = &payload[RECORD_HEADER..need];
-        if body.len() < 4 {
-            return Some(payload);
+    let mut offset = 0;
+    while offset < payload.len() {
+        let rest = &payload[offset..];
+        if rest.len() < RECORD_HEADER {
+            return Some(rest);
         }
-        let msg_end = 4usize.saturating_add(u24(&body[1..4]));
-        if msg_end > body.len() {
-            return Some(payload);
+        let (content, version, length) = tls_record_header(rest)?;
+        if !is_record_version(version) {
+            return None;
         }
-    }
-    let rest = payload.get(need..)?;
-    if !rest.is_empty() && rest.len() < RECORD_HEADER {
-        return Some(rest);
+        let need = RECORD_HEADER + length;
+        if need > rest.len() {
+            return Some(rest);
+        }
+        if length == 0 {
+            offset += RECORD_HEADER;
+            continue;
+        }
+        if content == CONTENT_HANDSHAKE {
+            let body = &rest[RECORD_HEADER..need];
+            if body.len() < 4 {
+                return Some(rest);
+            }
+            let msg_end = 4usize.saturating_add(u24(&body[1..4]));
+            if msg_end > body.len() {
+                return Some(rest);
+            }
+        }
+        offset += need;
     }
     None
 }
@@ -608,6 +621,48 @@ mod tests {
             parse_tls(&stitched, true).kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
+    }
+
+    #[test]
+    fn truncated_handshake_prefix_skips_complete_and_empty_records() {
+        let hello = client_hello(Some("www.example.com"));
+        let cut = 40;
+        let prefixes = [
+            record(0x14, 0x0303, &[0x01]),
+            vec![0x14, 0x03, 0x03, 0x00, 0x00],
+            record(0x15, 0x0303, &[0x02, 0x28]),
+            record(0x17, 0x0303, &[0x01]),
+            record(CONTENT_HANDSHAKE, 0x0303, &handshake(0, &[])),
+        ];
+        for prefix in prefixes {
+            let mut payload = prefix.clone();
+            payload.extend_from_slice(&hello[..cut]);
+            assert_eq!(
+                truncated_handshake_prefix(&payload),
+                Some(&hello[..cut]),
+                "prefix {:02x?}",
+                &prefix[..prefix.len().min(5)]
+            );
+        }
+        let mut two = hello.clone();
+        two.extend_from_slice(&client_hello(Some("other.example"))[..10]);
+        assert_eq!(
+            truncated_handshake_prefix(&two),
+            Some(&client_hello(Some("other.example"))[..10])
+        );
+        assert_eq!(truncated_handshake_prefix(&hello), None);
+        assert_eq!(
+            truncated_handshake_prefix(&record(0x14, 0x0303, &[0x01])),
+            None
+        );
+    }
+
+    #[test]
+    fn grease_after_a_prior_tls_record_is_unproved() {
+        let mut hello = client_hello(Some("www.example.com"));
+        hello[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+        assert_eq!(parse_tls(&hello, false).kind, TlsParse::Other);
+        assert_eq!(parse_tls_seen(&hello, false, true).kind, TlsParse::Unproved);
     }
 
     #[test]
