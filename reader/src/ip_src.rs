@@ -879,6 +879,21 @@ impl Walk<'_> {
                 self.apply_tls_outcome(Some(flow), seq, &parsed, payload.len(), outcome);
                 return;
             }
+            // Leftover is still pending; a gap or overlap is not a new hello.
+            if self.tls_need.contains_key(&flow) {
+                self.apply_tls_outcome(
+                    Some(flow),
+                    seq,
+                    payload,
+                    payload.len(),
+                    TlsOutcome {
+                        kind: TlsParse::Unproved,
+                        claimed: false,
+                        counted: None,
+                    },
+                );
+                return;
+            }
         }
         if pick.is_tls() || pick.name.is_none() {
             let seen = flow
@@ -4955,11 +4970,16 @@ mod tests {
     }
 
     fn walk_ccs_then_later_hello(second: &[u8]) -> Vec<Cell> {
+        walk_ccs_then_later_hello_gap(second, 0)
+    }
+
+    fn walk_ccs_then_later_hello_gap(second: &[u8], gap: i32) -> Vec<Cell> {
         let other = sni_hello("other.example");
+        let next = 7 + second.len() as u32;
         walk_tls_seq(&[
             eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]),
             eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7, second),
-            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 7 + second.len() as u32, &other),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, next.wrapping_add_signed(gap), &other),
         ])
     }
 
@@ -5022,6 +5042,44 @@ mod tests {
         assert_eq!(empty_rec[2].tls_sni, ["other.example"]);
         let empty_msg = walk_ccs_then_later_hello(&tls_hello_request(0x0301));
         assert_eq!(empty_msg[2].tls_sni, ["other.example"]);
+    }
+
+    #[test]
+    fn gapped_later_hello_after_leftover_is_counted() {
+        let hello = sni_hello("www.example.com");
+        let hs = hello[5..].to_vec();
+        let leftover1 = tls_record_leftover(hello.clone(), &hs[..1]);
+        for gap in [1i32, 2, 8, 10, 40, 100, -1] {
+            let cells = walk_ccs_then_later_hello_gap(&leftover1, gap);
+            assert_eq!(cells[0].tls_sni, [] as [&str; 0], "gap {gap}");
+            assert_eq!(cells[1].tls_sni, ["www.example.com"], "gap {gap}");
+            assert_eq!(cells[1].counted, Some("tls-handshake"), "gap {gap}");
+            assert_eq!(cells[2].tls_sni, [] as [&str; 0], "gap {gap}");
+            assert_eq!(cells[2].counted, Some("tls-handshake"), "gap {gap}");
+        }
+        let leftover4 = tls_record_leftover(hello.clone(), &hs[..4]);
+        let cells = walk_ccs_then_later_hello_gap(&leftover4, 1);
+        assert_eq!(cells[1].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[2].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("tls-handshake"));
+        let cells = walk_ccs_then_later_hello_gap(
+            &tls_record_leftover(tls_hello_request(0x0301), &[0x01]),
+            1,
+        );
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[2].counted, Some("tls-handshake"));
+        let first = tls_record_leftover(hello, &[0x01]);
+        let other = sni_hello("other.example");
+        let next = 1 + first.len() as u32;
+        let cells = walk_tls_seq(&[
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, 1, &first),
+            eth_ipv4_tcp_seq(CLIENT, 50000, 443, next.wrapping_add_signed(1), &other),
+        ]);
+        assert_eq!(cells[0].tls_sni, ["www.example.com"]);
+        assert_eq!(cells[0].counted, Some("tls-handshake"));
+        assert_eq!(cells[1].tls_sni, [] as [&str; 0]);
+        assert_eq!(cells[1].counted, Some("tls-handshake"));
     }
 
     #[test]
