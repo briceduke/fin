@@ -346,6 +346,10 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
     hello_0304[1..3].copy_from_slice(&0x0304u16.to_be_bytes());
     let mut ccs_hello = ccs();
     ccs_hello.extend_from_slice(&hello);
+    let mut grease = hello.clone();
+    grease[1..3].copy_from_slice(&0x0a0au16.to_be_bytes());
+    let mut ccs_grease = ccs();
+    ccs_grease.extend_from_slice(&grease);
     vec![
         (
             "unnamed-0304",
@@ -444,6 +448,22 @@ fn review_cases() -> Vec<(&'static str, Vec<u8>)> {
             pcap(
                 LINK_ETHERNET,
                 &[eth_ipv4_tcp(OUTER, 50000, 443, &ccs_hello)],
+            ),
+        ),
+        (
+            "ccs-then-grease",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp(OUTER, 50000, 443, &ccs_grease)],
+            ),
+        ),
+        (
+            "rst-hello",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_flow_flags(
+                    OUTER, PEER, 50000, 443, 1, 0x14, &hello,
+                )],
             ),
         ),
         ("leftover-00-then-hello", leftover_then_hello(&[0x00])),

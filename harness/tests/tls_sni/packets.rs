@@ -96,10 +96,14 @@ pub fn tcp(src: u16, dst: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn tcp_seq(src: u16, dst: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+    tcp_seq_flags(src, dst, seq, 0x18, payload)
+}
+
+pub fn tcp_seq_flags(src: u16, dst: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
     let mut hdr = Vec::from(src.to_be_bytes());
     hdr.extend_from_slice(&dst.to_be_bytes());
     hdr.extend_from_slice(&seq.to_be_bytes());
-    hdr.extend_from_slice(&[0, 0, 0, 0, 0x50, 0x18, 0, 64, 0, 0, 0, 0]);
+    hdr.extend_from_slice(&[0, 0, 0, 0, 0x50, flags, 0, 64, 0, 0, 0, 0]);
     hdr.extend_from_slice(payload);
     hdr
 }
@@ -129,9 +133,26 @@ pub fn eth_ipv4_tcp_flow(
     seq: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    eth_ipv4_tcp_flow_flags(src, dst, sport, dport, seq, 0x18, payload)
+}
+
+pub fn eth_ipv4_tcp_flow_flags(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     eth(
         0x0800,
-        &ipv4_to(src, dst, 6, &tcp_seq(sport, dport, seq, payload)),
+        &ipv4_to(
+            src,
+            dst,
+            6,
+            &tcp_seq_flags(sport, dport, seq, flags, payload),
+        ),
     )
 }
 
