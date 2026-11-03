@@ -39,6 +39,35 @@ fn http_host_matches_tshark_469() {
 }
 
 #[test]
+fn http_host_without_tcp_reassemble_matches_tshark_469() {
+    let Some((tshark, fin)) = tools() else {
+        return;
+    };
+    let dir = work_dir();
+    let file = pcap(
+        LINK_ETHERNET,
+        &[eth_ipv4_tcp(OUTER, 50000, 80, &get("www.example.com"))],
+    );
+    let path = dir.join("http-host-default-no-o.pcap");
+    fs::write(&path, file).unwrap();
+    let mut args = vec![OsString::from("-r"), path.as_os_str().to_os_string()];
+    args.extend(
+        ["-n", "-T", "fields", "-e", FIELD]
+            .into_iter()
+            .map(OsString::from),
+    );
+    let output = run_pair(&tshark, &fin, &args).expect("pair");
+    let report = check_pair(&output).expect("check");
+    assert!(
+        report.faults.is_empty(),
+        "{report} tshark={:?} fin={:?} stderr={}",
+        output.tshark_stdout,
+        output.fin_stdout,
+        output.fin_stderr
+    );
+}
+
+#[test]
 fn stdin_matches_the_file_path() {
     let fin = fin_bin();
     let path = work_dir().join("http-stdin-vs-file.pcap");
@@ -372,6 +401,33 @@ fn junk_then_inner(first: &[u8]) -> Vec<u8> {
 
 fn tcp80(payload: &[u8]) -> Vec<u8> {
     pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 80, payload)])
+}
+
+fn tcp_http_ports(payload: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "8080",
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 8080, payload)]),
+        ),
+        (
+            "3128",
+            pcap(LINK_ETHERNET, &[eth_ipv4_tcp(OUTER, 50000, 3128, payload)]),
+        ),
+        (
+            "src80",
+            pcap(
+                LINK_ETHERNET,
+                &[eth_ipv4_tcp_to(PEER, OUTER, 80, 50000, 1, payload)],
+            ),
+        ),
+        (
+            "ipv6",
+            pcap(
+                LINK_ETHERNET,
+                &[eth(0x86dd, &ipv6(6, &tcp(50000, 80, payload)))],
+            ),
+        ),
+    ]
 }
 
 fn tcp80_seq(frames: &[Vec<u8>]) -> Vec<u8> {
@@ -1132,7 +1188,439 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 b"POST / HTTP/1.1\r\nHost: a.example\r\nnot-a-header\r\nContent-Length: 100\r\n\r\n",
             )),
         ),
+        (
+            "get-then-notify",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-subscribe",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"SUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-unsubscribe",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"UNSUBSCRIBE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-m-notify",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"M-NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-search",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"SEARCH / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-propfind",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"PROPFIND / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-trace",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"TRACE / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-notify",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-notify",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nNOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n"),
+        ),
+        (
+            "get-then-no-colon",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nnot-a-header\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-204-cl0",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-304-cl0",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"HTTP/1.1 304 Not Modified\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-100-cl0",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"HTTP/1.1 100 Continue\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-204-cl4-body",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 4\r\n\r\nxxxx",
+            )),
+        ),
+        (
+            "get-then-unreadable-cl-then-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"POST / HTTP/1.1\r\nHost: cl.example\r\nContent-Length: 4\x0b\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-in-data",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-out-data",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_OUT_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-connect",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_CONNECT / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "two-gets-then-rpc-in-data",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-rpc-then-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"RPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "204-no-cl-then-rpc-in-data",
+            tcp80(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-no-host-then-rpc-in-data",
+            tcp80(
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nRPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-then-mid-header-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-mid-header-post",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nPOST / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-mid-header-200",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nHTTP/1.1 200 OK\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-mid-header-icy",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"GET / HTTP/1.1\r\nHost: b.example\r\nICY 200\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-mid-header-get",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-mid-header-get",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n"),
+        ),
+        (
+            "get-no-host-then-mid-header-get",
+            tcp80(
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nGET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-then-short-post",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"POST / HTTP/1.1\r\nHost: b.example\r\nContent-Length: 100\r\n\r\nno",
+            )),
+        ),
+        (
+            "head-then-200-get",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "head-then-200-cl100-no",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nno",
+            )),
+        ),
+        (
+            "head-then-200-cl100-get",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 100\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-head-then-200",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "head-no-host-then-200",
+            tcp80(
+                b"HEAD / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            ),
+        ),
+        (
+            "head-then-200-cl0-get",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nHost: r.example\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-leftover-host",
+            tcp80(&concat_bytes(GET_A, b"Host: n.example\r\n\r\n")),
+        ),
+        (
+            "get-then-leftover-x-foo-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"X-Foo: bar\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-leftover-foo-bar-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"FOO:BAR / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-leftover-host",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-leftover-host",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n"),
+        ),
+        (
+            "204-no-cl-then-leftover-host",
+            tcp80(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+            ),
+        ),
+        (
+            "get-then-compact-leftover-host",
+            tcp80(&concat_bytes(GET_A, b"Host:n.example\r\n\r\n")),
+        ),
+        (
+            "get-then-leftover-host-tab",
+            tcp80(&concat_bytes(GET_A, b"Host:\tn.example\r\n\r\n")),
+        ),
+        (
+            "get-then-compact-x-foo-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"X-Foo:bar\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-compact-foo-bar-host",
+            tcp80(&concat_bytes(GET_A, b"FOO:BAR\r\nHost: n.example\r\n\r\n")),
+        ),
+        (
+            "get-then-compact-cl4-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"Content-Length:4\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-compact-leftover-host",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-compact-leftover-host",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost:n.example\r\n\r\n"),
+        ),
+        (
+            "204-no-cl-then-compact-leftover-host",
+            tcp80(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n",
+            ),
+        ),
+        (
+            "head-then-compact-leftover-host",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"Host:n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-no-host-then-compact-leftover-host",
+            tcp80(b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHost:n.example\r\n\r\n"),
+        ),
+        (
+            "get-then-not-a-header-then-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"not-a-header\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
     ];
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"NOTIFY / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-notify-8080",
+                "3128" => "get-then-notify-3128",
+                "src80" => "get-then-notify-src80",
+                _ => "get-then-notify-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"GET / HTTP/1.1\r\nHost: b.example\r\nnot-a-header\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-no-colon-8080",
+                "3128" => "get-then-no-colon-3128",
+                "src80" => "get-then-no-colon-src80",
+                _ => "get-then-no-colon-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"HTTP/1.1 204 No Content\r\nHost: b.example\r\nContent-Length: 0\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-204-cl0-8080",
+                "3128" => "get-then-204-cl0-3128",
+                "src80" => "get-then-204-cl0-src80",
+                _ => "get-then-204-cl0-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"RPC_IN_DATA / HTTP/1.1\r\nHost: rpc.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-rpc-in-data-8080",
+                "3128" => "get-then-rpc-in-data-3128",
+                "src80" => "get-then-rpc-in-data-src80",
+                _ => "get-then-rpc-in-data-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        GET_A,
+        b"GET / HTTP/1.1\r\nHost: b.example\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-mid-header-get-8080",
+                "3128" => "get-then-mid-header-get-3128",
+                "src80" => "get-then-mid-header-get-src80",
+                _ => "get-then-mid-header-get-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(
+        b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nHost: r.example\r\n\r\nGET / HTTP/1.1\r\nHost: inner.example\r\n\r\n",
+    )) {
+        out.push((
+            match suffix {
+                "8080" => "head-then-200-get-8080",
+                "3128" => "head-then-200-get-3128",
+                "src80" => "head-then-200-get-src80",
+                _ => "head-then-200-get-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(GET_A, b"Host: n.example\r\n\r\n")) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-leftover-host-8080",
+                "3128" => "get-then-leftover-host-3128",
+                "src80" => "get-then-leftover-host-src80",
+                _ => "get-then-leftover-host-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(GET_A, b"Host:n.example\r\n\r\n")) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-compact-leftover-host-8080",
+                "3128" => "get-then-compact-leftover-host-3128",
+                "src80" => "get-then-compact-leftover-host-src80",
+                _ => "get-then-compact-leftover-host-ipv6",
+            },
+            file,
+        ));
+    }
     out.extend(on_disk());
     out.into_iter()
         .filter(|(_, bytes)| !bytes.is_empty())
