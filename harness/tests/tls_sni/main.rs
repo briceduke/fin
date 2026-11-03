@@ -235,10 +235,18 @@ fn assert_no_later_hello(fin: &Path, name: &str, file: Vec<u8>, rows: &[&str], c
         rows,
         "{name} stdout={stdout:?} stderr={stderr:?}"
     );
-    assert!(
-        !stdout.contains("other.example"),
-        "{name} stdout={stdout:?} stderr={stderr:?}"
-    );
+    for host in [
+        "other.example",
+        "third.example",
+        "b.example",
+        "c.example",
+        "d.example",
+    ] {
+        assert!(
+            !stdout.contains(host),
+            "{name} has {host} stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
     for line in counted {
         assert!(
             stderr.contains(line),
@@ -351,6 +359,102 @@ fn gapped_later_hello_after_leftover_does_not_print_sni() {
         leftover_hello_then_gapped_hello(&[0x01], 1),
         &["www.example.com", ""],
         &["counted 1 tls-handshake", "counted 2 tls-handshake"],
+    );
+}
+
+#[test]
+fn abutting_later_hello_after_leftover_does_not_print_a_second_hello() {
+    let fin = fin_bin();
+    let counted4: &[&str] = &[
+        "counted 2 tls-handshake",
+        "counted 3 tls-handshake",
+        "counted 4 tls-handshake",
+    ];
+    let hello = client_hello(Some("www.example.com"));
+    let hs = hello[5..].to_vec();
+    let later = ["other.example", "third.example"];
+    let rows4: &[&str] = &["", "www.example.com", "", ""];
+    for n in [1usize, 2, 3, 4, 5, 8] {
+        assert_no_later_hello(
+            &fin,
+            &format!("ccs-then-hello-leftover-{n}-then-two-hellos"),
+            ccs_then_later_hellos(&append_record_leftover(hello.clone(), &hs[..n]), &later),
+            rows4,
+            counted4,
+        );
+    }
+    let blanks4: &[&str] = &["", "", "", ""];
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-request-leftover-1-then-two-hellos",
+        ccs_then_later_hellos(
+            &append_record_leftover(hello_request(0x0301), &[0x01]),
+            &later,
+        ),
+        blanks4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-two-hello-requests-leftover-1-then-two-hellos",
+        ccs_then_later_hellos(&two_hello_requests_leftover(&[0x01]), &later),
+        blanks4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-grease-hello-leftover-1-then-two-hellos",
+        ccs_then_later_hellos(
+            &append_record_leftover(grease_hello(0x0a0a), &[0x01]),
+            &later,
+        ),
+        blanks4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "hello-leftover-1-then-two-hellos",
+        leftover_hello_then_later_hellos(&[0x01], &later),
+        &["www.example.com", "", ""],
+        &[
+            "counted 1 tls-handshake",
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+        ],
+    );
+    assert_no_later_hello(
+        &fin,
+        "same-payload-ccs-hello-leftover-1-then-two-hellos",
+        same_payload_ccs_leftover_then_later_hellos(&[0x01], &later),
+        &["", "", ""],
+        &[
+            "counted 1 tls-handshake",
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+        ],
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-leftover-1-then-hello-then-gap-1",
+        leftover_abutting_then_gapped_third(&append_record_leftover(hello.clone(), &hs[..1]), 1),
+        rows4,
+        counted4,
+    );
+    assert_no_later_hello(
+        &fin,
+        "ccs-then-hello-leftover-1-then-four-hellos",
+        ccs_then_later_hellos(
+            &append_record_leftover(hello.clone(), &hs[..1]),
+            &["other.example", "b.example", "c.example", "d.example"],
+        ),
+        &["", "www.example.com", "", "", "", ""],
+        &[
+            "counted 2 tls-handshake",
+            "counted 3 tls-handshake",
+            "counted 4 tls-handshake",
+            "counted 5 tls-handshake",
+            "counted 6 tls-handshake",
+        ],
     );
 }
 
@@ -984,6 +1088,108 @@ fn ccs_then_later_hello(second: &[u8]) -> Vec<u8> {
     )
 }
 
+fn ccs_then_later_hellos(second: &[u8], names: &[&str]) -> Vec<u8> {
+    let hellos: Vec<Vec<u8>> = names.iter().map(|name| client_hello(Some(name))).collect();
+    let ccs = ccs();
+    let mut payloads: Vec<&[u8]> = vec![&ccs, second];
+    payloads.extend(hellos.iter().map(|hello| hello.as_slice()));
+    sequential_payloads(50000, 443, &payloads)
+}
+
+fn leftover_hello_then_later_hellos(leftover: &[u8], names: &[&str]) -> Vec<u8> {
+    let first = append_record_leftover(client_hello(Some("www.example.com")), leftover);
+    let hellos: Vec<Vec<u8>> = names.iter().map(|name| client_hello(Some(name))).collect();
+    let mut payloads: Vec<&[u8]> = vec![&first];
+    payloads.extend(hellos.iter().map(|hello| hello.as_slice()));
+    sequential_payloads(50000, 443, &payloads)
+}
+
+fn same_payload_ccs_leftover_then_later_hellos(leftover: &[u8], names: &[&str]) -> Vec<u8> {
+    let mut first = ccs();
+    first.extend_from_slice(&append_record_leftover(
+        client_hello(Some("www.example.com")),
+        leftover,
+    ));
+    let hellos: Vec<Vec<u8>> = names.iter().map(|name| client_hello(Some(name))).collect();
+    let mut payloads: Vec<&[u8]> = vec![&first];
+    payloads.extend(hellos.iter().map(|hello| hello.as_slice()));
+    sequential_payloads(50000, 443, &payloads)
+}
+
+fn leftover_abutting_then_gapped_third(second: &[u8], gap: i32) -> Vec<u8> {
+    let ccs = ccs();
+    let other = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    let seq2 = 1 + ccs.len() as u32;
+    let seq3 = seq2 + second.len() as u32;
+    let seq4 = (seq3 + other.len() as u32).wrapping_add_signed(gap);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, second),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq3, &other),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq4, &third),
+        ],
+    )
+}
+
+fn leftover_two_gapped_hellos(second: &[u8], gap: i32) -> Vec<u8> {
+    let ccs = ccs();
+    let other = client_hello(Some("other.example"));
+    let third = client_hello(Some("third.example"));
+    let seq2 = 1 + ccs.len() as u32;
+    let seq3 = (seq2 + second.len() as u32).wrapping_add_signed(gap);
+    let seq4 = (seq3 + other.len() as u32).wrapping_add_signed(gap);
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq2, second),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq3, &other),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, seq4, &third),
+        ],
+    )
+}
+
+fn leftover_then_reverse_hello(second: &[u8]) -> Vec<u8> {
+    let ccs = ccs();
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &ccs),
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1 + ccs.len() as u32, second),
+            eth_ipv4_tcp_flow(
+                PEER,
+                OUTER,
+                443,
+                50000,
+                1,
+                &client_hello(Some("other.example")),
+            ),
+        ],
+    )
+}
+
+fn truncated_hello_then_gapped_hello(cut: usize, gap: i32) -> Vec<u8> {
+    let hello = client_hello(Some("www.example.com"));
+    let other = client_hello(Some("other.example"));
+    pcap(
+        LINK_ETHERNET,
+        &[
+            eth_ipv4_tcp_flow(OUTER, PEER, 50000, 443, 1, &hello[..cut]),
+            eth_ipv4_tcp_flow(
+                OUTER,
+                PEER,
+                50000,
+                443,
+                (1 + cut as u32).wrapping_add_signed(gap),
+                &other,
+            ),
+        ],
+    )
+}
+
 fn ccs_then_later_hello_gap(second: &[u8], gap: i32) -> Vec<u8> {
     let ccs = ccs();
     let other = client_hello(Some("other.example"));
@@ -1144,6 +1350,110 @@ fn incomplete_later_handshake_cases() -> Vec<(&'static str, Vec<u8>)> {
         (
             "hello-leftover-1-then-hello-gap-1",
             leftover_hello_then_gapped_hello(&[0x01], 1),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..1]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-2-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..2]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-3-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..3]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-4-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..4]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-5-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..5]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-8-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..8]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-request-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello_request(0x0301), &[0x01]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-two-hello-requests-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &two_hello_requests_leftover(&[0x01]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-grease-hello-leftover-1-then-two-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(grease_hello(0x0a0a), &[0x01]),
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "hello-leftover-1-then-two-hellos",
+            leftover_hello_then_later_hellos(&[0x01], &["other.example", "third.example"]),
+        ),
+        (
+            "same-payload-ccs-hello-leftover-1-then-two-hellos",
+            same_payload_ccs_leftover_then_later_hellos(
+                &[0x01],
+                &["other.example", "third.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-hello-then-gap-1",
+            leftover_abutting_then_gapped_third(
+                &append_record_leftover(hello.clone(), &hs[..1]),
+                1,
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-four-hellos",
+            ccs_then_later_hellos(
+                &append_record_leftover(hello.clone(), &hs[..1]),
+                &["other.example", "b.example", "c.example", "d.example"],
+            ),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-two-gapped-hellos",
+            leftover_two_gapped_hellos(&append_record_leftover(hello.clone(), &hs[..1]), 1),
+        ),
+        (
+            "ccs-then-hello-leftover-1-then-reverse-hello",
+            leftover_then_reverse_hello(&append_record_leftover(hello.clone(), &hs[..1])),
+        ),
+        (
+            "truncated-hello-40-then-hello-gap-1",
+            truncated_hello_then_gapped_hello(40, 1),
+        ),
+        (
+            "ccs-then-complete-hello-then-two-hellos",
+            ccs_then_later_hellos(&hello, &["other.example", "third.example"]),
         ),
     ]);
     cases
