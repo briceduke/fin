@@ -34,19 +34,6 @@ pub struct TlsOutcome {
     pub counted: Option<&'static str>,
 }
 
-/// Parse SNI from one TCP payload on an unnamed port. The first record must
-/// pass tshark 4.6.9 `is_sslv3_or_tls`.
-#[cfg(test)]
-pub fn parse_tcp_tls(payload: &[u8]) -> TlsParse {
-    parse_tls(payload, true).kind
-}
-
-/// Port 443 (and the other `tls` ports) force the TLS dissector.
-#[cfg(test)]
-pub fn parse_tcp_tls_on_tls_port(payload: &[u8]) -> TlsParse {
-    parse_tls(payload, false).kind
-}
-
 /// `heuristic` is tshark's first-packet `is_sslv3_or_tls` gate.
 pub fn parse_tls(payload: &[u8], heuristic: bool) -> TlsOutcome {
     if heuristic && !is_sslv3_or_tls(payload) {
@@ -493,7 +480,7 @@ mod tests {
     #[test]
     fn sni_name_is_proved() {
         assert_eq!(
-            parse_tcp_tls(&client_hello(Some("www.example.com"))),
+            parse_tls(&client_hello(Some("www.example.com")), true).kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
     }
@@ -501,21 +488,21 @@ mod tests {
     #[test]
     fn client_hello_without_sni_is_proved_empty() {
         assert_eq!(
-            parse_tcp_tls(&client_hello(None)),
+            parse_tls(&client_hello(None), true).kind,
             TlsParse::ClientHello(Vec::new())
         );
     }
 
     #[test]
     fn http_on_443_is_other() {
-        assert_eq!(parse_tcp_tls(b"GET / HTTP/1.1\r\n"), TlsParse::Other);
+        assert_eq!(parse_tls(b"GET / HTTP/1.1\r\n", true).kind, TlsParse::Other);
     }
 
     #[test]
     fn truncated_record_is_unproved() {
         let mut hello = client_hello(Some("a.example"));
         hello.truncate(hello.len() - 4);
-        assert_eq!(parse_tcp_tls(&hello), TlsParse::Unproved);
+        assert_eq!(parse_tls(&hello, true).kind, TlsParse::Unproved);
     }
 
     #[test]
@@ -523,13 +510,13 @@ mod tests {
         let mut hs = handshake(HANDSHAKE_CLIENT_HELLO, &[0u8; 64]);
         hs[1..4].copy_from_slice(&[0, 1, 0]);
         let rec = record(CONTENT_HANDSHAKE, 0x0303, &hs);
-        assert_eq!(parse_tcp_tls(&rec), TlsParse::Unproved);
+        assert_eq!(parse_tls(&rec, true).kind, TlsParse::Unproved);
     }
 
     #[test]
     fn app_data_is_other() {
         let rec = record(0x17, 0x0303, &[1, 2, 3, 4]);
-        assert_eq!(parse_tcp_tls(&rec), TlsParse::Other);
+        assert_eq!(parse_tls(&rec, true).kind, TlsParse::Other);
     }
 
     #[test]
@@ -543,7 +530,7 @@ mod tests {
         let idx = hello.len() - "fuzz.example".len() - 3;
         hello[idx] = 185;
         assert_eq!(
-            parse_tcp_tls_on_tls_port(&hello),
+            parse_tls(&hello, false).kind,
             TlsParse::ClientHello(vec!["fuzz.example".to_string()])
         );
     }
@@ -553,7 +540,7 @@ mod tests {
         let mut hello = client_hello(Some("www.example.com"));
         hello[1] = 0x03;
         hello[2] = 0x10;
-        assert_eq!(parse_tcp_tls_on_tls_port(&hello), TlsParse::Other);
+        assert_eq!(parse_tls(&hello, false).kind, TlsParse::Other);
     }
 
     #[test]
@@ -564,7 +551,7 @@ mod tests {
             let mut hello = client_hello(Some("www.example.com"));
             hello[1..3].copy_from_slice(&version.to_be_bytes());
             assert_eq!(
-                parse_tcp_tls_on_tls_port(&hello),
+                parse_tls(&hello, false).kind,
                 TlsParse::Other,
                 "{version:#06x}"
             );
@@ -574,9 +561,9 @@ mod tests {
     #[test]
     fn unnamed_port_rejects_tls13_record_version() {
         let hello = client_hello_bytes(Some(b"www.example.com"), 0x0304);
-        assert_eq!(parse_tcp_tls(&hello), TlsParse::Other);
+        assert_eq!(parse_tls(&hello, true).kind, TlsParse::Other);
         assert_eq!(
-            parse_tcp_tls_on_tls_port(&hello),
+            parse_tls(&hello, false).kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
     }
@@ -590,7 +577,7 @@ mod tests {
         for prefix in [ccs, alert, heartbeat] {
             let mut payload = prefix;
             payload.extend_from_slice(&hello);
-            assert_eq!(parse_tcp_tls(&payload), TlsParse::Other);
+            assert_eq!(parse_tls(&payload, true).kind, TlsParse::Other);
         }
         let mut app = record(0x17, 0x0303, &[1]);
         app.extend_from_slice(&hello);
@@ -604,7 +591,7 @@ mod tests {
         assert_eq!(ascii_name(b"www.example\0"), "www.example");
         assert_eq!(ascii_name(b"a\0b\0c"), "a");
         assert_eq!(
-            parse_tcp_tls_on_tls_port(&client_hello_bytes(Some(b"www\0.example"), 0x0301)),
+            parse_tls(&client_hello_bytes(Some(b"www\0.example"), 0x0301), false).kind,
             TlsParse::ClientHello(vec!["www".to_string()])
         );
     }
@@ -613,12 +600,12 @@ mod tests {
     fn split_record_stitches_when_concatenated() {
         let hello = client_hello(Some("www.example.com"));
         let cut = 40;
-        assert_eq!(parse_tcp_tls(&hello[..cut]), TlsParse::Unproved);
+        assert_eq!(parse_tls(&hello[..cut], true).kind, TlsParse::Unproved);
         let prefix = truncated_handshake_prefix(&hello[..cut]).unwrap_or(&hello[..cut]);
         let mut stitched = prefix.to_vec();
         stitched.extend_from_slice(&hello[cut..]);
         assert_eq!(
-            parse_tcp_tls(&stitched),
+            parse_tls(&stitched, true).kind,
             TlsParse::ClientHello(vec!["www.example.com".to_string()])
         );
     }
