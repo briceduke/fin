@@ -1456,6 +1456,64 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
             ),
         ),
+        (
+            "get-then-compact-leftover-host",
+            tcp80(&concat_bytes(GET_A, b"Host:n.example\r\n\r\n")),
+        ),
+        (
+            "get-then-leftover-host-tab",
+            tcp80(&concat_bytes(GET_A, b"Host:\tn.example\r\n\r\n")),
+        ),
+        (
+            "get-then-compact-x-foo-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"X-Foo:bar\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-then-compact-foo-bar-host",
+            tcp80(&concat_bytes(GET_A, b"FOO:BAR\r\nHost: n.example\r\n\r\n")),
+        ),
+        (
+            "get-then-compact-cl4-get",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"Content-Length:4\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "options-then-compact-leftover-host",
+            tcp80(b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n"),
+        ),
+        (
+            "post-cl0-then-compact-leftover-host",
+            tcp80(b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost:n.example\r\n\r\n"),
+        ),
+        (
+            "204-no-cl-then-compact-leftover-host",
+            tcp80(
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n",
+            ),
+        ),
+        (
+            "head-then-compact-leftover-host",
+            tcp80(&concat_bytes(
+                b"HEAD / HTTP/1.1\r\nHost: h.example\r\n\r\n",
+                b"Host:n.example\r\n\r\n",
+            )),
+        ),
+        (
+            "get-no-host-then-compact-leftover-host",
+            tcp80(b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHost:n.example\r\n\r\n"),
+        ),
+        (
+            "get-then-not-a-header-then-host",
+            tcp80(&concat_bytes(
+                GET_A,
+                b"not-a-header\r\nHost: n.example\r\n\r\n",
+            )),
+        ),
     ];
     for (suffix, file) in tcp_http_ports(&concat_bytes(
         GET_A,
@@ -1548,6 +1606,17 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 "3128" => "get-then-leftover-host-3128",
                 "src80" => "get-then-leftover-host-src80",
                 _ => "get-then-leftover-host-ipv6",
+            },
+            file,
+        ));
+    }
+    for (suffix, file) in tcp_http_ports(&concat_bytes(GET_A, b"Host:n.example\r\n\r\n")) {
+        out.push((
+            match suffix {
+                "8080" => "get-then-compact-leftover-host-8080",
+                "3128" => "get-then-compact-leftover-host-3128",
+                "src80" => "get-then-compact-leftover-host-src80",
+                _ => "get-then-compact-leftover-host-ipv6",
             },
             file,
         ));

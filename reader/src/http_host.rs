@@ -212,8 +212,9 @@ enum Take {
     Incomplete,
     TransferEncoding,
     /// Later NOTIFY/WebDAV/RPC_*, a no-colon header, a request or status
-    /// line in headers, unreadable Content-Length, or a 1xx/204/304 that
-    /// carries Content-Length. Counted.
+    /// line in headers, leftover compact `Name:value`, unreadable
+    /// Content-Length, or a 1xx/204/304 that carries Content-Length.
+    /// Counted.
     Unproved,
     Other,
     Done,
@@ -468,15 +469,26 @@ fn is_notification_method(method: &[u8]) -> bool {
 }
 
 /// A later request line this reader does not prove: NOTIFY, M-NOTIFY,
-/// SEARCH, PROPFIND, TRACE, RPC_IN_DATA, leftover `Host:` / other
-/// headers, and other method tokens with a space.
+/// SEARCH, PROPFIND, TRACE, RPC_IN_DATA, leftover `Host:` / compact
+/// `Host:n.example` / other headers, and other method tokens with a space.
 fn looks_like_unproved_method(line: &[u8]) -> bool {
+    if looks_like_compact_header(line) {
+        return true;
+    }
     let method = first_method(line);
     !method.is_empty()
         && method.len() < line.len()
         && method
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b':'))
+}
+
+/// Leftover `Name:value` with no ASCII space, including `Host:\tvalue`.
+fn looks_like_compact_header(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    valid_header_name(&line[..colon])
 }
 
 fn is_request_method(method: &[u8]) -> bool {
@@ -996,6 +1008,11 @@ mod tests {
             b"Host: n.example\r\n\r\n".as_slice(),
             b"X-Foo: bar\r\nHost: n.example\r\n\r\n",
             b"FOO:BAR / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"Host:n.example\r\n\r\n",
+            b"Host:\tn.example\r\n\r\n",
+            b"X-Foo:bar\r\nHost: n.example\r\n\r\n",
+            b"FOO:BAR\r\nHost: n.example\r\n\r\n",
+            b"Content-Length:4\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: n.example\r\n\r\n",
         ];
         for rest in rests {
             assert_eq!(
@@ -1005,32 +1022,42 @@ mod tests {
                 rest.escape_ascii()
             );
         }
+        let after_complete = [
+            b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+            b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost:n.example\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n",
+        ];
+        for payload in after_complete {
+            assert_eq!(
+                parse_http(payload, false),
+                HttpParse::Partial(vec!["a.example".to_string()]),
+                "{}",
+                payload.escape_ascii()
+            );
+        }
         assert_eq!(
-            parse_http(
-                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
-                false
-            ),
-            HttpParse::Partial(vec!["a.example".to_string()])
+            parse_http(&leftover_after_head(b"Host:n.example\r\n\r\n"), false),
+            HttpParse::Partial(vec!["h.example".to_string()])
         );
         assert_eq!(
             parse_http(
-                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n",
+                b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHost:n.example\r\n\r\n",
                 false
             ),
-            HttpParse::Partial(vec!["a.example".to_string()])
-        );
-        assert_eq!(
-            parse_http(
-                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
-                false
-            ),
-            HttpParse::Partial(vec!["a.example".to_string()])
+            HttpParse::Partial(vec![])
         );
     }
 
     #[test]
     fn leftover_junk_after_get_still_prints() {
         let proved = message(&leftover_after_get(b"junk"));
+        assert_eq!(proved.hosts, ["a.example"]);
+        let proved = message(&leftover_after_get(
+            b"not-a-header\r\nHost: n.example\r\n\r\n",
+        ));
         assert_eq!(proved.hosts, ["a.example"]);
     }
 

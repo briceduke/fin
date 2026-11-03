@@ -4318,6 +4318,11 @@ mod tests {
             b"Host: n.example\r\n\r\n".as_slice(),
             b"X-Foo: bar\r\nHost: n.example\r\n\r\n",
             b"FOO:BAR / HTTP/1.1\r\nHost: n.example\r\n\r\n",
+            b"Host:n.example\r\n\r\n",
+            b"Host:\tn.example\r\n\r\n",
+            b"X-Foo:bar\r\nHost: n.example\r\n\r\n",
+            b"FOO:BAR\r\nHost: n.example\r\n\r\n",
+            b"Content-Length:4\r\n\r\nxxxxGET / HTTP/1.1\r\nHost: n.example\r\n\r\n",
         ];
         for rest in rests {
             assert_counted_a_example(
@@ -4329,34 +4334,61 @@ mod tests {
             &get_then_http(b"Host: n.example\r\n\r\n"),
             "leftover Host header",
         );
-        assert_counted_a_example(
-            &eth_ipv4_tcp(
-                CLIENT,
-                50000,
-                80,
-                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
-            ),
-            "OPTIONS then leftover Host",
+        assert_counted_a_on_named_ports(
+            &get_then_http(b"Host:n.example\r\n\r\n"),
+            "compact leftover Host",
         );
-        assert_counted_a_example(
-            &eth_ipv4_tcp(
-                CLIENT,
-                50000,
-                80,
+        let after_complete = [
+            (
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n".as_slice(),
+                "OPTIONS then leftover Host",
+            ),
+            (
                 b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost: n.example\r\n\r\n",
+                "POST CL 0 then leftover Host",
             ),
-            "POST CL 0 then leftover Host",
-        );
-        assert_counted_a_example(
-            &eth_ipv4_tcp(
-                CLIENT,
-                50000,
-                80,
+            (
                 b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost: n.example\r\n\r\n",
+                "204 no-CL then leftover Host",
             ),
-            "204 no-CL then leftover Host",
+            (
+                b"OPTIONS * HTTP/1.1\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n",
+                "OPTIONS then compact leftover Host",
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\n\r\nHost:n.example\r\n\r\n",
+                "POST CL 0 then compact leftover Host",
+            ),
+            (
+                b"HTTP/1.1 204 No Content\r\nHost: a.example\r\n\r\nHost:n.example\r\n\r\n",
+                "204 no-CL then compact leftover Host",
+            ),
+        ];
+        for (payload, label) in after_complete {
+            assert_counted_a_example(&eth_ipv4_tcp(CLIENT, 50000, 80, payload), label);
+        }
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &leftover_after_head(b"Host:n.example\r\n\r\n"),
+        ));
+        assert_eq!(cell.http_host, ["h.example"]);
+        assert_eq!(cell.counted, Some("http"));
+        assert_counted_hosts_on_named_ports(
+            b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\nHost:n.example\r\n\r\n",
+            &[],
+            "no-Host GET then compact leftover Host",
         );
         let cell = walk_http(&eth_ipv4_tcp(CLIENT, 50000, 80, &get_then_http(b"junk")));
+        assert_eq!(cell.http_host, ["a.example"]);
+        assert_eq!(cell.counted, None);
+        let cell = walk_http(&eth_ipv4_tcp(
+            CLIENT,
+            50000,
+            80,
+            &get_then_http(b"not-a-header\r\nHost: n.example\r\n\r\n"),
+        ));
         assert_eq!(cell.http_host, ["a.example"]);
         assert_eq!(cell.counted, None);
     }
